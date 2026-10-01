@@ -11819,13 +11819,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.transport == "stdio":
-        mcp.run()
+        mcp.run(show_banner=False)
     else:
         _validate_http_bind(args.host)
         mcp.run(
             transport=args.transport,
             host=args.host,
             port=args.port,
+            show_banner=False
         )
 
 
