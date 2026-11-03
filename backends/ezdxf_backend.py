@@ -12,11 +12,15 @@ the live COM backend.
 from __future__ import annotations
 
 import asyncio
+import collections
+import concurrent.futures
+import contextvars
 import io
 import logging
 import math
 import os
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from importlib.util import find_spec
@@ -40,6 +44,7 @@ from .base import (
     normalize_lineweight,
     shoelace_area,
 )
+from .contracts.entity_modification import TEXT_SEARCH_SCOPE
 from .contracts.settings import (
     SUMMARY_FIELDS,
     custom_key_fold,
@@ -47,13 +52,26 @@ from .contracts.settings import (
     scale_value,
     validate_drawing_properties,
 )
+from .entity_fields import (
+    dimension_fields,
+    dimension_props,
+    hatch_loops,
+    hatch_props,
+    nesting_depths,
+)
+from .operations import CURRENT_OPERATION
 from .quarantine import (
     AbandonedCall,
+    DaemonExecutor,
+    DetachedRead,
     DocumentQuarantineError,
     QuarantineRecord,
+    detached_read_refusal,
+    is_marked_readonly,
     quarantine_refusal,
     real_call_name,
 )
+from .xdata_specs import prepare_xdata
 
 __all__ = [
     "DocumentQuarantineError",
@@ -66,6 +84,86 @@ __all__ = [
 #: always the most recent; older entries exist so a support transcript shows a
 #: document that has been abandoned on repeatedly rather than once.
 _MAX_ABANDONED_RECORDS = 10
+#: ``call_outcomes`` keeps this many cancellation / abandonment rows (B01).
+_MAX_CALL_OUTCOMES = 50
+#: How many of them ``system_status`` reports.
+_STATUS_CALL_OUTCOMES = 10
+
+#: Every ``_async`` worker runs here: daemon threads nothing joins at exit, so
+#: a runaway worker can never hold the server process open (B01).
+_WORKERS = DaemonExecutor(name="ezdxf-worker")
+
+
+class _DocLock(asyncio.Lock):
+    """The document lock, able to wake its queue when it is swapped out.
+
+    W1 review follow-up to B01: when a deadline swaps the lock (a quarantine,
+    or a detached read whose lock a later call needs), the calls already
+    queued on the old one were let through the gate under the old state.
+    Before, they sat out their own full ``EZDXF_CALL_TIMEOUT`` - forever at
+    ``0`` - and then said "busy"; a cancelled ``cad_batch``'s shielded
+    rollback was one of them, holding the cancellation and the lifespan's
+    shutdown behind it. ``orphan()`` wakes every one of them at once, and
+    ``acquire()`` on an orphan returns at once; ``EzdxfBackend._async`` sees
+    ``orphaned`` and answers the woken call from the new state.
+
+    An orphan stays ``locked()`` and is never released: the woken calls never
+    held it, and its holder is the abandoned worker.
+    """
+
+    orphaned = False
+
+    async def acquire(self):
+        if self.orphaned:
+            return True
+        return await super().acquire()
+
+    def orphan(self) -> None:
+        self.orphaned = True
+        for waiter in list(self._waiters or ()):
+            if not waiter.done():
+                waiter.set_result(True)
+
+
+class _Lease:
+    """A document lock that outlived the coroutine that took it (B01).
+
+    Created when a call is cancelled while its worker runs (or a read-only
+    call overruns): the lock now belongs to the worker thread until it ends.
+    ``timer`` is the pending ORIGINAL-deadline handle, ``abandoned`` is set
+    when that deadline found the worker still alive (the lock was swapped out
+    and must never be released), ``done`` when the worker ended. ``readonly``
+    leases are detached at that deadline instead of quarantined; ``document``
+    is the ``Drawing`` the call started on.
+    """
+
+    __slots__ = (
+        "loop",
+        "lock",
+        "row",
+        "document_path",
+        "document_id",
+        "document",
+        "readonly",
+        "timer",
+        "done",
+        "abandoned",
+    )
+
+    def __init__(
+        self, loop, lock, row, document_path, document_id, *, document=None, readonly=False
+    ):
+        self.loop = loop
+        self.lock = lock
+        self.row = row
+        self.document_path = document_path
+        self.document_id = document_id
+        self.document = document
+        self.readonly = readonly
+        self.timer: asyncio.TimerHandle | None = None
+        self.done = False
+        self.abandoned = False
+
 
 #: System variables that AutoCAD does not keep in the HEADER section. Grid and
 #: snap belong to the active VPORT table entry (DXF codes 76 / 15 / 75 / 14);
@@ -539,38 +637,6 @@ def _apply_iso_dimstyle(doc) -> None:
 _HATCH_STYLE_NAMES = {0: "normal", 1: "outer", 2: "ignore"}
 
 
-def _nesting_depths(loops: list[list[tuple[float, float]]]) -> list[int]:
-    """How many other loops each loop sits inside.
-
-    Read off containment rather than off the boundary-path flags, because the
-    flags do not carry it: DXF marks a path external or outermost, never "two
-    levels down". Depth is precisely where AutoCAD's three island styles stop
-    agreeing, so guessing it would make `normal` and `outer` return the same
-    number and quietly be wrong for one of them.
-
-    Hatch boundary loops do not cross, so any vertex of the inner loop settles
-    the question — the first one that is not sitting exactly on the other
-    loop's edge decides.
-    """
-    from ezdxf import edgesmith
-    from ezdxf.math import Vec2
-
-    rings = [[Vec2(x, y) for x, y in points] for points in loops]
-    depths = []
-    for index, points in enumerate(loops):
-        depth = 0
-        for other, ring in enumerate(rings):
-            if other == index:
-                continue
-            for x, y in points:
-                verdict = edgesmith.is_point_in_polygon_2d(Vec2(x, y), ring)
-                if verdict != 0:
-                    depth += verdict > 0
-                    break
-        depths.append(depth)
-    return depths
-
-
 def _measure_hatch(ent, tolerance: float, result: dict) -> dict:
     """The area a hatch actually fills: outer loops minus the islands in them.
 
@@ -609,7 +675,7 @@ def _measure_hatch(ent, tolerance: float, result: dict) -> dict:
 
     style_code = int(ent.dxf.get("hatch_style", 0) or 0)
     style = _HATCH_STYLE_NAMES.get(style_code, "normal")
-    depths = _nesting_depths(outlines)
+    depths = nesting_depths(outlines)
 
     area = 0.0
     for points, depth in zip(outlines, depths, strict=True):
@@ -1127,8 +1193,13 @@ _OCS_ENTITY_TYPES = frozenset(
 )
 
 
-def _entity_info_dxf(ent) -> EntityInfo:
-    """Convert an ezdxf entity to EntityInfo. Coordinates out are always WCS."""
+def _entity_info_dxf(ent, *, detail: bool = False) -> EntityInfo:
+    """Convert an ezdxf entity to EntityInfo. Coordinates out are always WCS.
+
+    ``detail=True`` (``entity_get`` - one entity) adds what a list row does not
+    pay for: a HATCH's loops, depths and filled area, a DIMENSION's full
+    fields (v1.7.0, B16, ``backends/entity_fields.py``).
+    """
     handle = ent.dxf.get("handle", "?")
     ent_type = ent.dxftype()
     layer = ent.dxf.get("layer", "0")
@@ -1257,7 +1328,10 @@ def _entity_info_dxf(ent) -> EntityInfo:
             # stored x unnegated); `insertion` above is already WCS, but the
             # block's content is drawn on the mirror image about it, so a
             # reader that places catalogue ports needs to know.
-            props["mirrored"] = float(extrusion[2]) < 0
+            # A mirror is a FLAT frame with -Z. A tilted frame whose normal has
+            # a negative z is not a mirror (backlog W3-T14-19); it reports
+            # `plane_normal` below instead.
+            props["mirrored"] = flat and float(extrusion[2]) < 0
             # The drawn symbol alone. ``bounding_box`` below takes the ATTRIBs
             # with it, so a TAG above a valve pushes the box past the body and
             # a line ending on the body's real edge reads as *inside* it.
@@ -1284,6 +1358,12 @@ def _entity_info_dxf(ent) -> EntityInfo:
             if ent.dxf.hasattr("fit_points"):
                 props["fit_point_count"] = len(list(ent.fit_points))
             props["degree"] = ent.dxf.degree
+        elif ent_type == "HATCH":
+            if detail and flat:
+                style = int(ent.dxf.get("hatch_style", 0) or 0)
+                props.update(hatch_props(hatch_loops(ent), style))
+            elif detail:
+                props["plane_normal"] = ocs.plane_normal(extrusion)
         elif ent_type in (
             "DIMENSION",
             "DIMLINEAR",
@@ -1310,6 +1390,8 @@ def _entity_info_dxf(ent) -> EntityInfo:
                     props["text_position"] = _pt(tm)  # group code 11 — OCS
             except Exception:
                 pass
+            if detail:
+                props["dimension"] = dimension_props(dimension_fields(ent))
     except Exception as exc:
         log.debug("extracting entity properties for %s: %s", ent_type, exc)
 
@@ -1392,6 +1474,10 @@ class _DocState:
     gdt_datums_defined: set = field(default_factory=set)
     gdt_datums_referenced: set = field(default_factory=set)
     activated_seq: int = 0
+    # v1.7.0 (B11): minted by _register_document; "" only on the empty `_void`.
+    document_id: str = ""
+    # The content revision: `_DirtyField` moves it on every `_dirty = True`.
+    revision: int = 0
 
     @property
     def label(self) -> str:
@@ -1426,6 +1512,23 @@ class _ActiveField:
         setattr(instance._state, self.attr, value)
 
 
+class _DirtyField(_ActiveField):
+    """``_dirty`` that also moves the content revision (v1.7.0, B11).
+
+    Every content change in this engine ends in ``self._dirty = True`` -
+    ``_mark_dirty`` after each mutation, ``_restore_snapshot`` for undo and
+    redo, ``transaction_rollback`` - and saving writes ``False``. So the
+    assignment is the one place that sees every content change and nothing
+    else: saving, exporting, finalizing and delivering never assign ``True``.
+    """
+
+    def __set__(self, instance, value):
+        state = instance._state
+        state.dirty = value
+        if value:
+            state.revision += 1
+
+
 # ---------------------------------------------------------------------------
 # EzdxfBackend
 # ---------------------------------------------------------------------------
@@ -1437,7 +1540,7 @@ class EzdxfBackend(AutoCADBackend):
     # Old per-backend attributes, now routed to the active document (v1.6).
     # `_doc` and `_doc_path` are explicit properties below (binding and
     # re-keying rules); the rest are plain views.
-    _dirty = _ActiveField("dirty")
+    _dirty = _DirtyField("dirty")
     _current_layer = _ActiveField("current_layer")
     _current_space = _ActiveField("current_space")
     _undo_stack = _ActiveField("undo_stack")
@@ -1462,11 +1565,17 @@ class EzdxfBackend(AutoCADBackend):
         self._untitled_counter = 0
         self._activation_counter = 0
         self._connected = False
-        self._lock = asyncio.Lock()
+        self._lock = _DocLock()
         # R32: the document a timed-out call was abandoned on is untrusted until
         # it is replaced. See backends/quarantine.py for what that buys.
         self._quarantine: QuarantineRecord | None = None
         self._abandoned_calls: list[QuarantineRecord] = []
+        # W1 review follow-up: read-only calls past their deadline, still running.
+        self._detached_reads: list[DetachedRead] = []
+        # B01: cancellations and abandonments, newest last; Task 10 reads it.
+        self.call_outcomes: collections.deque = collections.deque(maxlen=_MAX_CALL_OUTCOMES)
+        self._leases: set[_Lease] = set()
+        self._in_flight: dict[concurrent.futures.Future, str] = {}
 
     @property
     def _state(self) -> _DocState:
@@ -1599,6 +1708,29 @@ class EzdxfBackend(AutoCADBackend):
     def is_connected(self) -> bool:
         return self._connected
 
+    def document_identity(self) -> dict:
+        """The active document's ``{document_id, revision, name, path, backend}`` (B11).
+
+        ``revision`` counts content changes (see ``_DirtyField``); a reopened
+        file is a new registration with a new id and revision 0.
+        """
+        if self._active_key is None or self._doc is None:
+            return {
+                "document_id": None,
+                "revision": None,
+                "name": None,
+                "path": None,
+                "backend": "ezdxf",
+            }
+        state = self._state
+        return {
+            "document_id": state.document_id,
+            "revision": state.revision,
+            "name": state.label,
+            "path": state.path,
+            "backend": "ezdxf",
+        }
+
     def capabilities(self) -> CapabilityMap:
         render_available = find_spec("matplotlib") is not None
         render_capability = (
@@ -1626,6 +1758,11 @@ class EzdxfBackend(AutoCADBackend):
                     reason="straight_edges_split_at_intersections;curved_edges_not_split",
                 ),
                 "hatch_edge_paths": FeatureCapability(True, "native"),
+                "hatch_loops": FeatureCapability(
+                    True,
+                    "native",
+                    reason="entity_get_reports_wcs_loops;ellipse_and_spline_edges_sampled_not_exact",
+                ),
                 "chspace": FeatureCapability(
                     True,
                     "computed",
@@ -1654,7 +1791,7 @@ class EzdxfBackend(AutoCADBackend):
                     "wcs",
                     reason=(
                         "reported_xy_is_wcs;z_component_not_reported;"
-                        "text_rotation_stays_in_entity_frame;hatch_boundaries_not_reported"
+                        "text_rotation_stays_in_entity_frame;hatch_loops_reported_in_wcs"
                     ),
                 ),
                 "ocs_tilted_plane": FeatureCapability(
@@ -1752,6 +1889,20 @@ class EzdxfBackend(AutoCADBackend):
         log.info("ezdxf backend ready")
 
     async def disconnect(self) -> None:
+        # B01: a pending original-deadline timer must not fire into a
+        # disconnected backend; a passed lease still ends with its worker.
+        for lease in list(self._leases):
+            if lease.timer is not None:
+                lease.timer.cancel()
+                lease.timer = None
+        self._leases.clear()
+        # A detached read's document goes away with the backend below; the
+        # lock it still holds must not stall a reconnected backend.
+        for read in self._detached_reads:
+            if read.thread_alive():
+                self._orphan_lock(read.lock)
+        self._detached_reads.clear()
+        await self._wait_for_workers(config.settings.shutdown_grace)
         for state in self._docs.values():
             state.discard_snapshots()
         self._docs.clear()
@@ -1762,6 +1913,30 @@ class EzdxfBackend(AutoCADBackend):
         # The record stays in _abandoned_calls for anyone reading the transcript.
         self._clear_quarantine("disconnect")
         self._connected = False
+
+    async def _wait_for_workers(self, grace: float) -> None:
+        """Wait up to ``grace`` seconds for in-flight workers; log the stragglers.
+
+        A straggler is not joined: it runs on a daemon thread, so the process
+        still exits; the log names it because whatever it was writing is lost.
+        """
+        pending = [(work, name) for work, name in list(self._in_flight.items()) if not work.done()]
+        if not pending:
+            return
+        waiters = [asyncio.wrap_future(work) for work, _ in pending]
+        if grace > 0:
+            await asyncio.wait(waiters, timeout=grace)
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.cancel()
+        for work, name in pending:
+            if not work.done():
+                log.warning(
+                    "disconnect: ezdxf worker %r is still running after SHUTDOWN_GRACE=%gs; "
+                    "it runs on a daemon thread and will not hold the process open",
+                    name,
+                    grace,
+                )
 
     def _cleanup_undo_stack(self):
         self._state.discard_snapshots()
@@ -1792,7 +1967,8 @@ class EzdxfBackend(AutoCADBackend):
                 self._docs.pop(previous_key).discard_snapshots()
                 if self._active_key == previous_key:
                     self._active_key = None
-        self._docs[key] = _DocState(key=key, doc=doc, path=path)
+        # B11: a registration is a document of its own - a reopened file too.
+        self._docs[key] = _DocState(key=key, doc=doc, path=path, document_id=uuid.uuid4().hex)
         self._activate_key(key)
         return key, reloaded
 
@@ -1893,6 +2069,8 @@ class EzdxfBackend(AutoCADBackend):
             "active": key == self._active_key,
             "saved": not state.dirty,
             "entity_count": len(state.doc.modelspace()),
+            "document_id": state.document_id,
+            "revision": state.revision,
         }
 
     def _close_document_sync(self, key: str, *, save: bool, discard: bool) -> dict:
@@ -2005,8 +2183,8 @@ class EzdxfBackend(AutoCADBackend):
     @staticmethod
     def _timeout_error(call: str, timeout: float) -> RuntimeError:
         return RuntimeError(
-            f"ezdxf call '{call}' timed out after {timeout:g}s. asyncio.to_thread "
-            "cannot be cancelled, so the worker thread was abandoned and may still be "
+            f"ezdxf call '{call}' timed out after {timeout:g}s. A worker thread "
+            "cannot be cancelled, so this one was abandoned and may still be "
             "writing to the drawing. Every later call on this document is refused - "
             "reads included - until drawing_open(path), drawing_new() or "
             "drawing_close() rebinds it, or until the abandoned call is seen to finish "
@@ -2101,122 +2279,404 @@ class EzdxfBackend(AutoCADBackend):
                 )
         return record
 
-    def _quarantine_document(self, func, watcher, timeout: float) -> str:
+    def _quarantine_document(
+        self,
+        func,
+        watcher,
+        timeout: float,
+        *,
+        document_path: str | None,
+        document_id: int | None,
+        cause: str = "deadline",
+    ) -> str:
         """Record an abandoned call and refuse the document until it is replaced.
 
         ``func`` is the caller's closure (it carries the qualname the message
         needs); ``watcher`` is the wrapper the worker thread is actually running,
-        and the only thing that can report whether it ever finished.
+        and the only thing that can report whether it ever finished. The
+        document is the one the call STARTED against (B01: captured at call
+        start, never re-read when the record is made).
         """
         call = real_call_name(func)
         record = QuarantineRecord(
             call,
             timeout,
             watcher,
-            document_path=self._doc_path,
-            document_id=id(self._doc),
+            document_path=document_path,
+            document_id=document_id,
+            cause=cause,
         )
         self._quarantine = record
         self._abandoned_calls.append(record)
         del self._abandoned_calls[:-_MAX_ABANDONED_RECORDS]
         return call
 
-    async def _async(self, func, *args, quarantine_exit: bool = False, **kwargs):
-        """Run a blocking ezdxf call in a worker thread, serialised and timed out.
+    def _orphan_lock(self, lock) -> None:
+        """Swap ``lock`` out (if it is current) and wake everything queued on it.
 
-        The ezdxf ``Drawing`` is not thread-safe, so every backend method funnels
-        through one lock. Without a timeout a single hung call held that lock
-        forever and every later tool call on the server deadlocked behind it.
-
-        ``EZDXF_CALL_TIMEOUT`` (seconds, ``0`` disables) bounds the *whole* wait —
-        queueing behind an in-flight call plus the call itself — mirroring
-        ``ComBackend._run``, where the executor queue wait sits inside the same
-        ``wait_for``.
-
-        Lock ownership on timeout: ``asyncio.to_thread`` cannot be cancelled, so
-        the worker thread outlives the timeout and may still be mutating the
-        document. The timed-out call therefore deliberately **never releases its
-        lock**; the backend swaps in a fresh ``asyncio.Lock`` and leaves the
-        abandoned call holding the orphaned one. The runaway thread can then never
-        hand the lock to new work mid-write, and the next tool call proceeds
-        immediately instead of deadlocking — the same abandon-and-rebuild shape the
-        COM backend uses for its stuck STA executor. Callers already queued on the
-        orphaned lock get the explicit "backend busy" error rather than silently
-        interleaving with the runaway thread. Timing out while merely *waiting*
-        for the lock does not abandon it: that lock is held by a live call which
-        will release it normally. Outside cancellation (client disconnect) also
-        releases normally, as it did before the timeout existed.
-
-        R32 — swapping the lock is only half the answer, and on its own it is the
-        more dangerous half: it removes the mutual exclusion the lock existed
-        for, so the *next* call runs against the same ``Drawing`` the runaway is
-        still mutating. Measured, that returned a fresh circle handle, an entity
-        count for a modelspace 50 entities further on, and a valid DXF of a state
-        that never existed. So the abandonment quarantines the document, and
-        every later call is refused **before** ``lock.acquire()`` — after the
-        acquire the refusal would queue behind an unrelated in-flight call and
-        the caller would wait the full timeout to be told the document is
-        untrusted. Reads are refused too: a read of a container another thread is
-        appending to does not tear loudly, it runs unbounded — ``drawing_info``
-        blew its own 2.0s deadline at 2.03s and abandoned a *second* worker.
-
-        ``quarantine_exit=True`` is for the three calls that rebind ``self._doc``
-        to a freshly constructed object. They still take the lock, because two
-        concurrent recoveries would otherwise both rebind it and one fresh
-        document would be silently discarded with its caller's work in it.
+        The fresh lock is installed BEFORE the waiters are woken, so a woken
+        call that retries finds it. ``self._lock`` is therefore never an orphan.
         """
-        # The gate, before any await: a refusal must not queue.
+        if self._lock is lock:
+            self._lock = _DocLock()
+        orphan = getattr(lock, "orphan", None)
+        if orphan is not None:
+            orphan()
+
+    def _gate(self, quarantine_exit: bool, detached_read_exit: bool) -> None:
+        """Refuse a call the current state does not admit (before any await).
+
+        A quarantine refuses everything but its three exits. A detached read
+        refuses every call on the document it holds, except the exits that
+        replace that document object (``quarantine_exit`` or
+        ``detached_read_exit``); a call on another document goes through.
+        """
         if self._quarantine is not None:
             self._reap_quarantine()
             if self._quarantine is not None and not quarantine_exit:
                 raise quarantine_refusal(self._quarantine)
+        if self._detached_reads:
+            self._reap_detached_reads()
+            if not (quarantine_exit or detached_read_exit):
+                holder = self._detached_read_on(self._doc)
+                if holder is not None:
+                    raise detached_read_refusal(holder)
+
+    def _reap_detached_reads(self) -> None:
+        """Forget the detached reads whose worker has ended (the free exit)."""
+        live = []
+        for read in self._detached_reads:
+            if read.thread_alive():
+                live.append(read)
+                continue
+            error = read.watcher.error
+            log.warning(
+                "detached read-only ezdxf call %r ended %.1fs after it started%s; "
+                "its document is available again",
+                read.call,
+                read.age(),
+                f" with {type(error).__name__}: {error}" if error is not None else "",
+            )
+        self._detached_reads = live
+
+    def _detached_read_on(self, document) -> DetachedRead | None:
+        if document is None:
+            return None
+        for read in self._detached_reads:
+            if read.document is document and read.thread_alive():
+                return read
+        return None
+
+    def _call_target(self):
+        """The document a call submitted now runs on: ``(Drawing, path, id, label)``."""
+        doc = self._doc
+        document_path = self._doc_path
+        document_id = id(doc) if doc is not None else None
+        return doc, document_path, document_id, document_path or self._active_key
+
+    def _held_by_detached_read(self, lock) -> bool:
+        return any(read.lock is lock and read.thread_alive() for read in self._detached_reads)
+
+    def _detach_read(self, func, watched: AbandonedCall, timeout: float, lease: _Lease) -> None:
+        """A read-only call is past its ORIGINAL deadline and still running.
+
+        It is never quarantined: a read cannot change the drawing. It is
+        recorded (``readonly_overrun``, with the deadline), and from now on
+        ``_gate`` refuses every other call on its document by name while the
+        exits work. The lock stays with the read; whoever passes the gate and
+        needs it swaps it out (``_async``), and the calls already queued on it
+        are woken now and answered by the new state.
+        """
+        row = lease.row
+        started = row["started"] if row is not None else time.time() - timeout
+        if row is not None:
+            row["outcome"] = "readonly_overrun"
+            row["deadline"] = started + timeout
+        self._detached_reads.append(
+            DetachedRead(
+                real_call_name(func),
+                timeout,
+                watched,
+                document=lease.document,
+                document_path=lease.document_path,
+                started=started,
+                lock=lease.lock,
+            )
+        )
+        if any(not waiter.done() for waiter in (getattr(lease.lock, "_waiters", None) or ())):
+            self._orphan_lock(lease.lock)
+
+    def _record_outcome(
+        self, func, outcome: str, started: float, document: str | None, *, ended: float | None
+    ) -> dict:
+        row = {
+            "call": real_call_name(func),
+            "outcome": outcome,
+            "started": started,
+            "ended": ended,
+            "document": document,
+            # B12: the operation this call belongs to (the middleware's or a
+            # cad_batch step's), read in the awaiting coroutine's context.
+            "operation_id": CURRENT_OPERATION.get(),
+        }
+        self.call_outcomes.append(row)
+        return row
+
+    def _forget_in_flight(self, work: concurrent.futures.Future) -> None:
+        # Runs on the worker thread as the future completes; a dict pop is
+        # atomic under the GIL.
+        self._in_flight.pop(work, None)
+
+    def _pass_lease(self, lease: _Lease, watched: AbandonedCall) -> None:
+        """Hand the document lock to the worker thread (B01).
+
+        The awaiting coroutine is gone (cancelled), the worker is not: it keeps
+        the lock until it ends, and the release reaches the loop through
+        ``call_soon_threadsafe``. A loop that is already closed has nobody left
+        to hand the lock to, so that case is dropped silently.
+        """
+        loop = lease.loop
+
+        def _on_finish() -> None:  # worker thread
+            try:
+                loop.call_soon_threadsafe(self._lease_finished, lease, watched)
+            except RuntimeError:
+                pass
+
+        if not watched.set_on_finish(_on_finish):
+            self._lease_finished(lease, watched)
+
+    def _lease_finished(self, lease: _Lease, watched: AbandonedCall) -> None:
+        """The worker holding a passed lease has ended (loop thread)."""
+        if lease.timer is not None:
+            lease.timer.cancel()
+            lease.timer = None
+        self._leases.discard(lease)
+        if lease.done:
+            return
+        lease.done = True
+        if lease.row is not None:
+            lease.row["ended"] = time.time()
+            if lease.row["outcome"] == "cancelled_running":
+                lease.row["outcome"] = (
+                    "failed_after_cancel" if watched.error is not None else "completed_after_cancel"
+                )
+        if lease.abandoned or getattr(lease.lock, "orphaned", False):
+            # The original deadline already swapped this lock out. Waiters
+            # queued on it were woken and answered by the new state; nobody
+            # may inherit it now.
+            return
+        lease.lock.release()
+
+    def _lease_deadline(self, lease: _Lease, watched: AbandonedCall, func, timeout: float) -> None:
+        """The cancelled call's ORIGINAL deadline arrived (loop thread)."""
+        lease.timer = None
+        self._leases.discard(lease)
+        if lease.done or watched.finished:
+            return  # finished in time; _lease_finished releases (or already did)
+        if lease.readonly:
+            self._detach_read(func, watched, timeout, lease)
+            log.warning(
+                "cancelled read-only ezdxf call %r is still running at its "
+                "EZDXF_CALL_TIMEOUT=%gs deadline; detaching it - its document is refused "
+                "to other calls until it ends, the exits work, nothing is quarantined",
+                real_call_name(func),
+                timeout,
+            )
+            return
+        lease.abandoned = True
+        self._orphan_lock(lease.lock)
+        name = self._quarantine_document(
+            func,
+            watched,
+            timeout,
+            document_path=lease.document_path,
+            document_id=lease.document_id,
+            cause="cancelled_then_deadline",
+        )
+        if lease.row is not None:
+            lease.row["outcome"] = "abandoned_deadline"
+        log.error(
+            "cancelled ezdxf call %r was still running at its EZDXF_CALL_TIMEOUT=%gs deadline; "
+            "abandoning the worker and the lock it holds, and quarantining the document",
+            name,
+            timeout,
+        )
+
+    async def _async(
+        self,
+        func,
+        *args,
+        quarantine_exit: bool = False,
+        readonly: bool = False,
+        detached_read_exit: bool = False,
+        **kwargs,
+    ):
+        """Run a blocking ezdxf call in a worker thread, serialised and timed out.
+
+        The ezdxf ``Drawing`` is not thread-safe, so every backend method funnels
+        through one lock. ``EZDXF_CALL_TIMEOUT`` (seconds, ``0`` disables)
+        bounds the *whole* wait — queueing behind an in-flight call plus the
+        call itself — mirroring ``ComBackend._run``.
+
+        **The lease follows the worker thread (v1.7.0, B01).** Nothing can stop
+        a worker thread, so whatever ends the *wait* — a deadline, a
+        cancellation (the MCP SDK cancels a request by cancelling an anyio
+        scope, so a client pressing Esc is enough), a shutdown — the lock stays
+        with the worker until it ends:
+
+        - cancelled while queued: nothing was acquired, nothing is released;
+        - cancelled while running: the cancelled coroutine does NOT release;
+          ``AbandonedCall.set_on_finish`` hands the release to the worker,
+          which posts it to the loop with ``call_soon_threadsafe`` exactly once.
+          The call is recorded in ``call_outcomes``. If the worker is still
+          alive at the call's ORIGINAL deadline, the abandon path below runs
+          then (cause ``cancelled_then_deadline``);
+        - deadline overrun: the worker's own future decides — ``work.done()``,
+          never ``cancelled()``. Done means the call finished (or raised
+          ``TimeoutError`` itself) as the deadline fired: its outcome is
+          returned or raised and the lock released. Still running means the
+          worker is abandoned: the lock is swapped, the orphaned one is never
+          released (waiters already past the gate must not inherit it), and the
+          document is quarantined;
+        - ``readonly=True`` (or a ``func`` marked by
+          ``quarantine.mark_readonly``): an overrun never quarantines the document — a
+          read cannot change it. From the call's ORIGINAL deadline on (a
+          cancelled read keeps its deadline too) the read is *detached*: a
+          ``readonly_overrun`` row is written, every other call on its
+          document is refused by name (``DocumentBusyError``), and the exits
+          (``quarantine_exit`` / ``detached_read_exit``: drawing_open /
+          drawing_new / drawing_close / document_activate / document_close,
+          and document_list) do not wait for it, swapping out the lock the
+          read holds — they replace the document object the read holds (or,
+          document_list, only read the registry), so nothing races it. Not
+          waiting is not answering at once: a read that computes holds the
+          GIL and the event loop runs only in its switch slices, so every
+          answer is slow until the read ends (measured: an 8 s CPU-bound read
+          at a 1 s deadline - its own error at 5.1-5.5 s, a busy refusal in
+          1.2-1.8 s, drawing_new in 0.6-1.3 s; a read waiting on I/O leaves
+          the GIL free and they answer in milliseconds);
+        - a swapped lock wakes its queue at once (``_DocLock.orphan``): a call
+          queued on it is answered by the new state — a refusal, or a retry
+          on the fresh lock for an exit — never by its own timeout;
+        - ``EZDXF_CALL_TIMEOUT=0``: no deadline, so nothing is ever abandoned,
+          quarantined or detached; a cancelled call's lease is still held
+          until its worker ends, and every later call - the exits included -
+          queues behind it: a runaway is freed only by its end or a restart.
+
+        The document a call runs against (``Drawing``, path and identity) is
+        captured once it holds the lock, right before its worker is submitted -
+        never at entry: an exit queued ahead of it (document_activate,
+        drawing_open, drawing_new) switches ``self._doc`` while it waits, and a
+        read filed against the document it does NOT read would let the gate
+        admit writes on the one it does. It is not read again when recorded.
+
+        Workers run on ``_WORKERS``, a ``DaemonExecutor``: a runaway can never
+        hold the interpreter open at exit.
+
+        R32 — every later call is refused **before** ``lock.acquire()`` while
+        the document is quarantined (after the acquire the refusal would queue
+        behind an unrelated call), and refused again after the acquire for a
+        waiter that got past the gate before the quarantine began.
+        ``quarantine_exit=True`` is for the three calls that rebind
+        ``self._doc`` to a freshly constructed object; they still take the lock.
+        """
+        # A function marked by quarantine.mark_readonly is a read whatever
+        # keywords a wrapper around this method passed on.
+        readonly = readonly or is_marked_readonly(func)
+        # The gate, before any await: a refusal must not queue.
+        if self._quarantine is not None or self._detached_reads:
+            self._gate(quarantine_exit, detached_read_exit)
 
         timeout = config.settings.ezdxf_call_timeout
-        if timeout <= 0:
-            # No deadline means no abandon branch, so nothing here can quarantine.
-            async with self._lock:
-                return await asyncio.to_thread(func, *args, **kwargs)
-
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = loop.time() + timeout if timeout > 0 else None
         lock = self._lock
-        # One `asyncio.timeout_at` for both phases rather than two
-        # `asyncio.wait_for`s. `wait_for` wraps its awaitable in a Task, so the
-        # old shape cost two extra Tasks and two timer handles on *every* call
-        # — 4,000 of each to draw 2,000 lines, which is where the throughput
-        # this release lost was going. `acquired` keeps the two failure modes
-        # distinguishable, which is the whole reason they were separate.
-        acquired = False
-        call: asyncio.Future | None = None
-        # The only place an abandoned thread's outcome is observable is inside
-        # the thread: `call` is CANCELLED by the deadline, so its done-callback
-        # reports the await ending and never the worker. See AbandonedCall.
+        # Provisional: only a call that never gets the lock is filed under it.
+        # The document a call RUNS on is the one active once it holds the
+        # lock - an exit queued ahead of it may switch documents meanwhile -
+        # so the target is taken again after every acquire, below.
+        doc, document_path, document_id, document = self._call_target()
+        started = time.time()
         watched = AbandonedCall(func)
+        acquired = False
+        work: concurrent.futures.Future | None = None
         try:
             async with asyncio.timeout_at(deadline):
-                await lock.acquire()
+                while True:
+                    lock = self._lock
+                    if self._detached_reads and self._held_by_detached_read(lock):
+                        # Past the gate, so this call may run while the read
+                        # does: the read keeps its (now orphaned) lock.
+                        self._orphan_lock(lock)
+                        lock = self._lock
+                    await lock.acquire()
+                    # Whatever ran before this acquire (an exit, or a call an
+                    # orphan wake let through) may have switched the active
+                    # document; the worker reads self._doc, so this is it.
+                    doc, document_path, document_id, document = self._call_target()
+                    if not lock.orphaned:
+                        break
+                    # Swapped out while this call queued on it: the state that
+                    # swapped it answers - a refusal, or a retry on the fresh
+                    # lock for a call it admits (an exit, another document).
+                    self._gate(quarantine_exit, detached_read_exit)
                 acquired = True
-                call = asyncio.ensure_future(asyncio.to_thread(watched, *args, **kwargs))
-                result = await call
+                if self._quarantine is not None or self._detached_reads:
+                    self._gate(quarantine_exit, detached_read_exit)
+                work = _WORKERS.submit(contextvars.copy_context().run, watched, *args, **kwargs)
+                self._in_flight[work] = real_call_name(func)
+                work.add_done_callback(self._forget_in_flight)
+                result = await asyncio.wrap_future(work, loop=loop)
         except TimeoutError as exc:
             if not acquired:
                 # Timed out queueing behind someone else's live call. That lock
-                # is held by a call that will release it normally; do not
-                # abandon it.
+                # is held by a call that will release it normally.
                 raise self._busy_error(timeout) from exc
-            if call is None or not call.cancelled():
-                # The call itself raised TimeoutError (an OSError subclass,
-                # and the same type the deadline raises) rather than overrunning
-                # the deadline. That is an ordinary failure: release the lock
-                # and let it through unchanged instead of blaming the deadline.
+            if work is None:
                 lock.release()
                 raise
-            if self._lock is lock:
-                self._lock = asyncio.Lock()
-            # Same handler, same branch as the lock swap: the two other exits
-            # above touched nothing, and quarantining on either would refuse the
-            # whole document for a failure that never reached it.
-            name = self._quarantine_document(func, watched, timeout)
+            if work.done():
+                # Finished (or raised TimeoutError itself) as the deadline
+                # fired: the worker is gone, so is the lease, and its outcome
+                # is the answer. A never-started future is cancelled, not run.
+                lock.release()
+                if work.cancelled():
+                    raise RuntimeError(
+                        f"ezdxf call '{real_call_name(func)}' timed out after {timeout:g}s "
+                        "before its worker started; nothing ran."
+                    ) from exc
+                return work.result()
+            name = real_call_name(func)
+            if readonly:
+                row = self._record_outcome(func, "readonly_overrun", started, document, ended=None)
+                lease = _Lease(
+                    loop, lock, row, document_path, document_id, document=doc, readonly=True
+                )
+                self._detach_read(func, watched, timeout, lease)
+                self._pass_lease(lease, watched)
+                log.warning(
+                    "read-only ezdxf call %r exceeded EZDXF_CALL_TIMEOUT=%gs; detaching it - "
+                    "its document is refused to other calls until it ends, the exits work, "
+                    "and nothing is quarantined",
+                    name,
+                    timeout,
+                )
+                raise RuntimeError(
+                    f"ezdxf read '{name}' timed out after {timeout:g}s. It is read-only, so "
+                    "the document is NOT quarantined. Its worker cannot be cancelled and still "
+                    "reads the drawing, so until it finishes every other call on this document "
+                    "answers 'busy' by name; drawing_open(path), drawing_new(), drawing_close(), "
+                    "document_activate(<another document>) and document_close() do not wait for "
+                    "it (while it computes, every answer is slower). Raise EZDXF_CALL_TIMEOUT "
+                    "(seconds; 0 disables the timeout entirely - then nothing is detached and a "
+                    "runaway read holds every call) if this read is legitimately slow."
+                ) from exc
+            self._orphan_lock(lock)
+            self._quarantine_document(
+                func, watched, timeout, document_path=document_path, document_id=document_id
+            )
+            self._record_outcome(func, "abandoned_deadline", started, document, ended=None)
             log.error(
                 "ezdxf call %r exceeded EZDXF_CALL_TIMEOUT=%gs; abandoning the worker "
                 "thread and the lock it holds, and quarantining the document it may "
@@ -2225,12 +2685,38 @@ class EzdxfBackend(AutoCADBackend):
                 timeout,
             )
             raise self._timeout_error(name, timeout) from exc
-        except BaseException:
-            # Only ours to release if we ever took it — cancellation can land
-            # while still queueing, and releasing someone else's lock there
-            # would hand the document to two callers at once.
-            if acquired:
+        except BaseException as exc:
+            if not acquired:
+                if isinstance(exc, asyncio.CancelledError):
+                    self._record_outcome(
+                        func, "cancelled_queued", started, document, ended=time.time()
+                    )
+                raise
+            if work is None or work.cancel() or work.done():
+                # Never started (cancelled before a worker took it), or already
+                # ended: the lease ends here, with this coroutine.
                 lock.release()
+                if isinstance(exc, asyncio.CancelledError):
+                    if work is None or work.cancelled():
+                        outcome = "cancelled_queued"
+                    elif work.exception() is not None:
+                        outcome = "failed_after_cancel"
+                    else:
+                        outcome = "completed_after_cancel"
+                    self._record_outcome(func, outcome, started, document, ended=time.time())
+                raise
+            # Cancelled while the worker runs: the lease passes to the worker.
+            row = self._record_outcome(func, "cancelled_running", started, document, ended=None)
+            lease = _Lease(
+                loop, lock, row, document_path, document_id, document=doc, readonly=readonly
+            )
+            if deadline is not None:
+                # A read keeps its original deadline too: there it is detached.
+                lease.timer = loop.call_at(
+                    deadline, self._lease_deadline, lease, watched, func, timeout
+                )
+                self._leases.add(lease)
+            self._pass_lease(lease, watched)
             raise
         lock.release()
         return result
@@ -2275,9 +2761,11 @@ class EzdxfBackend(AutoCADBackend):
                 units=unit_str,
                 version=doc.dxfversion,
                 backend="ezdxf",
+                document_id=self._state.document_id,
+                revision=self._state.revision,
             )
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def drawing_new(self, template: str | None = None) -> dict:
         def _sync():
@@ -2389,7 +2877,37 @@ class EzdxfBackend(AutoCADBackend):
         return await self._async(_sync)
 
     async def drawing_export_dxf(self, path: str) -> dict:
-        return await self.drawing_save_as(path, "dxf")
+        """A DXF copy of the active document; the document is not re-pointed.
+
+        ``doc.saveas`` (``drawing_save_as``) sets ``doc.filename`` and this
+        backend's path and saved flag; an export must do neither (v1.7.0,
+        B23), so the document is written through ``doc.write`` into a stream
+        this method opens, with ``Drawing.save``'s own encoding rule
+        (``output_encoding``, errors ``dxfreplace``). Not a content change:
+        the revision does not move. A ``.dwg`` name is refused (``dwg``).
+        """
+        if _is_dwg_path(path):
+            raise _refuse_dwg("drawing_export_dxf", path)
+
+        def _sync():
+            doc = self._require_doc()
+            self._refuse_path_held_elsewhere("drawing_export_dxf", path)
+            with open(path, "w", encoding=doc.output_encoding, errors="dxfreplace") as stream:
+                doc.write(stream)
+            return {
+                "ok": True,
+                "path": path,
+                "format": "dxf",
+                "method": "ezdxf.write",
+                "dxf_version": doc.dxfversion,
+                "document": {
+                    "name": Path(self._doc_path).name if self._doc_path else "untitled.dxf",
+                    "full_name": self._doc_path or "",
+                },
+                "repointed": False,
+            }
+
+        return await self._async(_sync)
 
     # ── external references, rasters and DWG (v1.6 track G) ──────────────────
 
@@ -2753,7 +3271,7 @@ class EzdxfBackend(AutoCADBackend):
                 current = doc.active_layout().name
             return {"ok": True, "layouts": names, "current": current}
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def layout_create(self, name: str) -> dict:
         def _sync():
@@ -3027,7 +3545,12 @@ class EzdxfBackend(AutoCADBackend):
         def _sync():
             return [self._document_row(key, state) for key, state in self._docs.items()]
 
-        return await self._async(_sync)
+        # Admitted past a detached read like an exit (review minor 4): the
+        # busy refusal sends the caller to document_activate(<another
+        # document>), and this is the call that names them. It reads the
+        # registry and each document's entity count, so running next to a
+        # read races nothing.
+        return await self._async(_sync, readonly=True, detached_read_exit=True)
 
     async def document_activate(self, name_or_path: str) -> dict:
         if not isinstance(name_or_path, str):
@@ -3050,7 +3573,9 @@ class EzdxfBackend(AutoCADBackend):
 
         # Not a quarantine exit: a quarantined backend refuses to switch, because
         # the runaway thread holds the one worker and the one orphaned lock.
-        return await self._async(_sync)
+        # It is a detached read's exit: switching away leaves the read its
+        # document, and switching back to it is refused again by the gate.
+        return await self._async(_sync, detached_read_exit=True)
 
     async def document_close(
         self, name_or_path: str | None = None, save: bool = False, discard: bool = False
@@ -3067,7 +3592,9 @@ class EzdxfBackend(AutoCADBackend):
             key = self._resolve_document_key(name_or_path)
             return self._close_document_sync(key, save=save, discard=discard)
 
-        return await self._async(_sync, quarantine_exit=closing_active)
+        # Closing never races a detached read: the active document is the
+        # read's (then it is replaced) or another one.
+        return await self._async(_sync, quarantine_exit=closing_active, detached_read_exit=True)
 
     # ── layer states ──────────────────────────────────────────────────────────
 
@@ -3236,7 +3763,7 @@ class EzdxfBackend(AutoCADBackend):
                 )
             return rows
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def layer_state_delete(self, name) -> dict:
         from engineering.environment.layer_states import validate_state_name
@@ -3406,7 +3933,7 @@ class EzdxfBackend(AutoCADBackend):
                 for view in doc.views
             ]
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     # ── UCS ───────────────────────────────────────────────────────────────────
 
@@ -3472,7 +3999,7 @@ class EzdxfBackend(AutoCADBackend):
                 rows.append(self._ucs_row(None, origin, x_axis, y_axis, True))
             return rows
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def ucs_set(self, name, origin, x_axis, y_axis) -> dict:
         from engineering.environment.names import validate_name
@@ -3637,7 +4164,7 @@ class EzdxfBackend(AutoCADBackend):
                 result["note"] = self._R12_NOTE
             return result
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def viewport_set_scale(self, handle: str, scale: float) -> dict:
         def _sync():
@@ -4217,7 +4744,7 @@ class EzdxfBackend(AutoCADBackend):
                 if name != "Model"
             ]
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def page_setup_apply(self, layout: str, setup: dict) -> dict:
         from engineering.standards.papers import (
@@ -4617,6 +5144,17 @@ class EzdxfBackend(AutoCADBackend):
             _ensure_linetype_loaded(self._require_doc(), linetype)
             entity.dxf.linetype = linetype
 
+    def _attach_xdata(self, entity, prepared) -> None:
+        """XDATA validated by ``prepare_xdata``, written inside the create call's
+        own worker job (v1.7.0, B17): one lock, one undo snapshot."""
+        if not prepared:
+            return
+        doc = self._require_doc()
+        for app, tags in prepared:
+            if app not in doc.appids:
+                doc.appids.add(app)
+            entity.set_xdata(app, tags)
+
     def _mark_dirty(self):
         self._dirty = True
         self._push_undo_snapshot()
@@ -4716,7 +5254,10 @@ class EzdxfBackend(AutoCADBackend):
         layer=None,
         color=None,
         linetype=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             msp = self._msp()
             ent = msp.add_line(
@@ -4724,6 +5265,7 @@ class EzdxfBackend(AutoCADBackend):
                 (float(x2), float(y2), float(z2)),
             )
             self._apply_attrs(ent, layer, color, linetype)
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
@@ -4736,11 +5278,15 @@ class EzdxfBackend(AutoCADBackend):
         radius,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             msp = self._msp()
             ent = msp.add_circle((float(cx), float(cy)), float(radius))
             self._apply_attrs(ent, layer, color)
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
@@ -4755,7 +5301,10 @@ class EzdxfBackend(AutoCADBackend):
         end_angle,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             msp = self._msp()
             ent = msp.add_arc(
@@ -4765,6 +5314,7 @@ class EzdxfBackend(AutoCADBackend):
                 float(end_angle),
             )
             self._apply_attrs(ent, layer, color)
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
@@ -4776,12 +5326,16 @@ class EzdxfBackend(AutoCADBackend):
         closed=False,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             msp = self._msp()
             pts_2d = [(float(p[0]), float(p[1])) for p in points]
             ent = msp.add_lwpolyline(pts_2d, close=closed)
             self._apply_attrs(ent, layer, color)
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
@@ -4796,7 +5350,10 @@ class EzdxfBackend(AutoCADBackend):
         rotation=0.0,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             msp = self._msp()
             ent = msp.add_text(
@@ -4809,6 +5366,7 @@ class EzdxfBackend(AutoCADBackend):
                 },
             )
             self._apply_attrs(ent, layer, color)
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
@@ -5023,7 +5581,10 @@ class EzdxfBackend(AutoCADBackend):
         angle=0.0,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             msp = self._msp()
             hatch = msp.add_hatch()
@@ -5031,6 +5592,7 @@ class EzdxfBackend(AutoCADBackend):
             pts = [(float(p[0]), float(p[1])) for p in boundary_points]
             hatch.paths.add_polyline_path(pts, is_closed=True)
             self._apply_attrs(hatch, layer, color)
+            self._attach_xdata(hatch, prepared)
             self._mark_dirty()
             return _entity_info_dxf(hatch)
 
@@ -5805,11 +6367,31 @@ class EzdxfBackend(AutoCADBackend):
     async def entity_delete(self, handle) -> dict:
         def _sync():
             ent = self._get_entity(handle)
-            self._msp().delete_entity(ent)
+            self._owner_layout(ent).delete_entity(ent)
             self._mark_dirty()
             return {"ok": True, "deleted_handle": handle}
 
         return await self._async(_sync)
+
+    @staticmethod
+    def _owner_layout(ent):
+        """The layout that holds ``ent`` - model space, a paper layout or a block
+        definition - which is the one it must be deleted from.
+
+        ``entity_delete`` deleted from ``_msp()``, the *current* space, so a
+        handle on another layout died in ezdxf with ``ValueError:
+        list.remove(x): x not in list`` (W1 review: the paper-space
+        construction line ``construction_left`` names). ActiveX
+        ``HandleToObject(h).Delete()`` deletes wherever the entity lives; this
+        is the same rule.
+        """
+        layout = ent.get_layout()
+        if layout is None:
+            raise RuntimeError(
+                f"Entity {ent.dxf.handle} ({ent.dxftype()}) belongs to no layout or block "
+                "definition, so there is nothing to delete it from."
+            )
+        return layout
 
     async def entity_array_rectangular(
         self,
@@ -5876,9 +6458,9 @@ class EzdxfBackend(AutoCADBackend):
 
     async def entity_get(self, handle) -> EntityInfo:
         def _sync():
-            return _entity_info_dxf(self._get_entity(handle))
+            return _entity_info_dxf(self._get_entity(handle), detail=True)
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def entity_set_properties(
         self,
@@ -5950,8 +6532,9 @@ class EzdxfBackend(AutoCADBackend):
     _DIMENSION_NOTE = (
         "DIMENSION text is not searched: its text field holds the '<>' override "
         "placeholder rather than the measured value, so editing it would either do "
-        "nothing or detach the dimension from what it measures. Use "
-        "dimension_* text_override for that."
+        "nothing or detach the dimension from what it measures; nor is any "
+        "anonymous block ('*D' holds a dimension's rendered measurement, '*T' a "
+        "table's). Use dimension_* text_override for that."
     )
 
     async def text_set_background(
@@ -6019,17 +6602,37 @@ class EzdxfBackend(AutoCADBackend):
             doc = self._require_doc()
             pattern = re.compile(re.escape(needle), 0 if match_case else re.IGNORECASE)
 
-            def _candidates():
+            def _containers():
                 # Block *definitions* carry ATTDEF and any text drawn inside the
                 # block; a search that only walks layouts silently misses them.
-                yield from doc.modelspace()
+                # Layout blocks are the layouts already walked; an xref's block
+                # holds another file's content, never this drawing's. An
+                # anonymous block ("*D", "*T", "*U", "*X" ...) is a rendering
+                # regenerated from its owner: a DIMENSION's "*D" block holds
+                # the displayed measurement as MTEXT, and rewriting it showed
+                # a number the dimension does not measure. Same rule live.
+                yield doc.modelspace()
                 for layout_name in doc.layouts.names():
                     if layout_name != "Model":
-                        yield from doc.layouts.get(layout_name)
+                        yield doc.layouts.get(layout_name)
                 for block in doc.blocks:
-                    yield from block
-                for entity in doc.modelspace().query("INSERT"):
-                    yield from entity.attribs
+                    if (
+                        block.is_any_layout
+                        or block.block_record.is_xref
+                        or block.name.startswith("*")
+                    ):
+                        continue
+                    yield block
+
+            def _candidates():
+                # The ATTRIBs of EVERY block reference - on a paper layout or
+                # nested in a block definition too, not only in model space:
+                # the live engine searches exactly this (TEXT_SEARCH_SCOPE).
+                for container in _containers():
+                    for entity in container:
+                        yield entity
+                        if entity.dxftype() == "INSERT":
+                            yield from entity.attribs
 
             changed: list[dict] = []
             seen: set[str] = set()
@@ -6085,6 +6688,7 @@ class EzdxfBackend(AutoCADBackend):
                 # are different answers, and the caller can only tell them apart
                 # if the scope is on the response.
                 "searched_types": list(self._TEXT_BEARING_TYPES),
+                "searched_scope": list(TEXT_SEARCH_SCOPE),
                 "note": self._DIMENSION_NOTE,
                 "dry_run": bool(dry_run),
             }
@@ -6234,7 +6838,7 @@ class EzdxfBackend(AutoCADBackend):
                 select.Window((lo_x, lo_y), (hi_x, hi_y)), resolved, entity_type, layer
             )
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def selection_polygon(
         self, points, mode: str = "window", entity_type: str = "", layer: str = ""
@@ -6255,7 +6859,7 @@ class EzdxfBackend(AutoCADBackend):
                 }
             return self._select_shape(select.Polygon(vertices), resolved, entity_type, layer)
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def selection_filter(
         self,
@@ -6330,7 +6934,7 @@ class EzdxfBackend(AutoCADBackend):
                 "filtered_by": filtered_by,
             }
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def entity_list(
         self,
@@ -6358,7 +6962,7 @@ class EzdxfBackend(AutoCADBackend):
                     break
             return results
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def entity_count(self, type_filter=None, layer_filter=None) -> int:
         # Deliberately a mirror of entity_list's filter arms rather than a call
@@ -6378,7 +6982,7 @@ class EzdxfBackend(AutoCADBackend):
                 count += 1
             return count
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     # ── layer management ──────────────────────────────────────────────────────
 
@@ -6387,7 +6991,7 @@ class EzdxfBackend(AutoCADBackend):
             doc = self._require_doc()
             return [_layer_info_dxf(lyr, self._current_layer) for lyr in doc.layers]
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def layer_create(
         self,
@@ -6532,7 +7136,7 @@ class EzdxfBackend(AutoCADBackend):
             doc = self._require_doc()
             return [lt.dxf.name for lt in doc.linetypes]
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def linetype_load(self, name, file=None) -> dict:
         # Loads a single linetype. Lookup order:
@@ -6592,7 +7196,7 @@ class EzdxfBackend(AutoCADBackend):
                 )
             return blocks
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def block_insert(
         self,
@@ -6620,7 +7224,19 @@ class EzdxfBackend(AutoCADBackend):
                 attribs["layer"] = layer
             self._require_block(name)
             ref = msp.add_blockref(name, (float(x), float(y)), dxfattribs=attribs)
-            if values:
+            # Every ATTDEF gets its ATTRIB, with the default where no value is
+            # given - what the live `InsertBlock` does (measured on AutoCAD
+            # 2026); without values the headless INSERT had none (W1-T1-08).
+            attdefs = list(self._doc.blocks.get(name).query("ATTDEF"))
+            if attdefs:
+                # `add_auto_attribs` matches tags exactly; `values` is keyed
+                # upper-case (tags are not case-sensitive, backlog W1-T1-05),
+                # so a foreign definition's lower-case ATTDEF is keyed by its
+                # own spelling here.
+                for attdef in attdefs:
+                    own = attdef.dxf.get("tag", "")
+                    if own and own not in values and own.upper() in values:
+                        values[own] = values[own.upper()]
                 # `add_auto_blockref` wraps the INSERT in an anonymous *U block,
                 # so the returned handle names `*U1` and carries no ATTRIBs.
                 # `add_auto_attribs` attaches ATTRIBs to this INSERT for every
@@ -6998,7 +7614,7 @@ class EzdxfBackend(AutoCADBackend):
                 result[attrib.dxf.tag] = self._attrib_value(attrib)
             return result
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def block_set_attributes(self, handle, attributes) -> dict:
         from backends.block_specs import validate_attribute_values
@@ -7012,8 +7628,9 @@ class EzdxfBackend(AutoCADBackend):
             updated = []
             for attrib in ent.attribs:
                 tag = attrib.dxf.tag
-                if tag in values:
-                    self._write_attrib_value(attrib, values[tag])
+                # `values` is keyed upper-case: tags are not case-sensitive.
+                if tag.upper() in values:
+                    self._write_attrib_value(attrib, values[tag.upper()])
                     updated.append(tag)
             self._mark_dirty()
             return {"ok": True, "updated_tags": updated}
@@ -7039,7 +7656,7 @@ class EzdxfBackend(AutoCADBackend):
                     out[app] = decode_values((tag.code, tag.value) for tag in tags)
             return {"handle": handle, "xdata": out, "backend": "ezdxf"}
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def entity_set_xdata(self, handle, app_name, values) -> dict:
         from backends.xdata_specs import (
@@ -7166,6 +7783,7 @@ class EzdxfBackend(AutoCADBackend):
             solid_vertices,
             validate_attdef_specs,
             validate_base_point,
+            validate_block_name,
             validate_entity_specs,
         )
         from security import sanitize_symbol_name
@@ -7173,11 +7791,12 @@ class EzdxfBackend(AutoCADBackend):
         # The anonymous-name rule comes first: ``*`` is also a forbidden DXF
         # symbol character, so ``sanitize_symbol_name`` would refuse ``*U9``
         # with the generic message before this one could name the real reason.
-        if (name or "").strip().startswith("*"):
+        validate_block_name(name)
+        if name.strip().startswith("*"):
             raise ValueError("block_define: anonymous block names (*...) are refused")
         clean_name = sanitize_symbol_name(name, kind="block")
         ents = validate_entity_specs(entities)
-        atts = validate_attdef_specs(attdefs or [])
+        atts = validate_attdef_specs(attdefs)
         base = (*validate_base_point(base_x, base_y), 0.0)
         wanted_layers = referenced_layers(ents)
         align_map = {
@@ -7214,7 +7833,12 @@ class EzdxfBackend(AutoCADBackend):
                 blk.delete_all_entities()
                 blk.block.dxf.base_point = base
             for spec in ents:
-                attribs = {"layer": spec["layer"], "color": 0, "linetype": "ByBlock"}
+                attribs = {
+                    "layer": spec["layer"],
+                    "color": 0,
+                    "linetype": "ByBlock",
+                    "lineweight": -2,  # ByBlock, as the live engine styles it
+                }
                 kind = spec["type"]
                 if kind == "line":
                     blk.add_line(
@@ -7258,6 +7882,8 @@ class EzdxfBackend(AutoCADBackend):
                     dxfattribs={
                         "layer": "0",
                         "color": 0,
+                        "linetype": "ByBlock",
+                        "lineweight": -2,
                         "height": att["height"],
                         "rotation": att["rotation_deg"],
                         "prompt": att["prompt"],
@@ -7298,7 +7924,7 @@ class EzdxfBackend(AutoCADBackend):
                 "by_layer": dict(sorted(layer_counts.items(), key=lambda x: -x[1])),
             }
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def analysis_entities_in_region(
         self,
@@ -7344,7 +7970,7 @@ class EzdxfBackend(AutoCADBackend):
                         continue
             return results
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def analysis_measure_distance(self, x1, y1, x2, y2) -> float:
         return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
@@ -7356,7 +7982,7 @@ class EzdxfBackend(AutoCADBackend):
         def _sync():
             return _measure_dxf_entity(self._get_entity(handle), float(flatten_tolerance))
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     # ── boundary tracing (M8 / F3) ───────────────────────────────────────────
 
@@ -7745,7 +8371,7 @@ class EzdxfBackend(AutoCADBackend):
                 "dxf_attributes": dump,
             }
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def analysis_bounding_box(self) -> dict:
         def _sync():
@@ -7764,7 +8390,7 @@ class EzdxfBackend(AutoCADBackend):
                     return {"error": str(e)}
             return {"error": "ezdxf bbox not available"}
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def analysis_select_by_layer(self, layer_name) -> list[EntityInfo]:
         def _sync():
@@ -7775,7 +8401,7 @@ class EzdxfBackend(AutoCADBackend):
                 if e.dxf.get("layer", "0").lower() == layer_name.lower()
             ]
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def analysis_select_by_type(self, entity_type) -> list[EntityInfo]:
         def _sync():
@@ -7783,7 +8409,7 @@ class EzdxfBackend(AutoCADBackend):
             et = entity_type.upper()
             return [_entity_info_dxf(e) for e in msp if et == e.dxftype().upper()]
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def selection_get(self) -> dict:
         # COM-only: headless ezdxf has no viewport / pickfirst grip selection.
@@ -7913,7 +8539,7 @@ class EzdxfBackend(AutoCADBackend):
                     "truncated": False,
                 }
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     # ── transactions ──────────────────────────────────────────────────────────
 
@@ -7978,6 +8604,10 @@ class EzdxfBackend(AutoCADBackend):
 
         return await self._async(_sync)
 
+    def transaction_depth(self) -> int | None:
+        # The active document's snapshot stack; system_status reports the same.
+        return len(self._transaction_stack)
+
     # ── system ────────────────────────────────────────────────────────────────
 
     async def system_status(self) -> dict:
@@ -7987,7 +8617,13 @@ class EzdxfBackend(AutoCADBackend):
         # channel the first thing the quarantine closes, leaving the user with a
         # refusal and no way to ask what happened.
         self._reap_quarantine()
+        self._reap_detached_reads()
         has_doc = self._doc is not None
+        identity = self.document_identity()
+        detached_reads = [
+            {**read.to_dict(), "document_active": has_doc and read.document is self._doc}
+            for read in self._detached_reads
+        ]
         return {
             "backend": "ezdxf",
             "connected": True,
@@ -7996,9 +8632,16 @@ class EzdxfBackend(AutoCADBackend):
             "open_documents": len(self._docs),
             "active_document": self._active_key,
             "unsaved_changes": self._dirty,
+            "document_id": identity["document_id"],
+            "revision": identity["revision"],
             "transaction_depth": len(self._transaction_stack),
             "quarantine": self._quarantine.to_dict() if self._quarantine else None,
             "abandoned_calls": [record.to_dict() for record in self._abandoned_calls],
+            # W1 review follow-up: read-only calls past their deadline that
+            # still run; while one holds the active document, every call but
+            # the exits is refused by name (DocumentBusyError).
+            "detached_reads": detached_reads,
+            "call_outcomes": [dict(row) for row in self.call_outcomes][-_STATUS_CALL_OUTCOMES:],
             "capabilities": [
                 "file_read_write",
                 "dxf_export",
@@ -8018,7 +8661,15 @@ class EzdxfBackend(AutoCADBackend):
             key = str(name).upper()
             if key in _VPORT_SYSVARS:
                 attr, shape = _VPORT_SYSVARS[key]
-                raw = getattr(self._active_vport(doc).dxf, attr)
+                # A read never creates the *Active entry (``_active_vport``
+                # does, for the writers): a file without one reads the VPORT
+                # defaults from an unbound entity, so readonly=True stays true.
+                from ezdxf.entities import VPort
+
+                active = doc.viewports.has_entry("*Active")
+                entries = doc.viewports.get("*Active") if active else []
+                vport = entries[0] if entries else VPort.new(dxfattribs={"name": "*Active"})
+                raw = getattr(vport.dxf, attr)
                 if shape == "point":
                     return (float(raw[0]), float(raw[1]))
                 return int(raw)
@@ -8033,7 +8684,7 @@ class EzdxfBackend(AutoCADBackend):
                 return math.radians(float(raw))
             return raw
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def system_set_variable(self, name, value) -> dict:
         from ezdxf.lldxf.const import DXFKeyError
@@ -8121,7 +8772,7 @@ class EzdxfBackend(AutoCADBackend):
             rows.sort(key=lambda row: row["name"].lower())
             return rows
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def dimstyle_create(self, name: str, values: dict, set_current: bool = False) -> dict:
         from engineering.standards.dimstyles import validate_overrides
@@ -8246,7 +8897,7 @@ class EzdxfBackend(AutoCADBackend):
             rows.sort(key=lambda row: row["name"].lower())
             return rows
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def textstyle_create(
         self,
@@ -8328,7 +8979,7 @@ class EzdxfBackend(AutoCADBackend):
             rows.sort(key=lambda row: row["name"].lower())
             return rows
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def mleaderstyle_create(self, name: str, values: dict) -> dict:
         from engineering.standards.mleaderstyles import validate_mleaderstyle
@@ -8606,6 +9257,28 @@ class EzdxfBackend(AutoCADBackend):
 
     # ── premium meta-tools live on AutoCADBackend (base.py) and are shared by
     # both backends. Only the XLINE primitive is backend-specific. ────────────
+    async def _delete_layer_entities(self, layer: str) -> dict:
+        def _sync():
+            doc = self._require_doc()
+            wanted = str(layer).casefold()
+            deleted: list[str] = []
+            for name in doc.layouts.names_in_taborder():
+                space = doc.layouts.get(name)
+                victims = [
+                    entity
+                    for entity in space
+                    if str(entity.dxf.get("layer", "0")).casefold() == wanted
+                ]
+                for entity in victims:
+                    handle = str(entity.dxf.handle)  # read before the entity is destroyed
+                    space.delete_entity(entity)
+                    deleted.append(handle)
+            if deleted:
+                self._mark_dirty()
+            return {"deleted": deleted, "failed": []}
+
+        return await self._async(_sync)
+
     async def _create_xline(self, x, y, dx, dy, layer) -> EntityInfo:
         def _sync():
             self._require_doc()
@@ -8793,7 +9466,7 @@ class EzdxfBackend(AutoCADBackend):
                 "backend": "ezdxf",
             }
 
-        return await self._async(_sync)
+        return await self._async(_sync, readonly=True)
 
     async def drawing_properties_set(
         self, summary: dict | None = None, custom: dict | None = None

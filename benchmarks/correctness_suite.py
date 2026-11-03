@@ -16,10 +16,20 @@ method the old version lacks simply raises AttributeError -> miss.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import math
 import os
+import shutil
 import sys
 import tempfile
+
+
+def _scratch_dir(prefix: str = "acadmcp_check_") -> str:
+    """A temporary folder removed when the check's process exits; every A/B run
+    used to leave one folder per check in %TEMP%."""
+    folder = tempfile.mkdtemp(prefix=prefix)
+    atexit.register(shutil.rmtree, folder, ignore_errors=True)
+    return folder
 
 
 async def _b():
@@ -72,7 +82,7 @@ async def core_linear_dim():
 async def core_save_dxf_roundtrip():
     b = await _b()
     await b.entity_create_line(0, 0, 10, 10)
-    path = os.path.join(tempfile.mkdtemp(), "rt.dxf")
+    path = os.path.join(_scratch_dir(), "rt.dxf")
     await b.drawing_save_as(path, "dxf")
     import ezdxf
 
@@ -362,7 +372,7 @@ async def settings_layer_state_roundtrip():
     await b.layer_freeze("LS_B")
     restored = await b.layer_state_restore("bench")
     layers = {layer.name: layer for layer in await b.layer_list()}
-    path = os.path.join(tempfile.mkdtemp(), "ls.dxf")
+    path = os.path.join(_scratch_dir(), "ls.dxf")
     await b.drawing_save_as(path, "dxf")
     await b.drawing_open(path)
     names_after_reopen = {row["name"] for row in await b.layer_state_list()}
@@ -400,7 +410,7 @@ async def settings_pdf_mediabox_a3():
 
     b = await _b()
     await b.page_setup_apply("Layout1", resolve_page_setup("ANSI_B"))
-    out_dir = tempfile.mkdtemp()
+    out_dir = _scratch_dir()
     report_b = await batch_plot(b, ["Layout1"], out_dir, "{drawing}-{layout}-ansi_b.pdf")
     width_b, height_b = report_b["sheets"][0]["mediabox_mm"]
     applied = await b.page_setup_apply("Layout1", resolve_page_setup("ISO_A3"))
@@ -825,7 +835,7 @@ def _plant_pair() -> dict:
     """The synthetic plant pair, written to a fresh temporary folder."""
     from tests.fixtures.plant_pair import build_plant_pair
 
-    return build_plant_pair(tempfile.mkdtemp(prefix="acadmcp_plant_"))
+    return build_plant_pair(_scratch_dir(prefix="acadmcp_plant_"))
 
 
 def _quoted(handle: str) -> str:
@@ -851,7 +861,7 @@ async def scale_check_detects_schematic():
 
     truth = _plant_pair()
     pair = scale_check(read_snapshot(truth["pid"]), read_snapshot(truth["layout"]))
-    folder = tempfile.mkdtemp(prefix="acadmcp_scale_")
+    folder = _scratch_dir(prefix="acadmcp_scale_")
     positions = [(0, 0), (4000, 0), (8000, 0), (0, 3000), (4000, 3000), (8000, 6000)]
     paths = []
     for factor in (1.0, 2.0):
@@ -944,7 +954,7 @@ async def diff_detects_known_edits():
     from engineering.understand.diff import diff_snapshots
     from engineering.understand.snapshot import read_snapshot
 
-    folder = tempfile.mkdtemp(prefix="acadmcp_diff_")
+    folder = _scratch_dir(prefix="acadmcp_diff_")
     old_path, new_path = os.path.join(folder, "rev_a.dxf"), os.path.join(folder, "rev_b.dxf")
     doc = ezdxf.new("R2018")
     msp = doc.modelspace()
@@ -1009,7 +1019,7 @@ async def topology_known_defects():
     cross_b = msp.add_line((2000, 1000), (3000, 0), dxfattribs=pipe)
     bar = msp.add_line((4000, 0), (5000, 0), dxfattribs=pipe)
     stem = msp.add_line((4500, 0), (4500, 500), dxfattribs=pipe)
-    path = os.path.join(tempfile.mkdtemp(prefix="acadmcp_topo_"), "topology.dxf")
+    path = os.path.join(_scratch_dir(prefix="acadmcp_topo_"), "topology.dxf")
     doc.saveas(path)
 
     found = topology_findings(read_snapshot(path), layers=["PIPE"], gap=10.0)
@@ -1025,6 +1035,679 @@ async def topology_known_defects():
         and _quoted(cross_a.dxf.handle) in crossing
         and _quoted(cross_b.dxf.handle) in crossing
         and all(_quoted(e.dxf.handle) not in crossing + near for e in (bar, stem))
+    )
+
+
+# ── Reliability (v1.7.0 W1: the three review reproducers + B07) ─────────────
+
+
+async def cancel_never_overlaps():
+    """A cancelled call's worker still owns the document until it ends (B01).
+
+    The first call's worker blocks on an event; its awaiting task is cancelled
+    (what an MCP client's Esc does) and a second call is started at once. The
+    second must not run while the first worker is still inside the drawing:
+    the trace is A then B, never B first. Version-agnostic: ``_async`` is the
+    backend's own lifecycle on every release that has an ezdxf engine.
+    """
+    import threading
+
+    b = await _b()
+    entered, release = threading.Event(), threading.Event()
+    trace: list[str] = []
+
+    def slow():
+        entered.set()
+        release.wait(10)
+        trace.append("A:end")
+
+    first = asyncio.ensure_future(b._async(slow))
+    if not await asyncio.to_thread(entered.wait, 10):
+        return False
+    first.cancel()
+    try:
+        await first
+    except asyncio.CancelledError:
+        pass
+    second = asyncio.ensure_future(b._async(lambda: trace.append("B:run")))
+    await asyncio.sleep(0.3)
+    overlapped = "B:run" in trace  # B ran while A's worker was still blocked
+    release.set()
+    await asyncio.wait_for(second, 10)
+    return not overlapped and trace == ["A:end", "B:run"]
+
+
+async def qa_scan_finds_entity_5001():
+    """The 5,001st entity is read (B02): the base checks read the first 5,000
+    entities of the current space, so an offender beyond them was "clean"."""
+    b = await _b()
+    msp = b._doc.modelspace()
+    for index in range(1, 5_001):
+        y = 10.0 * index
+        msp.add_line((0.0, y), (100.0, y), dxfattribs={"layer": "GEOMETRY"})
+    offender = msp.add_line((-300.0, 0.0), (-200.0, 0.0), dxfattribs={"layer": "CONSTRUCTION"})
+    issues = await b.drawing_critique(focus=["construction_left"])
+    found = [i for i in issues if i.focus == "construction_left"]
+    return len(found) == 1 and found[0].handles == [offender.dxf.handle]
+
+
+async def export_text_never_formula():
+    """Exported text never becomes a spreadsheet formula (B03).
+
+    The parts list goes out as CSV and XLSX with designations that start like
+    formulas (``=1+1``, ``@x``, a leading tab) beside a genuine ``-12.5`` mass.
+    Read back the way a reader of the file would: ``csv`` gets a leading ``'``
+    on each text cell, never on the number; openpyxl finds string cells (data
+    type ``s``) for the text and a numeric cell for the mass.
+    """
+    import csv
+
+    from engineering.sheet.extract import write_rows
+
+    texts = ("=1+1", "@x", "\tD")
+    rows = [
+        {"item": i, "qty": 1, "designation": t, "material": "S235", "mass": "-12.5"}
+        for i, t in enumerate(texts, start=1)
+    ]
+    columns = ("item", "qty", "designation", "mass")
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "bom.csv")
+        write_rows(rows, target, columns=columns, fmt="csv")
+        with open(target, newline="", encoding="utf-8") as handle:
+            body = list(csv.reader(handle))[1:]
+        csv_ok = [r[2] for r in body] == ["'" + t for t in texts] and all(
+            r[3] == "-12.5" for r in body
+        )
+        from openpyxl import load_workbook
+
+        target = os.path.join(tmp, "bom.xlsx")
+        write_rows(rows, target, columns=columns, fmt="xlsx")
+        sheet = load_workbook(target).active
+        cells = [(sheet.cell(r, 3), sheet.cell(r, 4)) for r in range(2, 2 + len(texts))]
+        xlsx_ok = all(
+            text_cell.data_type == "s"
+            and text_cell.value == t
+            and mass_cell.data_type == "n"
+            and mass_cell.value == -12.5
+            for (text_cell, mass_cell), t in zip(cells, texts, strict=True)
+        )
+    return csv_ok and xlsx_ok
+
+
+async def spec_refuses_non_finite():
+    """A non-finite spec value is refused by its path, dry run included (B07).
+
+    A NaN vessel width was accepted (and an inf height died later as a
+    RuntimeError), and ``pid_from_spec``'s dry run approved a NaN symbol scale.
+    """
+    import copy
+
+    from engineering.pid.spec import EXAMPLE_SPEC, run_spec
+    from engineering.pid.symbols_vessels import build_vessel
+
+    refused: list[bool] = []
+    for params, path in (
+        ({"width": float("nan")}, "vertical_vessel: params.width"),
+        ({"height": float("inf")}, "vertical_vessel: params.height"),
+    ):
+        try:
+            build_vessel("vertical_vessel", params)
+            refused.append(False)
+        except Exception as exc:  # noqa: BLE001 - a RuntimeError later on is the old failure
+            refused.append(isinstance(exc, ValueError) and str(exc).startswith(path))
+    b = await _b()
+    spec = copy.deepcopy(EXAMPLE_SPEC)
+    spec["equipment"][0]["scale"] = float("nan")
+    try:
+        await run_spec(b, spec, dry_run=True)
+        refused.append(False)
+    except Exception as exc:  # noqa: BLE001 - only a refusal by path counts
+        refused.append(isinstance(exc, ValueError) and str(exc).startswith("equipment[0].scale"))
+    return all(refused)
+
+
+# ── Verification (v1.7.0 W3, B56: the roadmap's acceptance scenarios) ────────
+#
+# One check per scenario of the roadmap's acceptance table: T05, T09-T13, T18,
+# T25, T36. Each check stages the defect on purpose and passes only when the
+# defect is reported AND the clean case is not - a check that cannot fail is
+# no evidence. Expected values are worked out by hand in each docstring.
+
+
+async def _mm_backend():
+    """A fresh document declaring millimetres ($INSUNITS 4): verification holds a
+    drawing to its declared unit, and a new ezdxf document declares metres."""
+    b = await _b()
+    await b.system_set_variable("INSUNITS", 4)
+    return b
+
+
+def _requirement_set(*items):
+    from engineering.verification.requirements import parse_requirements
+
+    return parse_requirements({"units": "mm", "items": list(items)})
+
+
+def _req_item(rid, quantity, features, target=None):
+    item = {"id": rid, "quantity": quantity, "features": features, "provenance": "explicit"}
+    if target is not None:
+        item["target"] = target
+    return item
+
+
+def _rows(report) -> dict:
+    return {row["id"]: row for row in report["rows"]}
+
+
+def _plate_with_two_holes():
+    """An 80 x 50 plate, Ø10 holes h1 at (40, 25) and h2 at (60, 25): 20 apart."""
+    from engineering.mech.part import build_part
+
+    return build_part(
+        {
+            "kind": "prismatic",
+            "name": "plate",
+            "material": "aluminium",
+            "thickness": 8.0,
+            "outline": [[0.0, 0.0], [80.0, 0.0], [80.0, 50.0], [0.0, 50.0]],
+            "features": [
+                {"kind": "hole", "id": "h1", "x": 40.0, "y": 25.0, "diameter": 10.0},
+                {"kind": "hole", "id": "h2", "x": 60.0, "y": 25.0, "diameter": 10.0},
+            ],
+        }
+    )
+
+
+async def _circle_handle_at(b, x, y):
+    for info in await b.entity_list(type_filter="CIRCLE", limit=1000):
+        if info.properties["center"][:2] == [x, y]:
+            return info.handle
+    return None
+
+
+async def verify_t05_stale_preview_no_silent_mutation():
+    """T05: after a preview the operator moves the feature in CAD - stale, and
+    nothing of the planned change runs.
+
+    Through the real ``cad_batch`` tool over an in-memory client. The planned
+    change moves the line +5 in x. The operator moves its start to (3, 3)
+    directly in the document (the content revision cannot see that; the exact
+    fingerprint does). The apply must be refused ``stale_revision`` and the line
+    must keep the operator's (3, 3) - not (8, 3). A server-side edit between
+    preview and apply is refused too. A preview nobody disturbed applies.
+    """
+    from fastmcp import Client
+
+    import server
+
+    b = await _b()
+
+    async def make():
+        return b
+
+    line = await b.entity_create_line(0, 0, 10, 0)
+    handle = line.handle
+    steps = [{"tool": "entity_move", "args": {"handle": handle, "dx": 5.0, "dy": 0.0}}]
+
+    def start():
+        point = b._doc.entitydb[handle].dxf.start
+        return (point.x, point.y)
+
+    # the test suite runs this check in-process too: restore the factory after
+    original = server._make_backend
+    server._make_backend = make
+    try:
+        return await _t05_through_the_tool(server, Client, b, handle, steps, start)
+    finally:
+        server._make_backend = original
+
+
+async def _t05_through_the_tool(server, client_cls, b, handle, steps, start):
+    async with client_cls(server.mcp) as client:
+
+        async def preview():
+            dry = await client.call_tool("cad_batch", {"steps": steps, "dry_run": True})
+            return dry.structured_content["preview"]
+
+        async def apply(planned):
+            return await client.call_tool(
+                "cad_batch",
+                {
+                    "steps": steps,
+                    "expected_revision": planned["revision"],
+                    "preconditions": planned["preconditions"],
+                },
+                raise_on_error=False,
+            )
+
+        planned = await preview()
+        b._doc.entitydb[handle].dxf.start = (3.0, 3.0)  # the operator, in CAD
+        direct = await apply(planned)
+        direct_ok = (
+            direct.is_error
+            and direct.structured_content.get("kind") == "stale_revision"
+            and start() == (3.0, 3.0)
+        )
+        planned = await preview()
+        await client.call_tool("entity_set_properties", {"handle": handle, "color": 1})
+        served = await apply(planned)
+        served_ok = (
+            served.is_error
+            and served.structured_content.get("kind") == "stale_revision"
+            and start() == (3.0, 3.0)
+        )
+        clean = await apply(await preview())
+        clean_ok = not clean.is_error and start() == (8.0, 3.0)
+    return direct_ok and served_ok and clean_ok
+
+
+async def verify_t09_diameter_under_its_label():
+    """T09: a circle drawn Ø39.8 (r = 19.9) under a dimension that reads "Ø40".
+
+    The requirement is Ø40, bound through the dimension: the row is measured on
+    the circle (39.8, delta -0.2) and fails; the label's 40 is reported as the
+    displayed value and as a ``dimension_mismatch`` finding, and changes
+    nothing in the row. The same requirement bound to the circle by handle fails
+    with the same 39.8.
+    """
+    import ezdxf
+
+    from engineering.verification.report import verify_requirements
+
+    doc = ezdxf.new("R2010", setup=True, units=4)
+    msp = doc.modelspace()
+    circle = msp.add_circle((50, 50), 19.9)
+    dim = msp.add_diameter_dim(
+        center=(50, 50), radius=19.9, angle=0, text="Ø40", dimstyle="Standard"
+    )
+    dim.render()
+    path = os.path.join(_scratch_dir(), "t09.dxf")
+    doc.saveas(path)
+    b = await _b()
+    await b.drawing_open(path)
+    target = {"nominal": 40.0}
+    report = await verify_requirements(
+        b,
+        _requirement_set(
+            _req_item(
+                "BY_LABEL",
+                "diameter",
+                [{"kind": "dimension", "handle": dim.dimension.dxf.handle}],
+                target,
+            ),
+            _req_item(
+                "BY_HANDLE", "diameter", [{"kind": "handle", "handle": circle.dxf.handle}], target
+            ),
+        ),
+    )
+    rows = _rows(report)
+    label, plain = rows["BY_LABEL"], rows["BY_HANDLE"]
+    findings = {(f["requirement"], f["kind"]) for f in report["findings"]}
+    return (
+        label["status"] == "fail"
+        and abs(label["measured"]["value"] - 39.8) < 1e-9
+        and abs(label["delta"] + 0.2) < 1e-9
+        and label["dimension"]["displayed_value"] == 40.0
+        and ("BY_LABEL", "dimension_mismatch") in findings
+        and plain["status"] == "fail"
+        and abs(plain["measured"]["value"] - 39.8) < 1e-9
+        and report["accepted"] is False
+    )
+
+
+async def verify_t10_moved_circle_against_its_model():
+    """T10: the part model (XDATA) still says h2 is at x = 60; the circle was moved.
+
+    ``draw_part`` stores the model on the drawing and tags each circle with its
+    feature. h2 is then moved 2 mm right by ``entity_move`` (the tag moves with
+    it). The stored model still reads 60, so it would say the pitch is 20; the
+    requirement "h1 to h2 is 20" bound by feature tag measures the circles -
+    22 - and fails. The model is not the evidence.
+    """
+    from engineering.mech.draw import draw_part, read_part
+    from engineering.verification.report import verify_requirements
+
+    b = await _mm_backend()
+    drawn = await draw_part(b, _plate_with_two_holes(), at=(0.0, 0.0), dimension=False)
+    h2 = await _circle_handle_at(b, 60.0, 25.0)
+    if h2 is None:
+        return False
+    await b.entity_move(h2, 2.0, 0.0)
+    model = await read_part(b, drawn["part_id"])
+    model_x = {
+        f.get("id"): f.get("x") for f in (model.get("part") or model).get("features", [])
+    }.get("h2")
+
+    def tag(feature):
+        return {
+            "kind": "feature_tag",
+            "part": drawn["part_id"],
+            "feature": feature,
+            "type": "circle",
+        }
+
+    report = await verify_requirements(
+        b,
+        _requirement_set(_req_item("PITCH", "distance", [tag("h1"), tag("h2")], {"nominal": 20.0})),
+    )
+    row = _rows(report)["PITCH"]
+    return (
+        model_x == 60.0
+        and row["status"] == "fail"
+        and abs(row["measured"]["value"] - 22.0) < 1e-9
+        and report["accepted"] is False
+    )
+
+
+async def verify_t11_inner_hole_moved_caught_on_reopen():
+    """T11: an inner hole moved inside the outline of the saved file.
+
+    A plate with Ø10 holes at (40, 25) and (60, 25) is saved; in the FILE the
+    second hole moves to (62, 25). The entity counts and the extents - what
+    1.6's delivery parity compared - are identical, so parity passes. The
+    saved file, measured fresh, fails the 20 mm pitch with 22, both re-bound
+    from the document and when a fresh engine opens it alone.
+    """
+    from collections import Counter
+
+    import ezdxf
+    from ezdxf import bbox
+
+    from engineering.mech.draw import draw_part
+    from engineering.verification.artifact import verify_artifact
+    from engineering.verification.report import verify_requirements
+
+    b = await _mm_backend()
+    drawn = await draw_part(b, _plate_with_two_holes(), at=(0.0, 0.0), dimension=False)
+
+    def tag(feature):
+        return {
+            "kind": "feature_tag",
+            "part": drawn["part_id"],
+            "feature": feature,
+            "type": "circle",
+        }
+
+    rs = _requirement_set(_req_item("PITCH", "distance", [tag("h1"), tag("h2")], {"nominal": 20.0}))
+    if (await verify_requirements(b, rs))["status"] != "pass":
+        return False
+    path = os.path.join(_scratch_dir(), "t11.dxf")
+    await b.drawing_save_as(path, "dxf")
+
+    def parity(doc):
+        msp = doc.modelspace()
+        box = bbox.extents(msp)
+        return Counter(e.dxftype() for e in msp), (tuple(box.extmin), tuple(box.extmax))
+
+    doc = ezdxf.readfile(path)
+    before = parity(doc)
+    moved = 0
+    for circle in doc.modelspace().query("CIRCLE"):
+        if tuple(circle.dxf.center)[:2] == (60.0, 25.0):
+            circle.dxf.center = (62.0, 25.0, 0.0)
+            moved += 1
+    doc.saveas(path)
+    parity_blind = parity(ezdxf.readfile(path)) == before
+    on_file = _rows(await verify_artifact(path, rs, backend=b))["PITCH"]
+    fresh = await _b()
+    await fresh.drawing_open(path)
+    alone = _rows(await verify_requirements(fresh, rs))["PITCH"]
+    return (
+        moved == 1
+        and parity_blind
+        and on_file["status"] == "fail"
+        and abs(on_file["measured"]["value"] - 22.0) < 1e-9
+        and alone["status"] == "fail"
+    )
+
+
+async def verify_t12_equal_holes_ambiguous():
+    """T12: two equal Ø10 holes and a requirement that names "the" Ø10 hole.
+
+    The binding must be ``ambiguous`` with both holes as candidates and no
+    handle chosen; the report is not a pass and is not accepted. Naming the
+    hole by its feature tag binds exactly one.
+    """
+    from engineering.mech.draw import draw_part
+    from engineering.verification.report import verify_requirements
+
+    b = await _mm_backend()
+    drawn = await draw_part(b, _plate_with_two_holes(), at=(0.0, 0.0), dimension=False)
+    window = {"kind": "predicate", "type": "circle", "radius_min": 4.999, "radius_max": 5.001}
+    tagged = {"kind": "feature_tag", "part": drawn["part_id"], "feature": "h1", "type": "circle"}
+    report = await verify_requirements(
+        b,
+        _requirement_set(
+            _req_item("ANY", "diameter", [window], {"nominal": 10.0}),
+            _req_item("H1", "diameter", [tagged], {"nominal": 10.0}),
+        ),
+    )
+    rows = _rows(report)
+    expected = sorted(
+        [await _circle_handle_at(b, 40.0, 25.0), await _circle_handle_at(b, 60.0, 25.0)]
+    )
+    candidates = sorted(
+        handle for ref in rows["ANY"]["binding"]["candidates"] for handle in ref["handles"]
+    )
+    return (
+        rows["ANY"]["status"] == "ambiguous"
+        and candidates == expected
+        and not rows["ANY"]["handles"]
+        and rows["H1"]["status"] == "pass"
+        and report["status"] != "pass"
+        and report["accepted"] is False
+    )
+
+
+async def verify_t13_hole_count_cardinality():
+    """T13: exactly six Ø8 holes on a Ø100 PCD - five and seven both fail.
+
+    Every hole has the right diameter in all three drawings, so a check that
+    only measured diameters would pass them all. The count requirement passes
+    six, fails five (one deleted) and fails seven (one added).
+    """
+    from engineering.verification.report import verify_requirements
+
+    b = await _mm_backend()
+    handles = []
+    for k in range(6):
+        angle = math.radians(60.0 * k)
+        c = await b.entity_create_circle(50 * math.cos(angle), 50 * math.sin(angle), 4.0)
+        handles.append(c.handle)
+    window = {"kind": "predicate", "type": "circle", "radius_min": 3.999, "radius_max": 4.001}
+    rs = _requirement_set(_req_item("N", "count", [window], {"exact": 6}))
+
+    async def count_status():
+        row = _rows(await verify_requirements(b, rs))["N"]
+        return row["status"], row["measured"]["value"]
+
+    six = await count_status()
+    await b.entity_delete(handles[0])
+    five = await count_status()
+    await b.entity_create_circle(50.0, 0.0, 4.0)
+    await b.entity_create_circle(0.0, 0.0, 4.0)
+    seven = await count_status()
+    return six == ("pass", 6.0) and five == ("fail", 5.0) and seven == ("fail", 7.0)
+
+
+async def verify_t18_dimension_override_and_dimlfac_visible():
+    """T18: the geometry and the annotation are judged apart.
+
+    Two vertical lines 40 apart under a dimension whose text is overridden to
+    "42", and two lines 21 apart under a dimension with DIMLFAC 2 (it shows
+    42). Each requirement matches its geometry (40, 21), so each row passes -
+    and each dimension is a ``dimension_mismatch`` finding that blocks
+    acceptance. The same lines under an honest dimension are accepted.
+    """
+    import ezdxf
+
+    from engineering.verification.report import verify_requirements
+
+    def sheet(**kw):
+        doc = ezdxf.new("R2010", setup=True, units=4)
+        msp = doc.modelspace()
+        handles = []
+        for x0, width, extra in (
+            (0.0, 40.0, kw.get("first", {})),
+            (100.0, 21.0, kw.get("second", {})),
+        ):
+            msp.add_line((x0, 0), (x0, 20))
+            msp.add_line((x0 + width, 0), (x0 + width, 20))
+            dim = msp.add_linear_dim(
+                base=(x0, 30), p1=(x0, 0), p2=(x0 + width, 0), dimstyle="Standard", **extra
+            )
+            dim.render()
+            handles.append(dim.dimension.dxf.handle)
+        path = os.path.join(_scratch_dir(), "t18.dxf")
+        doc.saveas(path)
+        return path, handles
+
+    async def measure(path, handles):
+        b = await _b()
+        await b.drawing_open(path)
+        return await verify_requirements(
+            b,
+            _requirement_set(
+                _req_item(
+                    "W40",
+                    "distance",
+                    [{"kind": "dimension", "handle": handles[0]}],
+                    {"nominal": 40.0},
+                ),
+                _req_item(
+                    "W21",
+                    "distance",
+                    [{"kind": "dimension", "handle": handles[1]}],
+                    {"nominal": 21.0},
+                ),
+            ),
+        )
+
+    lying = await measure(*sheet(first={"text": "42"}, second={"override": {"dimlfac": 2.0}}))
+    honest = await measure(*sheet())
+    rows = _rows(lying)
+    kinds = sorted((f["requirement"], f["kind"]) for f in lying["findings"])
+    return (
+        rows["W40"]["status"] == "pass"
+        and rows["W21"]["status"] == "pass"
+        and rows["W40"]["dimension"]["displayed_value"] == 42.0
+        and rows["W21"]["dimension"]["displayed_value"] == 42.0
+        and kinds == [("W21", "dimension_mismatch"), ("W40", "dimension_mismatch")]
+        and lying["accepted"] is False
+        and honest["accepted"] is True
+        and honest["findings"] == []
+    )
+
+
+async def verify_t25_handle_renumber_rebinds():
+    """T25: a save that renumbers handles - re-bound by geometry, never by a
+    stale handle; a copied feature tag is ``unknown``, never a pick.
+
+    Two files hold the same Ø40 bore (r = 20) and a Ø10 pin (r = 5), created in
+    opposite orders, so the saved file gave the bore's old handle to the pin.
+    Re-bound from the source, the bore still measures 40 and passes. When the
+    saved file also holds a copy carrying the bore's feature tag, the binding
+    has two candidates and the row is ``unknown``.
+    """
+    import ezdxf
+
+    from engineering.mech.xdata import encode
+    from engineering.verification.artifact import verify_artifact
+
+    tag = {"kind": "feature", "part": "P1", "feature": "bore", "view": "front"}
+    folder = _scratch_dir()
+
+    def write(name, circles):
+        doc = ezdxf.new("R2010", units=4)
+        doc.appids.add("ACADMCP_MECH")
+        msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (200, 0), (200, 100), (0, 100)], close=True)
+        handles = {}
+        for key, cx, cy, radius, tagged in circles:
+            circle = msp.add_circle((cx, cy), radius)
+            if tagged:
+                rows = encode(tag, kinds=("feature",))
+                circle.set_xdata("ACADMCP_MECH", [row for row in rows if row[0] != 1001])
+            handles[key] = circle.dxf.handle
+        path = os.path.join(folder, name)
+        doc.saveas(path)
+        return path, handles
+
+    source, before = write("a.dxf", [("bore", 50, 50, 20, True), ("pin", 150, 80, 5, False)])
+    renumbered, after = write("b.dxf", [("pin", 150, 80, 5, False), ("bore", 50, 50, 20, True)])
+    copied, _ = write(
+        "c.dxf",
+        [("copy", 150, 50, 20, True), ("bore", 50, 50, 20, True), ("pin", 150, 80, 5, False)],
+    )
+    if after["pin"] != before["bore"]:
+        return False  # the fixture must renumber, or it proves nothing
+    b = await _b()
+    await b.drawing_open(source)
+    rs = _requirement_set(
+        _req_item(
+            "BORE", "diameter", [{"kind": "handle", "handle": before["bore"]}], {"nominal": 40.0}
+        )
+    )
+    rebound = _rows(await verify_artifact(renumbered, rs, backend=b))["BORE"]
+    doubled = _rows(await verify_artifact(copied, rs, backend=b))["BORE"]
+    return (
+        rebound["status"] == "pass"
+        and abs(rebound["measured"]["value"] - 40.0) < 1e-9
+        and rebound["handles"] == [after["bore"]]
+        and doubled["status"] == "unknown"
+        and len(doubled["binding"]["candidates"]) == 2
+    )
+
+
+async def verify_t36_report_stale_after_file_change():
+    """T36: the delivered file changes after its report was written.
+
+    A Ø40 bore is delivered with its requirement: the manifest re-hashes clean
+    and the acceptance report is accepted. One line is then appended to the
+    delivered DXF. ``verify_manifest`` must name the DXF as stale, and the
+    acceptance report, re-checked against its artifact's sha256, must turn
+    stale and stop being accepted.
+    """
+    import json
+
+    import ezdxf
+
+    from engineering.delivery import deliver_drawing, verify_manifest
+    from engineering.layers import ensure_engineering_layers, ensure_standard_linetypes
+    from engineering.verification.report import mark_stale
+
+    b = await _mm_backend()
+    await ensure_standard_linetypes(b)
+    await ensure_engineering_layers(b)
+    bore = await b.entity_create_circle(50, 50, 20, layer="GEOMETRY")
+    rs = _requirement_set(
+        _req_item(
+            "BORE", "diameter", [{"kind": "handle", "handle": bore.handle}], {"nominal": 40.0}
+        )
+    )
+    bundle = os.path.join(_scratch_dir(), "bundle")
+    result = await deliver_drawing(
+        b, bundle, formats=["dxf"], min_score=0, strict_critique=False, requirements=rs
+    )
+    manifest = os.path.join(bundle, "manifest.json")
+    clean = verify_manifest(manifest)
+    with open(os.path.join(bundle, "acceptance.json"), encoding="utf-8") as handle:
+        report = json.load(handle)
+    accepted_before = mark_stale(report, None)["accepted"]
+    delivered = os.path.join(bundle, "drawing.dxf")
+    doc = ezdxf.readfile(delivered)
+    doc.modelspace().add_line((0, 0), (10, 0))
+    doc.saveas(delivered)
+    edited = verify_manifest(manifest)
+    later = mark_stale(report, None)
+    return (
+        result.status == "success"
+        and clean["ok"] is True
+        and accepted_before is True
+        and edited["ok"] is False
+        and [row["filename"] for row in edited["stale"]] == ["drawing.dxf"]
+        and later["stale"] is True
+        and later["accepted"] is False
     )
 
 
@@ -1077,6 +1760,34 @@ CHECKS = {
     "cable_takeoff_roundup": (cable_takeoff_roundup, "Understanding"),
     "diff_detects_known_edits": (diff_detects_known_edits, "Understanding"),
     "topology_known_defects": (topology_known_defects, "Understanding"),
+    "cancel_never_overlaps": (cancel_never_overlaps, "Reliability"),
+    "qa_scan_finds_entity_5001": (qa_scan_finds_entity_5001, "Reliability"),
+    "export_text_never_formula": (export_text_never_formula, "Reliability"),
+    "spec_refuses_non_finite": (spec_refuses_non_finite, "Reliability"),
+    "verify_t05_stale_preview_no_silent_mutation": (
+        verify_t05_stale_preview_no_silent_mutation,
+        "Verification",
+    ),
+    "verify_t09_diameter_under_its_label": (verify_t09_diameter_under_its_label, "Verification"),
+    "verify_t10_moved_circle_against_its_model": (
+        verify_t10_moved_circle_against_its_model,
+        "Verification",
+    ),
+    "verify_t11_inner_hole_moved_caught_on_reopen": (
+        verify_t11_inner_hole_moved_caught_on_reopen,
+        "Verification",
+    ),
+    "verify_t12_equal_holes_ambiguous": (verify_t12_equal_holes_ambiguous, "Verification"),
+    "verify_t13_hole_count_cardinality": (verify_t13_hole_count_cardinality, "Verification"),
+    "verify_t18_dimension_override_and_dimlfac_visible": (
+        verify_t18_dimension_override_and_dimlfac_visible,
+        "Verification",
+    ),
+    "verify_t25_handle_renumber_rebinds": (verify_t25_handle_renumber_rebinds, "Verification"),
+    "verify_t36_report_stale_after_file_change": (
+        verify_t36_report_stale_after_file_change,
+        "Verification",
+    ),
 }
 
 

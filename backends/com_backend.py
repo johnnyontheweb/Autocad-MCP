@@ -7,15 +7,19 @@ AutoCAD's STA (Single-Threaded Apartment) COM requirement.
 from __future__ import annotations
 
 import asyncio
+import collections
+import concurrent.futures
+import contextvars
+import functools
 import io
 import logging
 import math
 import os
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
@@ -39,7 +43,12 @@ from .base import (
     rad2deg,
     shoelace_area,
 )
+from .contracts.entity_modification import TEXT_SEARCH_SCOPE
 from .contracts.settings import SUMMARY_FIELDS, validate_drawing_properties
+from .document_guard import ActiveDocumentChangedError
+from .operations import CURRENT_OPERATION
+from .quarantine import DaemonExecutor, real_call_name
+from .xdata_specs import prepare_xdata
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +65,7 @@ if _WIN32_AVAILABLE:
         import win32com.client
         import win32con  # noqa: F401
         import win32gui
+        import win32process
         import win32ui
 
         _COM_IMPORTS_OK = True
@@ -121,11 +131,36 @@ except ImportError:
 # COM thread-state (accessed ONLY from the COM executor thread)
 # ---------------------------------------------------------------------------
 
-_COM_STATE: dict[str, Any] = {}  # keys: "app"
+_COM_STATE: dict[str, Any] = {}  # keys: "app", "app_identity"
+
+#: Per-thread state of the executor job running now (B11): ``guard`` is the
+#: ``_JobGuard`` that ``_acad_doc()`` consults. Thread-local, not in
+#: ``_COM_STATE``: a stuck job on an abandoned executor thread must never
+#: clear the guard of the job running on its replacement.
+_JOB_STATE = threading.local()
+
+
+class _JobGuard:
+    """One job's check of the bound document, run at its first ``_acad_doc()``.
+
+    The checked Document is reused by the rest of the job and dropped on the
+    COM thread when the job ends (a COM proxy must not be released elsewhere).
+    """
+
+    __slots__ = ("backend", "doc")
+
+    def __init__(self, backend):
+        self.backend = backend
+        self.doc = None
+
+    def __call__(self, app):
+        if self.doc is None:
+            self.doc = self.backend._guard(app)
+        return self.doc
 
 
 def _com_init():
-    """COM thread initializer – called once by the ThreadPoolExecutor."""
+    """COM thread initializer – called once by the STA worker thread."""
     if _COM_IMPORTS_OK:
         pythoncom.CoInitialize()
 
@@ -137,7 +172,7 @@ def _com_teardown():
     paired with a CoUninitialize when the worker is torn down or a stuck
     SendCommand eventually unblocks, instead of leaking the apartment forever.
     """
-    _COM_STATE.pop("app", None)
+    _drop_app()
     if _COM_IMPORTS_OK:
         try:
             pythoncom.CoUninitialize()
@@ -240,6 +275,176 @@ def _acad_app():
     return _COM_STATE["app"]
 
 
+def _drop_app() -> None:
+    """Forget the cached Application proxy (and the identity read from it)."""
+    _COM_STATE.pop("app", None)
+    _COM_STATE.pop("app_identity", None)
+    _COM_STATE.pop("vl", None)
+    _COM_STATE.pop("vl_docs", None)
+
+
+def _app_identity(app) -> tuple:
+    """Which running AutoCAD ``app`` is: ``(HWND, process id)`` of its main window.
+
+    A document is one document of one application (B11): an unsaved
+    ``Drawing1.dwg`` has the key ``('Drawing1.dwg', '')`` in every AutoCAD, so
+    after a restart the new one must not inherit the old one's id. Measured on
+    AutoCAD 2026 (25.1) on 2026-10-26: ``Application.HWND`` is an ``int`` and
+    two proxies from two ``GetActiveObject`` calls report the same one
+    (scripts/smoke_document_com.py). Read once per proxy and cached beside it,
+    so the guard costs no extra round trip. A proxy whose HWND cannot be read
+    is identified by itself - conservative: a re-attach is then refused as a
+    changed application once, and ``document_activate`` binds again.
+    """
+    cached = _COM_STATE.get("app_identity")
+    if cached is not None and cached[0] is app:
+        return cached[1]
+    try:
+        hwnd = int(app.HWND)
+    except Exception as exc:  # noqa: BLE001 - identified by the proxy instead
+        log.debug("Application.HWND unreadable (%s); identifying the proxy itself", exc)
+        identity: tuple = ("proxy", id(app))
+    else:
+        pid = None
+        if _COM_IMPORTS_OK:
+            try:
+                pid = int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
+            except Exception as exc:  # noqa: BLE001 - the HWND alone still tells two apart
+                log.debug("GetWindowThreadProcessId(%s) failed: %s", hwnd, exc)
+        identity = ("hwnd", hwnd, pid)
+    _COM_STATE["app_identity"] = (app, identity)
+    return identity
+
+
+# ---------------------------------------------------------------------------
+# The operator-edit counter (v1.7.0, B11)
+# ---------------------------------------------------------------------------
+#
+# A transient AutoLISP database reactor in the bound document's own namespace
+# counts every object appended, modified, erased or unerased in that
+# document's database; the server evaluates two fixed forms through
+# ``VL.Application.16`` - no COM event sink, no SendCommand. Measured on
+# AutoCAD 2026 (25.1) on 2026-10-26 on scratch Documents.Add() documents
+# (scripts/smoke_operator_edits_com.py): see ``ComBackend._edit_counter_start``.
+
+#: Installs the reactor (once: ``vlr-added-p`` guards a second one), adds the
+#: document id to the namespace's ``acadmcp:edit-ids`` and answers
+#: ``"<id>:<count>"``. Not ``vlr-pers``: the reactor lives in the session and
+#: is never saved. ``all-documents`` keeps it counting while another drawing is
+#: active. The ids are a list, not one tag: two servers bound to one document
+#: (two clients on one seat) share the namespace and its count, and each must
+#: find its own id there - a single tag would make each one's install look,
+#: to the other, like a removed reactor, and their reads would move each
+#: other's revision for ever.
+_EDIT_COUNTER_INSTALL = (
+    "(progn (vl-load-com)"
+    " (if (null acadmcp:edit-n) (setq acadmcp:edit-n 0))"
+    " (defun acadmcp:edit-bump (r a) (setq acadmcp:edit-n (1+ acadmcp:edit-n)))"
+    " (if (not (and acadmcp:edit-r (vlr-added-p acadmcp:edit-r)))"
+    " (progn (setq acadmcp:edit-r (vlr-acdb-reactor nil '("
+    "(:vlr-objectAppended . acadmcp:edit-bump) (:vlr-objectModified . acadmcp:edit-bump)"
+    " (:vlr-objectErased . acadmcp:edit-bump) (:vlr-objectUnErased . acadmcp:edit-bump))))"
+    " (vlr-set-notification acadmcp:edit-r 'all-documents)))"
+    ' (if (not (member "{document_id}" acadmcp:edit-ids))'
+    ' (setq acadmcp:edit-ids (cons "{document_id}" acadmcp:edit-ids)))'
+    ' (strcat "{document_id}" ":" (itoa acadmcp:edit-n)))'
+)
+
+#: ``"<id>:<count>"``, or nil when no reactor is installed (a namespace the
+#: server never installed into), it was removed (``vlr-remove-all``) or this
+#: id was never added to the namespace (it is another document's, or a
+#: reopened one's).
+_EDIT_COUNTER_READ = (
+    '(if (and acadmcp:edit-r (vlr-added-p acadmcp:edit-r) (member "{document_id}" acadmcp:edit-ids))'
+    ' (strcat "{document_id}" ":" (itoa acadmcp:edit-n)))'
+)
+
+_VL_PROGID = "VL.Application.16"
+
+
+def _dispatch(obj):
+    """The raw ``PyIDispatch`` behind ``obj``, or None for a plain Python object."""
+    ole = getattr(obj, "_oleobj_", None)
+    if ole is not None:
+        return ole
+    if hasattr(obj, "GetIDsOfNames") and hasattr(obj, "Invoke"):
+        return obj
+    return None
+
+
+def _vl_get(obj, name: str):
+    """Property ``name`` of a VL object.
+
+    The ``VL.Application.16`` proxy has type info (``DVlApplication``: Name,
+    Documents, ActiveDocument) but win32com's dynamic dispatch raised
+    ``AttributeError`` for ``ActiveDocument`` on AutoCAD 2026 (measured), so
+    the member is invoked by its DISPID.
+    """
+    ole = _dispatch(obj)
+    if ole is None:
+        return getattr(obj, name)
+    return ole.Invoke(ole.GetIDsOfNames(name), 0, pythoncom.DISPATCH_PROPERTYGET, 1)
+
+
+def _vl_call(obj, name: str, *args):
+    ole = _dispatch(obj)
+    if ole is None:
+        return getattr(obj, name)(*args)
+    flags = pythoncom.DISPATCH_METHOD | pythoncom.DISPATCH_PROPERTYGET
+    return ole.Invoke(ole.GetIDsOfNames(name), 0, flags, 1, *args)
+
+
+def _vl_application(app):
+    """``app``'s VL application, cached beside the proxy; raises when it has none."""
+    cached = _COM_STATE.get("vl")
+    if cached is not None and cached[0] is app:
+        if isinstance(cached[1], BaseException):
+            raise cached[1]
+        return cached[1]
+    try:
+        vl = app.GetInterfaceObject(_VL_PROGID)
+    except Exception as exc:  # noqa: BLE001 - no Visual LISP: the counter is off
+        _COM_STATE["vl"] = (app, exc)
+        _COM_STATE.pop("vl_docs", None)
+        raise
+    _COM_STATE["vl"] = (app, vl)
+    _COM_STATE["vl_docs"] = {}
+    return vl
+
+
+def _vl_document_forms(app, document_id: str, *, fresh: bool):
+    """``(eval, parsed read form)`` for the namespace of the document active NOW.
+
+    Cached per document id: fetching ``ActiveDocument.Functions`` and the two
+    function objects cost ~6.6 ms live, one ``eval`` of a parsed form ~1 ms.
+    ``fresh`` re-fetches - the cached objects may belong to a closed namespace.
+    """
+    vl = _vl_application(app)
+    docs = _COM_STATE.setdefault("vl_docs", {})
+    if not fresh and document_id in docs:
+        return docs[document_id]
+    functions = _vl_get(_vl_get(vl, "ActiveDocument"), "Functions")
+    reader = _vl_call(functions, "Item", "read")
+    evaluator = _vl_call(functions, "Item", "eval")
+    source = _EDIT_COUNTER_READ.format(document_id=document_id)
+    forms = (reader, evaluator, _vl_call(reader, "funcall", source))
+    docs[document_id] = forms
+    return forms
+
+
+def _parse_edit_count(value, document_id: str) -> int | None:
+    """The count from ``"<id>:<count>"`` when it is this document's, else None."""
+    if not isinstance(value, str):
+        return None
+    tag, _, count = value.partition(":")
+    if tag != document_id:
+        return None
+    try:
+        return int(count)
+    except ValueError:
+        return None
+
+
 #: ``AcSaveAsType`` template constants, newest first: ac2018_Template,
 #: ac2013_Template, ac2010_Template. A seat older than the first refuses it
 #: with a COM error and the next one is tried.
@@ -306,10 +511,21 @@ def _template_as_dwt(app, source: Path) -> tuple[Path, bool]:
 
 
 def _acad_doc():
-    """Return active AutoCAD document."""
+    """The active AutoCAD document - inside a ComBackend call, the bound one.
+
+    ``ComBackend._run`` installs a per-job ``_JobGuard`` (B11): the first call
+    here in a job checks that AutoCAD's active document is still the one this
+    session is bound to, and refuses with ``ActiveDocumentChangedError`` before
+    any work when the operator switched; later calls in the same job reuse the
+    checked document. Outside a job (a test calling a ``_sync`` directly) it is
+    the plain active document, as before.
+    """
     app = _acad_app()
     if app.Documents.Count == 0:
         raise RuntimeError("No drawing is open in AutoCAD. Open or create a .dwg file first.")
+    guard = getattr(_JOB_STATE, "guard", None)
+    if guard is not None:
+        return guard(app)
     return app.ActiveDocument
 
 
@@ -328,6 +544,120 @@ def _msp():
     except Exception as exc:  # never strand a write over a layout probe
         log.debug("ActiveLayout.Block unavailable (%s); using ModelSpace", exc)
         return doc.ModelSpace
+
+
+def _delete_on_layer_all_layouts(doc, layer: str) -> dict:
+    """Delete every entity on ``layer`` in every layout's block of ``doc``.
+
+    Measured on AutoCAD 2026 on 2026-10-24 in a scratch ``Documents.Add()``
+    document closed with ``Close(False)``: ``Layouts.Item(i).Block.Item(j)``
+    answers ``ObjectName`` / ``Handle`` / ``Layer`` for a LINE in model space
+    and on an unactivated Layout1 alike, and ``HandleToObject(h).Delete()``
+    removed both (Block.Count Model 2 -> 1, Layout1 2 -> 1, the other-layer
+    line kept). The handles are collected first and deleted afterwards, so the
+    indices being walked never shift. A delete that fails (a locked layer) is
+    reported with its reason, never skipped. ``doc`` is taken once by the
+    caller: the active document can change between two calls.
+    """
+    wanted = str(layer).casefold()
+    layouts = doc.Layouts
+    victims: list[str] = []
+    for i in range(int(layouts.Count)):
+        block = layouts.Item(i).Block
+        for j in range(int(block.Count)):
+            entity = block.Item(j)
+            if str(entity.Layer).casefold() == wanted:
+                victims.append(str(entity.Handle))
+    deleted: list[str] = []
+    failed: list[dict] = []
+    for handle in victims:
+        try:
+            doc.HandleToObject(handle).Delete()
+        except Exception as exc:  # noqa: BLE001 - reported per entity below
+            failed.append({"handle": handle, "error": str(exc)})
+        else:
+            deleted.append(handle)
+    return {"deleted": deleted, "failed": failed}
+
+
+#: The ActiveX object names ``text_find_replace`` reads and writes
+#: (``TextString``): TEXT, MTEXT, ATTRIB, ATTDEF.
+_COM_TEXT_OBJECTS = ("AcDbText", "AcDbMText", "AcDbAttribute", "AcDbAttributeDefinition")
+#: A block reference and a MINSERT (``block_explode`` measured both names).
+_COM_REFERENCE_OBJECTS = ("AcDbBlockReference", "AcDbMInsertBlock")
+
+
+def _com_text_candidates(doc):
+    """Every object ``text_find_replace`` reads on the live engine, in the
+    headless engine's scope (``TEXT_SEARCH_SCOPE``): model space and every paper
+    layout (``Layouts.Item(i).Block``, in ``TabOrder``), every block definition
+    that is neither a layout block nor an xref (``Blocks.Item(i).IsLayout`` /
+    ``IsXRef``), and the ATTRIBs of every block reference found in any of them
+    (``GetAttributes()``, which answers an empty array for a reference without
+    attributes). It searched ``ModelSpace`` alone, so an attribute on a sheet,
+    a title-block field or a block definition's ATTDEF default was never found
+    on the live engine while the headless one replaced it.
+
+    An anonymous block (``Name`` starting with ``*``) is not searched: a
+    dimension's ``*D`` block, a table's ``*T`` and a dynamic or hatch ``*U`` /
+    ``*X`` hold a rendering AutoCAD regenerates from the owning object, so a
+    match there rewrote a dimension's displayed measurement while the
+    dimension still measured the old value (measured on AutoCAD 2026: an
+    ``AddDimAligned`` of 50 mm owns ``*D1`` and its MText ``50`` was matched).
+    The headless engine skips the same blocks by the same rule.
+
+    Every item is yielded through ``_com_concrete_entity``: with a makepy cache
+    ``Block.Item(i)`` is the gen_py ``IAcadEntity`` wrapper, which has no
+    ``TextString`` (measured on AutoCAD 2026: ``hasattr(item, "TextString")``
+    is False on a TEXT, and the walk raised ``AttributeError``).
+
+    Members measured on AutoCAD 2026 by Task 12's probe (a scratch
+    ``Documents.Add()`` document closed with ``Close(False)``).
+    """
+    layouts = doc.Layouts
+    spaces = []
+    for index in range(int(layouts.Count)):
+        layout = layouts.Item(index)
+        spaces.append((int(layout.TabOrder), layout.Block))
+    containers = [block for _order, block in sorted(spaces, key=lambda row: row[0])]
+    blocks = doc.Blocks
+    for index in range(int(blocks.Count)):
+        block = blocks.Item(index)
+        if bool(block.IsLayout) or bool(block.IsXRef) or str(block.Name).startswith("*"):
+            continue
+        containers.append(block)
+    for container in containers:
+        for index in range(int(container.Count)):
+            entity = _com_concrete_entity(container.Item(index))
+            yield entity
+            if str(entity.ObjectName) in _COM_REFERENCE_OBJECTS:
+                for attribute in entity.GetAttributes():
+                    yield _com_concrete_entity(attribute)
+
+
+def _com_text_find_replace(doc, pattern, replace: str, layer: str | None, dry_run: bool) -> list:
+    """``[{handle, type, before, after}]`` for every match in the live scope;
+    written through ``TextString`` unless ``dry_run``. Each handle once."""
+    changed: list[dict] = []
+    seen: set[str] = set()
+    for entity in _com_text_candidates(doc):
+        object_name = str(entity.ObjectName)
+        if object_name not in _COM_TEXT_OBJECTS:
+            continue
+        handle = str(entity.Handle)
+        if handle in seen:
+            continue
+        seen.add(handle)
+        if layer and str(entity.Layer) != layer:
+            continue
+        current = str(entity.TextString or "")
+        if not current or not pattern.search(current):
+            continue
+        updated = pattern.sub(replace, current)
+        if not dry_run:
+            entity.TextString = updated
+        changed.append({"handle": handle, "type": object_name, "before": current, "after": updated})
+    return changed
 
 
 def _int_member(obj, name: str) -> int | None:
@@ -518,6 +848,26 @@ def _apply_entity_attrs(entity, layer: str | None, color: int | None, linetype: 
     if linetype is not None:
         _ensure_linetype_loaded(linetype)
         entity.Linetype = linetype
+
+
+def _attach_xdata(entity, prepared) -> None:
+    """XDATA validated by ``prepare_xdata``, written onto an entity this same COM
+    job just created (v1.7.0, B17) - no extra round trip per entity. The APPID
+    is registered first, exactly as ``entity_set_xdata`` does."""
+    if not prepared:
+        return
+    doc = _acad_doc()
+    for app, tags in prepared:
+        try:
+            doc.RegisteredApplications.Add(app)
+        except Exception as exc:  # already registered
+            log.debug("RegisteredApplications.Add(%s): %s", app, exc)
+        codes = [1001] + [code for code, _ in tags]
+        payload = [app] + [_apoint(*value) if code == 1010 else value for code, value in tags]
+        entity.SetXData(
+            _ai(codes),
+            win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_VARIANT, payload),
+        )
 
 
 def _regen():
@@ -1047,16 +1397,17 @@ def _com_bulge(entity, index: int) -> float:
         return 0.0
 
 
-def _com_bulges(entity, coords, closed: bool, length) -> list[float]:
+def _com_bulges(entity, coords, closed: bool, length, stride: int = 2) -> list[float]:
     """Every vertex's bulge, read only when ``Length`` says an arc exists.
 
-    ``coords`` is the flat ``Coordinates`` variant (x0, y0, x1, y1, ...). A
+    ``coords`` is the flat ``Coordinates`` variant: (x, y) pairs on a
+    lightweight polyline, (x, y, z) triples on a heavy 2D one (``stride``). A
     circular arc is strictly longer than its chord, so when AutoCAD's own
     ``Length`` equals the chord walk the polyline is straight everywhere and
     the per-vertex COM round trips are skipped.
     """
-    count = len(coords) // 2
-    pts = [(float(coords[i]), float(coords[i + 1])) for i in range(0, 2 * count, 2)]
+    count = len(coords) // stride
+    pts = [(float(coords[i]), float(coords[i + 1])) for i in range(0, stride * count, stride)]
     chord = sum(math.dist(a, b) for a, b in zip(pts, pts[1:], strict=False))
     if closed and count > 1:
         chord += math.dist(pts[-1], pts[0])
@@ -1422,14 +1773,17 @@ def _entity_info(entity) -> EntityInfo:
             props["length"] = entity.Radius * _sweep
         elif obj_name in _COM_LWPOLYLINE_NAMES or obj_name == "AcDb2dPolyline":
             coords = list(entity.Coordinates)
-            pts = [[coords[i], coords[i + 1]] for i in range(0, len(coords), 2)]
+            # Measured on AutoCAD 2026 (25.1), backlog W3-T13-09: a heavy 2D
+            # polyline's Coordinates are (x, y, z) triples - AddPolyline of three
+            # vertices answers nine values - while a lightweight polyline's are
+            # (x, y) pairs.
+            stride = 3 if obj_name == "AcDb2dPolyline" else 2
+            pts = [[coords[i], coords[i + 1]] for i in range(0, len(coords), stride)]
             # ActiveX hands back WCS for every point property on this backend
-            # *except* this one: "LightweightPolyline object: the variant is an
-            # array of 2D points in OCS." Scoped to the lightweight polyline
-            # deliberately — AcDb2dPolyline's Coordinates may be 3D triples, and
-            # changing its stride on a doc reading alone, with no way to verify
-            # against live AutoCAD from here, risks breaking a path that works
-            # today.
+            # *except* the lightweight polyline: "LightweightPolyline object: the
+            # variant is an array of 2D points in OCS." A heavy 2D polyline's
+            # frame is not translated: that reading is still unverified live, and
+            # the `ocs_normalized` capability reason says so.
             normal = None
             if obj_name in _COM_LWPOLYLINE_NAMES:
                 try:
@@ -1452,7 +1806,9 @@ def _entity_info(entity) -> EntityInfo:
             # is zero and no call is needed. GetBulge answers in the same OCS
             # as Coordinates, so a translated `points` list needs the bulges
             # translated with it — a mirrored frame reverses the arc's sense.
-            bulges = _com_bulges(entity, coords, bool(entity.Closed), props["length"])
+            bulges = _com_bulges(
+                entity, coords, bool(entity.Closed), props["length"], stride=stride
+            )
             if normal is not None:
                 bulges = [ocs.wcs_bulge(normal, b) for b in bulges]
             props["bulges"] = bulges
@@ -1476,12 +1832,17 @@ def _entity_info(entity) -> EntityInfo:
             props["x_scale"] = entity.XScaleFactor
             props["y_scale"] = entity.YScaleFactor
             props["rotation_deg"] = rad2deg(entity.Rotation)
-            # ezdxf parity: a block reference whose Normal points -Z is drawn
-            # on the mirror image (x -> -x) about its insertion point.
+            # ezdxf parity: a block reference whose Normal is -Z in a FLAT frame
+            # is drawn on the mirror image (x -> -x) about its insertion point; a
+            # tilted Normal with a negative z is no mirror (W3-T14-19).
             try:
-                props["mirrored"] = float(entity.Normal[2]) < 0
+                normal = tuple(float(v) for v in entity.Normal)
             except Exception:
-                props["mirrored"] = False
+                normal = (0.0, 0.0, 1.0)
+            flat = ocs.is_flat_frame(normal)
+            props["mirrored"] = flat and normal[2] < 0
+            if not flat:
+                props["plane_normal"] = ocs.plane_normal(normal)
             geometry_bbox = _com_geometry_bbox(entity)
             if geometry_bbox is not None:
                 props["geometry_bbox"] = geometry_bbox
@@ -1633,6 +1994,58 @@ def _capture_window(hwnd: int) -> bytes | None:
 # ---------------------------------------------------------------------------
 
 
+#: The ``_mutating`` call running in this task: ``_run`` marks it ``reached``
+#: when it hands a job to the COM thread. A task copies the context, so a
+#: ``gather``-ed sub-call marks the same holder.
+_MUTATION_PROBE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "acadmcp_mutation_probe", default=None
+)
+
+
+def _note_reached() -> None:
+    """The running ``_mutating`` call handed work to AutoCAD (see ``_run``)."""
+    probe = _MUTATION_PROBE.get()
+    if probe is not None:
+        probe["reached"] = True
+
+
+def _mutating(method):
+    """Bump the bound document's content revision after ``method`` (B11).
+
+    Only when the call handed work to AutoCAD - on success and on failure: a
+    write that raised may have landed in part, so the revision moves. Never on
+    ``ActiveDocumentChangedError``, which is raised before anything reaches
+    AutoCAD, and never for a call that returned or raised before its first
+    job (an argument refusal, ``transaction_rollback`` with no transaction),
+    which is what the headless revision does too. A refusal raised *inside* a
+    job still moves it: from outside a job a refusal and a partial write look
+    alike, and the safe error is one stale_revision too many. Applied by name
+    from ``_MUTATING_METHODS``, never from a tool's cost class: that class
+    counts save and deliver as mutations, and ``cad_batch`` steps bypass it.
+    """
+
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        probe = {"reached": False}
+        outer = _MUTATION_PROBE.get()
+        token = _MUTATION_PROBE.set(probe)
+        refused = False
+        try:
+            return await method(self, *args, **kwargs)
+        except ActiveDocumentChangedError:
+            refused = True
+            raise
+        finally:
+            _MUTATION_PROBE.reset(token)
+            if probe["reached"] and outer is not None:
+                outer["reached"] = True  # a nested mutating call reached AutoCAD for both
+            if probe["reached"] and not refused:
+                self._bump_revision()
+
+    wrapper.__acadmcp_mutating__ = True
+    return wrapper
+
+
 class ComBackend(AutoCADBackend):
     """Live AutoCAD control via COM API."""
 
@@ -1641,11 +2054,29 @@ class ComBackend(AutoCADBackend):
     _REJECTED_RETRY_BUDGET_S = 20.0
     _REJECTED_RETRY_FIRST_PAUSE_S = 0.25
 
+    #: ``call_outcomes`` keeps this many rows; ``system_status`` reports the last few.
+    _MAX_CALL_OUTCOMES = 50
+    _STATUS_CALL_OUTCOMES = 10
+
     def __init__(self):
-        self._executor: ThreadPoolExecutor | None = None
+        self._executor: concurrent.futures.Executor | None = None
+        # B01: cancellations recorded by `_run`, newest last; Task 10 reads it.
+        self.call_outcomes: collections.deque = collections.deque(maxlen=self._MAX_CALL_OUTCOMES)
         self._connected = False
         self._transaction_active = False
         self._document_scope_key: tuple[str, str] | None = None
+        # v1.7.0 (B11): the bound document and every document this session has
+        # bound, keyed by (application, Name, FullName) -> {"document_id",
+        # "revision"}; the application is ``_app_identity``, so a restarted
+        # AutoCAD's documents are new documents whatever their names.
+        self._bound: dict | None = None
+        self._known_documents: dict[tuple, dict] = {}
+        # B11: how operator edits reach the revision (``operator_edits_status``).
+        self._edit_counter: dict = {
+            "counted": None,
+            "method": "lisp_database_reactor",
+            "reason": "no call has touched a document yet",
+        }
 
     @property
     def name(self) -> str:
@@ -1654,6 +2085,53 @@ class ComBackend(AutoCADBackend):
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    def document_identity(self) -> dict:
+        """The bound document's ``{document_id, revision, name, path, backend}`` (B11).
+
+        ``revision`` counts this server's own content-changing calls on the
+        document (``_mutating``: on success and on failure, never on a refusal
+        or a save) plus one for every gap between two server calls in which
+        the operator's edit counter moved (``_edit_counter_start``; what it
+        catches and misses is in backends/document_guard.py). Answered from
+        memory: ``refresh_document_identity`` folds in a hand edit made since
+        the last call. All None until a document is bound.
+        """
+        bound = self._bound
+        if bound is None:
+            return {
+                "document_id": None,
+                "revision": None,
+                "name": None,
+                "path": None,
+                "backend": "com",
+            }
+        entry = self._known_documents.get(self._bound_entry_key()) or {}
+        return {
+            "document_id": bound["document_id"],
+            "revision": int(entry.get("revision", 0)),
+            "name": bound["name"],
+            "path": bound["full_name"] or None,
+            "backend": "com",
+        }
+
+    async def refresh_document_identity(self) -> None:
+        """Fold an operator edit made since the last call into the revision now.
+
+        ``document_identity()`` answers from memory; the edit counter is read
+        inside a guarded job. A preview and a precondition check await this
+        before they read the revision (engineering/changes/preview.py), so a
+        hand edit with no server call after it still moves the revision they
+        compare. One job (two ~1 ms counter reads); unbound, or refused because
+        another document is active, it changes nothing - the next guarded call
+        refuses that switch by itself.
+        """
+        if self._bound is None or self._executor is None:
+            return
+        try:
+            await self._run(self._check_bound_sync)
+        except Exception as exc:  # noqa: BLE001 - an identity read never fails a call
+            log.debug("refresh_document_identity: %s", exc)
 
     def capabilities(self) -> CapabilityMap:
         return CapabilityMap(
@@ -1695,11 +2173,16 @@ class ComBackend(AutoCADBackend):
                     "activex_wcs",
                     reason=(
                         "activex_returns_wcs_natively;lwpolyline_coordinates_translated_locally;"
-                        "2d_polyline_coordinates_not_verified_against_live_autocad"
+                        "2d_polyline_xyz_stride_measured;2d_polyline_ocs_not_verified_live"
                     ),
                 ),
                 "ocs_tilted_plane": FeatureCapability(
                     False, reason="2d_xy_cannot_address_a_tilted_plane"
+                ),
+                "hatch_loops": FeatureCapability(
+                    True,
+                    "dxf_export",
+                    reason="entity_get_reads_one_document_export;block_definition_members_not_read",
                 ),
                 "table": FeatureCapability(True, "native"),
                 "mleader": FeatureCapability(True, "native"),
@@ -1749,7 +2232,7 @@ class ComBackend(AutoCADBackend):
         # Lazy connection: just set up the executor. AutoCAD is connected
         # on the first actual tool call so the server starts even if AutoCAD
         # is not open yet — it will be found as soon as the user opens it.
-        self._executor = ThreadPoolExecutor(max_workers=1, initializer=_com_init)
+        self._executor = self._new_executor()
         self._connected = True
         progid = config.settings.cad_progid
         log.info("COM backend ready (will connect to %s on first tool call)", progid)
@@ -1761,15 +2244,41 @@ class ComBackend(AutoCADBackend):
                 config.DEFAULT_CAD_PROGID,
             )
 
+    @staticmethod
+    def _new_executor() -> concurrent.futures.Executor:
+        """The single STA thread every COM call runs on (B01: a daemon thread,
+        so a call stuck inside AutoCAD never holds the server process open)."""
+        return DaemonExecutor(max_workers=1, name="com-sta", initializer=_com_init)
+
     async def disconnect(self) -> None:
-        if self._executor:
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            teardown = None
             try:
-                self._executor.submit(_com_teardown)  # release COM apartment (R5)
+                teardown = executor.submit(_com_teardown)  # release COM apartment (R5)
             except Exception:
                 pass
-            self._executor.shutdown(wait=False)
-            self._executor = None
+            executor.shutdown(wait=False)
+            if teardown is not None:
+                # B01: wait a bounded SHUTDOWN_GRACE for the call ahead of the
+                # teardown; a worker still inside AutoCAD after it is logged and
+                # left on its daemon thread. `asyncio.wait` never cancels the
+                # teardown, so it still runs when that call returns.
+                grace = config.settings.shutdown_grace
+                waiter = asyncio.wrap_future(teardown)
+                if grace > 0:
+                    await asyncio.wait([waiter], timeout=grace)
+                if not teardown.done():
+                    waiter.cancel()
+                    log.warning(
+                        "disconnect: the COM worker is still inside a call after "
+                        "SHUTDOWN_GRACE=%gs; it runs on a daemon thread and will not hold "
+                        "the process open",
+                        grace,
+                    )
         self._document_scope_key = None
+        self._bound = None
+        self._known_documents.clear()
         self._transaction_active = False
         self._reset_document_state()
         self._connected = False
@@ -1782,30 +2291,316 @@ class ComBackend(AutoCADBackend):
             first_pause_s=self._REJECTED_RETRY_FIRST_PAUSE_S,
         )
 
+    # ── the bound document (v1.7.0, B11) ─────────────────────────────────────
+    #
+    # One document per session: (Name, FullName) plus a uuid4 id, bound by
+    # ``_rebind`` after a call that chose a document - drawing_new /
+    # drawing_open / document_activate, system_launch(open_path=...), and a
+    # document_close of the bound document itself - and by ``_guard`` at the
+    # first call that touches a document. Closing some other document, or a
+    # system_launch that only attaches, keeps the binding: whatever AutoCAD
+    # has active then is the operator's choice, not the call's, so the guard
+    # still refuses it (and an open UNDO mark stays rollback-able).
+    # backends/document_guard.py says why the operator's own edits are not
+    # counted.
+
     async def _ensure_document_state(self) -> None:
-        """Reset drawing-scoped metadata when AutoCAD's active document changes.
+        """The guard as a call of its own: bind on first contact, else refuse a switch.
 
-        Runs directly after ``Documents.Add`` / ``Open`` / ``Close`` — the
-        window in which AutoCAD still rejects incoming calls (see
-        ``_RPC_E_CALL_REJECTED``) — so the read waits that window out. It is
-        a pure read, which is what makes re-running it safe.
+        Before v1.7.0 this reset drawing-scoped metadata whenever AutoCAD's
+        active document had changed - silently following the operator to
+        another drawing. A switch is now refused with
+        ``ActiveDocumentChangedError``; ``document_activate`` is how a session
+        moves. The read waits out ``RPC_E_CALL_REJECTED`` (the window right
+        after Documents.Add / Open / Close).
         """
+        await self._run(self._check_bound_sync)
 
-        def _read_active_key():
-            app = _acad_app()
-            if app.Documents.Count == 0:
-                return None
+    def _check_bound_sync(self) -> None:
+        """``_guard`` on the COM thread; returns nothing (a proxy must not leave the STA)."""
+        self._guard(_acad_app())
+
+    def _active_key_sync(self, app) -> tuple[Any, tuple[str, str] | None]:
+        """``(ActiveDocument, (Name, FullName))``, or ``(None, None)`` with nothing open."""
+
+        def _read():
+            if int(app.Documents.Count) == 0:
+                return None, None
             doc = app.ActiveDocument
-            return (str(doc.Name), str(doc.FullName))
+            return doc, (str(doc.Name), str(doc.FullName))
 
-        def _sync():
-            key = self._wait_out_rejected_call(_read_active_key)
-            if key != self._document_scope_key:
-                self._document_scope_key = key
-                self._transaction_active = False
-                self._reset_document_state()
+        return self._wait_out_rejected_call(_read)
 
-        await self._run(_sync)
+    def _guard(self, app) -> Any:
+        """The bound Document, checked against AutoCAD's active one (COM thread).
+
+        Unbound: the active document is adopted - the first call that touches
+        a document binds it. Bound: a different active document, or none, is
+        refused with ``ActiveDocumentChangedError`` before anything is written.
+        """
+        doc, key = self._active_key_sync(app)
+        application = _app_identity(app)
+        if self._bound is None:
+            if key is None:
+                raise RuntimeError(
+                    "No drawing is open in AutoCAD. Open or create a .dwg file first."
+                )
+            self._bind_key(key, application)
+            self._edit_counter_start(app)
+            return doc
+        restarted = self._bound["app"] != application
+        if restarted or key != (self._bound["name"], self._bound["full_name"]):
+            raise ActiveDocumentChangedError(
+                self._bound_view(),
+                self._view_of(key, application),
+                application_changed=restarted,
+            )
+        self._edit_counter_start(app)
+        return doc
+
+    # -- operator edits (B11) ---------------------------------------------------
+
+    def operator_edits_status(self) -> dict:
+        """Whether the live revision counts the operator's own edits, and how.
+
+        ``{"counted": True, "method": "lisp_database_reactor", "reason": None}``
+        once the counter answered; ``counted: False`` with the error when
+        ``VL.Application.16`` is missing or failed (the revision then counts
+        this server's writes only, as before); ``counted: None`` until a call
+        has touched a document.
+        """
+        return dict(self._edit_counter)
+
+    def _edit_counter_start(self, app) -> None:
+        """Fold an edit made outside this server into the revision (COM thread).
+
+        Runs inside the guard, after it found the bound document active - so
+        the active namespace is the bound document's. The count is compared
+        with the one the previous job left (``_edit_counter_end``): a
+        difference is one more revision, however many objects changed. A
+        reactor that was watching and is gone (``vlr-remove-all``, a document
+        reopened under the same key) is an unwatched gap and counts too; it is
+        installed again. The first install sets the baseline and moves nothing.
+        What is and is not counted is in backends/document_guard.py. Any
+        failure turns the counter off for this attach and leaves the revision
+        counting the server's own writes; the next working read counts the
+        gap once.
+        """
+        entry = self._known_documents.get(self._bound_entry_key())
+        if entry is None:
+            return
+        document_id = entry["document_id"]
+        try:
+            count = self._read_edit_count(app, document_id)
+            gap = False
+            if count is None:
+                gap = "edits" in entry  # it was watching; something removed it
+                count = self._install_edit_counter(app, document_id)
+        except Exception as exc:  # noqa: BLE001 - the counter is evidence, never a failure
+            self._edit_counter = {
+                "counted": False,
+                "method": "lisp_database_reactor",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            if "edits" in entry:
+                entry["edits"] = None  # unknown: the next working read counts the gap
+            log.debug("operator-edit counter unavailable: %s", exc)
+            return
+        if gap or ("edits" in entry and entry["edits"] != count):
+            entry["revision"] += 1
+            log.info(
+                "document %s changed outside this server (edit counter %s -> %s)",
+                document_id,
+                entry.get("edits"),
+                count,
+            )
+        entry["edits"] = count
+        self._edit_counter = {"counted": True, "method": "lisp_database_reactor", "reason": None}
+
+    def _edit_counter_end(self, app) -> None:
+        """Remember the count this job leaves, so its own writes are not the operator's.
+
+        COM thread, at the end of a job whose guard passed. Read through the
+        cached forms only; a failure or another document's answer keeps the
+        previous count, so the next job counts this one's writes as an outside
+        edit - one revision too many, never one too few.
+        """
+        entry = self._known_documents.get(self._bound_entry_key())
+        if entry is None or entry.get("edits") is None:
+            return
+        try:
+            count = self._read_edit_count(app, entry["document_id"], refetch=False)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("operator-edit counter: end-of-job read failed: %s", exc)
+            return
+        if count is not None:
+            entry["edits"] = count
+
+    def _read_edit_count(self, app, document_id: str, *, refetch: bool = True) -> int | None:
+        """The bound namespace's count, or None when no reactor of ours answers there."""
+
+        def _once(fresh: bool):
+            _reader, evaluator, form = _vl_document_forms(app, document_id, fresh=fresh)
+            value = self._wait_out_rejected_call(lambda: _vl_call(evaluator, "funcall", form))
+            return _parse_edit_count(value, document_id)
+
+        try:
+            count = _once(False)
+        except Exception:
+            if not refetch:
+                raise
+            count = None
+        if count is None and refetch:
+            count = _once(True)  # the cached objects may belong to a closed namespace
+        return count
+
+    def _install_edit_counter(self, app, document_id: str) -> int:
+        reader, evaluator, _form = _vl_document_forms(app, document_id, fresh=True)
+        source = _EDIT_COUNTER_INSTALL.format(document_id=document_id)
+        value = self._wait_out_rejected_call(
+            lambda: _vl_call(evaluator, "funcall", _vl_call(reader, "funcall", source))
+        )
+        count = _parse_edit_count(value, document_id)
+        if count is None:
+            raise RuntimeError(f"the edit counter did not install (answered {value!r})")
+        return count
+
+    def _bind_key(self, key: tuple[str, str], application: tuple | None = None) -> bool:
+        """Bind ``key`` in ``application``; True when that is another document than before."""
+        entry_key = (application, *key)
+        entry = self._known_documents.get(entry_key)
+        if entry is None:
+            entry = {"document_id": uuid.uuid4().hex, "revision": 0}
+            self._known_documents[entry_key] = entry
+        previous = None if self._bound is None else self._bound["document_id"]
+        self._bound = {
+            "document_id": entry["document_id"],
+            "name": key[0],
+            "full_name": key[1],
+            "app": application,
+        }
+        self._document_scope_key = key
+        return previous != entry["document_id"]
+
+    def _bound_entry_key(self) -> tuple | None:
+        bound = self._bound
+        if bound is None:
+            return None
+        return (bound["app"], bound["name"], bound["full_name"])
+
+    def _bind_active_sync(self) -> bool:
+        """Bind whatever AutoCAD now has active (COM thread); True when that changed."""
+        app = _acad_app()
+        _doc, key = self._active_key_sync(app)
+        if key is None:
+            changed = self._bound is not None
+            self._bound = None
+            self._document_scope_key = None
+            return changed
+        return self._bind_key(key, _app_identity(app))
+
+    async def _rebind(self) -> None:
+        """After a call that chose a document: bind the active one, reset state on a change.
+
+        Only for a call that chose the document it leaves active (see the
+        section comment above): binding whatever AutoCAD has active after any
+        other call would follow the operator's tab switch silently - and drop
+        the open transaction of the document the session was bound to.
+        """
+        changed = await self._run(self._bind_active_sync)
+        if changed:
+            self._transaction_active = False
+            self._reset_document_state()
+
+    def _rekey_bound_sync(self, doc) -> None:
+        """Our own SaveAs renamed the bound document: same document, same id (COM thread)."""
+        bound = self._bound
+        if bound is None:
+            return
+        old = (bound["name"], bound["full_name"])
+        new = self._wait_out_rejected_call(lambda: (str(doc.Name), str(doc.FullName)))
+        if new == old:
+            return
+        application = bound["app"]
+        entry = self._known_documents.pop((application, *old), None) or {
+            "document_id": bound["document_id"],
+            "revision": 0,
+        }
+        self._known_documents[(application, *new)] = entry
+        self._bound = {
+            "document_id": entry["document_id"],
+            "name": new[0],
+            "full_name": new[1],
+            "app": application,
+        }
+        self._document_scope_key = new
+
+    def _reactivate_bound_sync(self, app) -> bool:
+        """Make the bound document active again after a job opened and closed another.
+
+        COM thread. True when it had to activate it; False when it already was,
+        when nothing is bound, or when the bound document is gone - closed, or
+        in an AutoCAD that is no longer the one attached (the next guarded call
+        then refuses by name).
+        """
+        bound = self._bound
+        if bound is None or bound["app"] != _app_identity(app):
+            return False
+        key = (bound["name"], bound["full_name"])
+
+        def _find():
+            count = int(app.Documents.Count)
+            if count == 0:
+                return None
+            active = app.ActiveDocument
+            if (str(active.Name), str(active.FullName)) == key:
+                return None
+            for index in range(count):
+                doc = app.Documents.Item(index)
+                if (str(doc.Name), str(doc.FullName)) == key:
+                    return doc
+            return None
+
+        doc = self._wait_out_rejected_call(_find)
+        if doc is None:
+            return False
+        doc.Activate()
+        self._wait_out_rejected_call(lambda: str(app.ActiveDocument.Name))
+        return True
+
+    def _bump_revision(self) -> None:
+        """One more content revision on the bound document (see ``_mutating``)."""
+        if getattr(self, "_bound", None) is None:
+            return
+        entry = self._known_documents.get(self._bound_entry_key())
+        if entry is not None:
+            entry["revision"] += 1
+
+    def _identity_of_key(self, key: tuple[str, str], application: tuple | None = None) -> dict:
+        entry = self._known_documents.get((application, *key))
+        return {
+            "document_id": entry["document_id"] if entry else None,
+            "revision": entry["revision"] if entry else None,
+        }
+
+    def _bound_view(self) -> dict:
+        bound = self._bound
+        return {
+            "document_id": bound["document_id"],
+            "name": bound["name"],
+            "path": bound["full_name"] or None,
+        }
+
+    def _view_of(
+        self, key: tuple[str, str] | None, application: tuple | None = None
+    ) -> dict | None:
+        if key is None:
+            return None
+        return {
+            "document_id": self._identity_of_key(key, application)["document_id"],
+            "name": key[0],
+            "path": key[1] or None,
+        }
 
     def _sync_test_connection(self):
         """Verify AutoCAD is reachable (runs in COM thread)."""
@@ -1833,16 +2628,58 @@ class ComBackend(AutoCADBackend):
         close the operator's drawing and discard unsaved work the server never
         created. What COM is exposed to is idempotency, so the message says the
         call may still land.
+
+        **The bound document (v1.7.0, B11).** Each job carries a
+        ``_JobGuard``: the first ``_acad_doc()`` of the job compares AutoCAD's
+        active document with the bound one inside this same job, before any
+        work, and refuses with ``ActiveDocumentChangedError`` when the
+        operator switched. A call that never asks for the document
+        (``Documents.Add`` / ``Open``, ``document_list``, ``system_status``)
+        writes into none and is not guarded.
         """
         if self._executor is None:
             raise RuntimeError("ComBackend not connected. Call connect() first.")
         loop = asyncio.get_running_loop()
         timeout = config.settings.com_call_timeout
-        future = loop.run_in_executor(self._executor, lambda: func(*args, **kwargs))
+        started = time.time()
+        document = self._document_label()
+        guard = _JobGuard(self)
+        # B12: a thread pool copies no context, so the operation id travels into
+        # the STA job explicitly - code on the COM thread and the call_outcomes
+        # rows below see the id the caller runs under.
+        operation_id = CURRENT_OPERATION.get()
+
+        def _job():
+            # B11: the first _acad_doc() of this job checks the bound document,
+            # inside the job, before any document work.
+            token = CURRENT_OPERATION.set(operation_id)
+            _JOB_STATE.guard = guard
+            try:
+                return func(*args, **kwargs)
+            finally:
+                if guard.doc is not None:
+                    try:
+                        self._edit_counter_end(_acad_app())
+                    except Exception as exc:  # noqa: BLE001 - never mask the job's outcome
+                        log.debug("operator-edit counter: %s", exc)
+                _JOB_STATE.guard = None
+                guard.doc = None
+                CURRENT_OPERATION.reset(token)
+
+        work = self._executor.submit(_job)
+        _note_reached()  # B11: from here a `_mutating` call may have written
+        future = asyncio.wrap_future(work, loop=loop)
         try:
             if timeout > 0:
                 return await asyncio.wait_for(future, timeout=timeout)
             return await future
+        except asyncio.CancelledError:
+            # B01: one STA thread, FIFO, so a cancelled call cannot overlap the
+            # next one — but whether it ran matters to Task 10's
+            # `unknown_commit`. `work.cancel()` is True only for a call no
+            # worker ever took (it never runs); False means it is running or done.
+            self._record_cancel(func, work, started, document, operation_id)
+            raise
         except TimeoutError as e:
             if not future.cancelled():
                 # The call raised TimeoutError instead of overrunning the
@@ -1852,13 +2689,25 @@ class ComBackend(AutoCADBackend):
                 # blaming AutoCAD and discarding a live STA connection.
                 raise
             log.error("COM call timed out after %.1fs; rebuilding executor", timeout)
+            # B12: the worker is still inside AutoCAD; whether the call lands
+            # is unknown, and the middleware reads this row to say so.
+            self.call_outcomes.append(
+                {
+                    "call": real_call_name(func),
+                    "outcome": "abandoned_deadline",
+                    "started": started,
+                    "ended": None,
+                    "document": document,
+                    "operation_id": operation_id,
+                }
+            )
             # The worker thread is still blocked inside SendCommand and cannot be
             # cancelled. Abandon it (shutdown(wait=False)) and start a fresh
             # single-thread executor so the next call doesn't queue behind the
             # stuck one and time out too. Drop the cached COM app for the same
             # reason — the new thread must re-Dispatch in its own apartment.
             stuck = self._executor
-            self._executor = ThreadPoolExecutor(max_workers=1, initializer=_com_init)
+            self._executor = self._new_executor()
             if stuck is not None:
                 # When the stuck SendCommand eventually unblocks, the queued
                 # teardown releases its COM apartment instead of leaking it (R5).
@@ -1867,7 +2716,7 @@ class ComBackend(AutoCADBackend):
                 except Exception:
                     pass
                 stuck.shutdown(wait=False)
-            _COM_STATE.pop("app", None)
+            _drop_app()
             self._connected = False
             raise RuntimeError(
                 f"AutoCAD did not respond within {timeout:.0f}s. The application "
@@ -1881,11 +2730,42 @@ class ComBackend(AutoCADBackend):
         except _COM_ERROR as e:
             hr = e.args[0] if e.args else 0
             if hr in (-2147221246, -2147221005, -2147417842):
-                _COM_STATE.pop("app", None)
+                _drop_app()
                 self._connected = False
             raise RuntimeError(
                 f"AutoCAD COM error ({hr:#010x}): {e.args[1] if len(e.args) > 1 else e}"
             ) from e
+
+    def _document_label(self) -> str | None:
+        """The bound document's FullName (or Name), captured when a call starts."""
+        key = self._document_scope_key
+        if key is None:
+            return None
+        name, full_name = key
+        return full_name or name
+
+    def _record_cancel(
+        self,
+        func,
+        work,
+        started: float,
+        document: str | None,
+        operation_id: str | None = None,
+    ) -> None:
+        queued = work.cancel()
+        row = {
+            "call": real_call_name(func),
+            "outcome": "cancelled_queued" if queued else "cancelled_running",
+            "started": started,
+            "ended": time.time() if queued else None,
+            "document": document,
+            "operation_id": operation_id,
+        }
+        self.call_outcomes.append(row)
+        if not queued:
+            # Runs on the worker thread when the call returns (at once if it
+            # already has); a dict store is atomic under the GIL.
+            work.add_done_callback(lambda _work: row.__setitem__("ended", time.time()))
 
     # ── drawing management ────────────────────────────────────────────────────
 
@@ -1919,6 +2799,7 @@ class ComBackend(AutoCADBackend):
                 log.debug("doc.GetVariable(INSUNITS) failed, reporting Unknown: %s", exc)
                 units = "Unknown"
 
+            identity = self.document_identity()
             return DrawingInfo(
                 name=doc.Name,
                 full_path=doc.FullName,
@@ -1931,6 +2812,8 @@ class ComBackend(AutoCADBackend):
                 units=units,
                 version=app.Version,
                 backend="com",
+                document_id=identity["document_id"],
+                revision=identity["revision"],
             )
 
         return await self._run(_sync)
@@ -1968,7 +2851,7 @@ class ComBackend(AutoCADBackend):
             return result
 
         result = await self._run(_sync)
-        await self._ensure_document_state()
+        await self._rebind()
         return result
 
     async def drawing_open(self, path: str) -> dict:
@@ -1979,7 +2862,7 @@ class ComBackend(AutoCADBackend):
             return {"ok": True, "name": name, "path": full_name}
 
         result = await self._run(_sync)
-        await self._ensure_document_state()
+        await self._rebind()
         return result
 
     async def drawing_save(self, path: str | None = None) -> dict:
@@ -1989,6 +2872,7 @@ class ComBackend(AutoCADBackend):
                 doc.SaveAs(path)
             else:
                 doc.Save()
+            self._rekey_bound_sync(doc)
             return {"ok": True, "path": doc.FullName}
 
         return await self._run(_sync)
@@ -2002,12 +2886,70 @@ class ComBackend(AutoCADBackend):
             fmt_map = {"dwg": 12, "dxf": 61, "dwt": 66}
             acad_fmt = fmt_map.get(fmt.lower(), 12)
             doc.SaveAs(path, acad_fmt)
+            self._rekey_bound_sync(doc)
             return {"ok": True, "path": path, "format": fmt}
 
         return await self._run(_sync)
 
     async def drawing_export_dxf(self, path: str) -> dict:
-        return await self.drawing_save_as(path, "dxf")
+        """A DXF copy through ``Document.Export``; the open document is not re-pointed.
+
+        ``SaveAs(path, 61)`` - what this method did until 1.7.0 - makes the
+        open document the DXF. ``Export`` does not. Measured on AutoCAD 2026
+        (25.1s) on 2026-10-24 in a scratch document: ``Export(<base>, "DXF",
+        <selection set of all>)`` writes ``<base>.DXF`` (upper-case extension,
+        ``$ACADVER`` AC1032 = R2018) and leaves ``Name``, ``FullName`` and
+        ``Saved`` as they were; ``".dxf"`` as the extension argument is
+        refused. The file is written into a private folder beside the target
+        and renamed onto it, so the name is the caller's and a file already
+        there is replaced in one step - AutoCAD is never asked about it. The
+        version reported is the one read back from the file's header.
+        """
+        target = Path(path)
+        if target.suffix.lower() != ".dxf":
+            raise ValueError(
+                f"drawing_export_dxf writes DXF; name the file .dxf, got {target.name!r}"
+            )
+
+        def _sync():
+            import shutil
+            import tempfile
+
+            from engineering.understand.snapshot import dxf_version_of
+
+            doc = _acad_doc()  # inside a job: the bound document, guarded (Task 9)
+            name, full_name = str(doc.Name), str(doc.FullName)
+            folder = tempfile.mkdtemp(prefix=".acadmcp_export_", dir=str(target.parent))
+            try:
+                selection = doc.SelectionSets.Add(f"_EXP_{uuid.uuid4().hex[:8]}")
+                try:
+                    selection.Select(_AC_SELECTION_SET_ALL)
+                    # "DXF", never ".dxf" (measured: "Invalid argument").
+                    doc.Export(os.path.join(folder, "export"), "DXF", selection)
+                finally:
+                    try:
+                        selection.Delete()
+                    except Exception:  # a selection set left behind is harmless; the export is not
+                        pass
+                written = sorted(Path(folder).glob("export.*"))
+                if not written:
+                    raise RuntimeError(
+                        f"AutoCAD reported the export of {name} done but wrote no file"
+                    )
+                os.replace(written[0], target)
+            finally:
+                shutil.rmtree(folder, ignore_errors=True)
+            return {
+                "ok": True,
+                "path": str(target),
+                "format": "dxf",
+                "method": "Document.Export",
+                "dxf_version": dxf_version_of(target),
+                "document": {"name": name, "full_name": full_name},
+                "repointed": False,
+            }
+
+        return await self._run(_sync)
 
     # ── external references, rasters and DWG (v1.6 track G) ──────────────────
     #
@@ -2188,6 +3130,7 @@ class ComBackend(AutoCADBackend):
         def _sync():
             doc = _acad_doc()
             doc.SaveAs(path, save_as_type)
+            self._rekey_bound_sync(doc)
             target = Path(path)
             return {
                 "ok": True,
@@ -2537,7 +3480,13 @@ class ComBackend(AutoCADBackend):
         def _sync():
             app = _acad_app()
             active = app.ActiveDocument if int(app.Documents.Count) else None
-            return [self._com_document_row(doc, active) for doc in self._com_documents(app)]
+            return [
+                {
+                    **self._com_document_row(doc, active),
+                    **self._identity_of_key((str(doc.Name), str(doc.FullName))),
+                }
+                for doc in self._com_documents(app)
+            ]
 
         return await self._run(_sync)
 
@@ -2556,7 +3505,7 @@ class ComBackend(AutoCADBackend):
             }
 
         result = await self._run(_sync)
-        await self._ensure_document_state()
+        await self._rebind()
         return result
 
     async def document_close(
@@ -2572,6 +3521,12 @@ class ComBackend(AutoCADBackend):
             )
             name = str(doc.Name)
             path = str(doc.FullName) or None
+            bound = self._bound
+            closes_bound = (
+                bound is not None
+                and bound["app"] == _app_identity(app)
+                and (name, str(doc.FullName)) == (bound["name"], bound["full_name"])
+            )
             dirty = not bool(doc.Saved)
             if dirty:
                 if save:
@@ -2598,7 +3553,7 @@ class ComBackend(AutoCADBackend):
                 return count, (str(app.ActiveDocument.Name) if count else None)
 
             count, active = self._wait_out_rejected_call(_read_after_close)
-            return {
+            return closes_bound, {
                 "ok": True,
                 "closed": name,
                 "path": path,
@@ -2609,8 +3564,12 @@ class ComBackend(AutoCADBackend):
                 "backend": "com",
             }
 
-        result = await self._run(_sync)
-        await self._ensure_document_state()
+        closes_bound, result = await self._run(_sync)
+        # B11: only closing the bound document moves the session. Closing some
+        # other one keeps the binding, so a tab the operator switched to is
+        # still refused by the guard rather than adopted here.
+        if closes_bound:
+            await self._rebind()
         return result
 
     # ── layer states ──────────────────────────────────────────────────────────
@@ -3149,7 +4108,10 @@ class ComBackend(AutoCADBackend):
             }
 
         result = await self._run(_sync)
-        await self._ensure_document_state()
+        # B11: only a file this call opened is a document the call chose; an
+        # attach keeps the binding (and an open transaction) as it was.
+        if path:
+            await self._rebind()
         return result
 
     async def preferences_get(self, keys: list[str] | None = None) -> dict:
@@ -3781,7 +4743,7 @@ class ComBackend(AutoCADBackend):
 
     #: Same scope as the headless backend, and DIMENSION is out for the same
     #: reason: its TextOverride is the '<>' placeholder, not the measurement.
-    _TEXT_BEARING_OBJECTS = ("AcDbText", "AcDbMText", "AcDbAttribute", "AcDbAttributeDefinition")
+    _TEXT_BEARING_OBJECTS = _COM_TEXT_OBJECTS
 
     @staticmethod
     def _plane_points(points) -> list[tuple[float, float]] | None:
@@ -3880,39 +4842,21 @@ class ComBackend(AutoCADBackend):
                         "character and would shred the text"
                     ),
                 }
+            # The bound document: inside a _run job Task 9's _JobGuard makes
+            # _acad_doc() return it (or refuse), never whatever is active.
             doc = _acad_doc()
             pattern = re.compile(re.escape(needle), 0 if match_case else re.IGNORECASE)
-
-            changed: list[dict] = []
-            for i in range(doc.ModelSpace.Count):
-                entity = doc.ModelSpace.Item(i)
-                if entity.ObjectName not in self._TEXT_BEARING_OBJECTS:
-                    continue
-                if layer and entity.Layer != layer:
-                    continue
-                current = entity.TextString
-                if not current or not pattern.search(current):
-                    continue
-                updated = pattern.sub(replace, current)
-                if not dry_run:
-                    entity.TextString = updated
-                changed.append(
-                    {
-                        "handle": entity.Handle,
-                        "type": entity.ObjectName,
-                        "before": current,
-                        "after": updated,
-                    }
-                )
-
+            changed = _com_text_find_replace(doc, pattern, replace, layer, dry_run)
             return {
                 "ok": True,
                 "replaced": len(changed),
                 "entities": changed,
                 "searched_types": list(self._TEXT_BEARING_OBJECTS),
+                "searched_scope": list(TEXT_SEARCH_SCOPE),
                 "note": (
                     "DIMENSION text is not searched: its TextOverride holds the '<>' "
-                    "placeholder rather than the measured value."
+                    "placeholder rather than the measured value; nor is any anonymous "
+                    "block ('*D' holds a dimension's rendered measurement, '*T' a table's)."
                 ),
                 "dry_run": bool(dry_run),
             }
@@ -4458,6 +5402,7 @@ class ComBackend(AutoCADBackend):
                     log.debug("SummaryInfo.Comments write failed: %s", exc)
             code = self._AC_SAVEAS_TEMPLATE if suffix == ".dwt" else self._AC_SAVEAS_DXF
             doc.SaveAs(path, code)
+            self._rekey_bound_sync(doc)
             return {
                 "ok": True,
                 "path": path,
@@ -4677,11 +5622,15 @@ class ComBackend(AutoCADBackend):
         layer=None,
         color=None,
         linetype=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             mspace = _msp()
             line = mspace.AddLine(_apoint(x1, y1, z1), _apoint(x2, y2, z2))
             _apply_entity_attrs(line, layer, color, linetype)
+            _attach_xdata(line, prepared)
             _regen()
             return _entity_info(line)
 
@@ -4694,11 +5643,15 @@ class ComBackend(AutoCADBackend):
         radius,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             mspace = _msp()
             circle = mspace.AddCircle(_apoint(cx, cy), float(radius))
             _apply_entity_attrs(circle, layer, color, None)
+            _attach_xdata(circle, prepared)
             _regen()
             return _entity_info(circle)
 
@@ -4713,7 +5666,10 @@ class ComBackend(AutoCADBackend):
         end_angle,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             mspace = _msp()
             arc = mspace.AddArc(
@@ -4723,6 +5679,7 @@ class ComBackend(AutoCADBackend):
                 deg2rad(end_angle),
             )
             _apply_entity_attrs(arc, layer, color, None)
+            _attach_xdata(arc, prepared)
             _regen()
             return _entity_info(arc)
 
@@ -4734,7 +5691,10 @@ class ComBackend(AutoCADBackend):
         closed=False,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             mspace = _msp()
             flat = []
@@ -4743,6 +5703,7 @@ class ComBackend(AutoCADBackend):
             pline = mspace.AddLightWeightPolyline(_av(flat))
             pline.Closed = closed
             _apply_entity_attrs(pline, layer, color, None)
+            _attach_xdata(pline, prepared)
             _regen()
             return _entity_info(pline)
 
@@ -4757,12 +5718,16 @@ class ComBackend(AutoCADBackend):
         rotation=0.0,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             mspace = _msp()
             txt = mspace.AddText(text, _apoint(x, y), float(height))
             txt.Rotation = deg2rad(rotation)
             _apply_entity_attrs(txt, layer, color, None)
+            _attach_xdata(txt, prepared)
             _regen()
             return _entity_info(txt)
 
@@ -4905,7 +5870,10 @@ class ComBackend(AutoCADBackend):
         angle=0.0,
         layer=None,
         color=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             mspace = _msp()
             # acPatternTypePreDefined = 0
@@ -4923,6 +5891,7 @@ class ComBackend(AutoCADBackend):
             hatch.Evaluate()
             bnd_pline.Delete()
             _apply_entity_attrs(hatch, layer, color, None)
+            _attach_xdata(hatch, prepared)
             _regen()
             return _entity_info(hatch)
 
@@ -5345,7 +6314,48 @@ class ComBackend(AutoCADBackend):
             ent = doc.HandleToObject(handle)
             return _entity_info(ent)
 
-        return await self._run(_sync)
+        info = await self._run(_sync)
+        if info.type == "HATCH" or "DIMENSION" in info.type:
+            await self._detail_from_export(info)
+        return info
+
+    async def _detail_from_export(self, info: EntityInfo) -> None:
+        """A HATCH's loops and a DIMENSION's fields, read from the drawing's DXF export.
+
+        ActiveX has no loop reader that leaves a non-associative hatch
+        untouched and no defpoint reader for every dimension class, so the
+        drawing is exported once (``Document.Export``, measured on AutoCAD 2026 -
+        ``engineering/understand/snapshot.py``) and the record of this handle is
+        read with the same code the headless engine runs. One export per call,
+        never per ``entity_list`` row. A member of a block definition is not in
+        a layout of the export: it says ``detail_unavailable`` instead.
+        """
+        from backends.entity_fields import dimension_props, hatch_props
+        from engineering.understand import snapshot as snapshot_module
+
+        snap = await snapshot_module.take_snapshot(self)
+        wanted = str(info.handle).upper()
+        record = next((r for r in snap.records if r.handle.upper() == wanted), None)
+        if record is None:
+            info.properties["detail_unavailable"] = (
+                f"{info.handle} is not in a layout of the exported drawing (a block "
+                "definition's member is not read); no loops or defpoints are reported"
+            )
+            return
+        info.properties["detail_source"] = "dxf_export"
+        if record.tilted:
+            info.properties["tilted"] = True
+            return
+        if info.type == "HATCH":
+            if not record.hatch_loops:  # a hatch has a loop: none means "not read"
+                info.properties["detail_unavailable"] = (
+                    f"{info.handle}'s boundary loops could not be read from the export; "
+                    "no loops or area are reported"
+                )
+                return
+            info.properties.update(hatch_props(record.hatch_loops, record.hatch_style))
+        elif record.dimension is not None:
+            info.properties["dimension"] = dimension_props(record.dimension)
 
     async def entity_set_properties(
         self,
@@ -5769,8 +6779,9 @@ class ComBackend(AutoCADBackend):
                     attrs = ref.GetAttributes()
                     for attr in attrs:
                         tag = attr.TagString
-                        if tag in values:
-                            attr.TextString = values[tag]
+                        # `values` is keyed upper-case: tags are not case-sensitive.
+                        if tag.upper() in values:
+                            attr.TextString = values[tag.upper()]
                 except Exception as exc:
                     log.debug("Block insert: GetAttributes or attribute setting failed: %s", exc)
             return _entity_info(ref)
@@ -6177,8 +7188,9 @@ class ComBackend(AutoCADBackend):
             updated = []
             for attr in attrs:
                 tag = attr.TagString
-                if tag in values:
-                    attr.TextString = values[tag]
+                # `values` is keyed upper-case: tags are not case-sensitive.
+                if tag.upper() in values:
+                    attr.TextString = values[tag.upper()]
                     updated.append(tag)
             return {"ok": True, "updated_tags": updated}
 
@@ -6331,17 +7343,19 @@ class ComBackend(AutoCADBackend):
             solid_vertices,
             validate_attdef_specs,
             validate_base_point,
+            validate_block_name,
             validate_entity_specs,
         )
 
         # The anonymous-name rule comes first: ``*`` is also a forbidden DXF
         # symbol character, so ``sanitize_symbol_name`` would refuse ``*U9``
         # with the generic message before this one could name the real reason.
-        if (name or "").strip().startswith("*"):
+        validate_block_name(name)
+        if name.strip().startswith("*"):
             raise ValueError("block_define: anonymous block names (*...) are refused")
         clean_name = sanitize_symbol_name(name, kind="block")
         ents = validate_entity_specs(entities)
-        atts = validate_attdef_specs(attdefs or [])
+        atts = validate_attdef_specs(attdefs)
         base_xy = validate_base_point(base_x, base_y)
         wanted_layers = referenced_layers(ents)
         # acAlignmentLeft / Center / Right / MiddleCenter
@@ -6351,6 +7365,9 @@ class ComBackend(AutoCADBackend):
             obj.Layer = layer
             obj.color = 0  # acByBlock
             obj.Linetype = "ByBlock"
+            # acLnWtByBlock; measured accepted on AcDbLine and an
+            # AcDbAttributeDefinition on AutoCAD 2026 (reads back -2).
+            obj.Lineweight = -2
 
         def _sync():
             doc = _acad_doc()
@@ -6784,11 +7801,28 @@ class ComBackend(AutoCADBackend):
         )
 
     async def view_screenshot(self, overlay_handles: bool = False) -> bytes | None:
+        """The AutoCAD window - of the bound document, or refused (B11).
+
+        A screenshot is evidence about this session's document, so it is
+        guarded like any read: checked before the capture, and checked again
+        after it, because the pixels come from whatever drawing the window
+        shows and an operator's tab click during the capture would hand back
+        another drawing's image. With nothing bound and nothing open the empty
+        application window is captured as before.
+        """
+
         def _sync():
+            app = _acad_app()
+            guarded = self._bound is not None or int(app.Documents.Count) > 0
+            if guarded:
+                self._guard(app)  # bound with nothing open is refused typed, too
             hwnd = _find_autocad_hwnd()
             if hwnd is None:
                 return None
-            return _capture_window(hwnd)
+            image = _capture_window(hwnd)
+            if guarded:
+                self._guard(app)
+            return image
 
         return await self._run(_sync)
 
@@ -6852,11 +7886,17 @@ class ComBackend(AutoCADBackend):
             return {"ok": True, "message": "Transaction committed"}
 
         # R16: clear the flag even if _run raises, so a failed commit can't leave
-        # _transaction_active permanently stale.
+        # _transaction_active permanently stale. B11: except for a refusal -
+        # nothing reached AutoCAD and the mark is still open in the bound document.
         try:
-            return await self._run(_sync)
-        finally:
+            result = await self._run(_sync)
+        except ActiveDocumentChangedError:
+            raise
+        except BaseException:
             self._transaction_active = False
+            raise
+        self._transaction_active = False
+        return result
 
     async def transaction_rollback(self) -> dict:
         # Without a transaction there is no Mark to go back to, and `_UNDO _B`
@@ -6876,10 +7916,22 @@ class ComBackend(AutoCADBackend):
             self._safe_send_command(doc, "_.UNDO _B")
             return {"ok": True, "message": "Transaction rolled back"}
 
+        # B11: `_UNDO _B` goes to the bound document or nowhere - a switch is
+        # refused before anything is sent and the flag stays set, so the
+        # rollback can be retried once the bound document is active again.
         try:
-            return await self._run(_sync)
-        finally:
+            result = await self._run(_sync)
+        except ActiveDocumentChangedError:
+            raise
+        except BaseException:
             self._transaction_active = False
+            raise
+        self._transaction_active = False
+        return result
+
+    def transaction_depth(self) -> int | None:
+        # A nested transaction_begin is refused here, so the depth is 0 or 1.
+        return int(bool(self._transaction_active))
 
     # ── system ──────────────────────────────────────────────────────────────
 
@@ -6891,7 +7943,9 @@ class ComBackend(AutoCADBackend):
                 app = _acad_app()
                 version = app.Version
                 doc_count = app.Documents.Count
-                active_doc = app.ActiveDocument.Name if doc_count > 0 else None
+                active = app.ActiveDocument if doc_count > 0 else None
+                active_key = None if active is None else (str(active.Name), str(active.FullName))
+                bound = self._bound
                 return {
                     "backend": "com",
                     "connected": True,
@@ -6901,7 +7955,18 @@ class ComBackend(AutoCADBackend):
                     "cad_progid": config.settings.cad_progid,
                     "autocad_version": version,
                     "open_documents": doc_count,
-                    "active_document": active_doc,
+                    "active_document": None if active_key is None else active_key[0],
+                    # B11: the document this session writes into, and whether
+                    # the operator has switched away from it (the next guarded
+                    # call would be refused with active_document_changed).
+                    "bound_document": None
+                    if bound is None
+                    else {"name": bound["name"], "path": bound["full_name"] or None},
+                    "active_document_changed": bound is not None
+                    and (
+                        active_key != (bound["name"], bound["full_name"])
+                        or bound["app"] != _app_identity(app)
+                    ),
                     "transaction_active": tx_active,
                     # Accurate capability list: the backend authors 2D entities
                     # (lines/arcs/circles/polylines/text/hatch/dims/blocks). It
@@ -6925,7 +7990,15 @@ class ComBackend(AutoCADBackend):
                     "error": str(exc),
                 }
 
-        return await self._run(_sync)
+        status = await self._run(_sync)
+        identity = self.document_identity()
+        status["document_id"] = identity["document_id"]
+        status["revision"] = identity["revision"]
+        status["operator_edits"] = self.operator_edits_status()
+        status["call_outcomes"] = [dict(row) for row in self.call_outcomes][
+            -self._STATUS_CALL_OUTCOMES :
+        ]
+        return status
 
     async def system_get_variable(self, name) -> Any:
         # GetVariable / SetVariable are members of AcadDocument, not of
@@ -7497,6 +8570,12 @@ class ComBackend(AutoCADBackend):
 
     # ── premium meta-tools live on AutoCADBackend (base.py) and are shared by
     # both backends. Only the XLINE primitive is backend-specific. ────────────
+    async def _delete_layer_entities(self, layer: str) -> dict:
+        def _sync():
+            return _delete_on_layer_all_layouts(_acad_doc(), layer)
+
+        return await self._run(_sync)
+
     async def _create_xline(self, x, y, dx, dy, layer) -> EntityInfo:
         def _sync():
             mspace = _msp()
@@ -7588,3 +8667,118 @@ class ComBackend(AutoCADBackend):
             }
 
         return await self._run(_sync)
+
+
+#: The ComBackend methods that change a document's content (B11): the headless
+#: engine's dirty-setting methods that exist here, the undo / redo the headless
+#: engine implements as snapshot restores, the live-only 3D solids and the two
+#: escape hatches. tests/test_bound_document_com.py derives the same set from
+#: the headless source and holds this one to it.
+_MUTATING_METHODS: frozenset[str] = frozenset(
+    {
+        "_create_xline",
+        "_delete_layer_entities",
+        "block_create_from_entities",
+        "block_define",
+        "block_explode",
+        "block_insert",
+        "block_set_attributes",
+        "dimension_aligned",
+        "dimension_angular",
+        "dimension_diameter",
+        "dimension_linear",
+        "dimension_radius",
+        "dimstyle_create",
+        "dimstyle_modify",
+        "dimstyle_set_current",
+        "drawing_audit",
+        "drawing_properties_set",
+        "drawing_purge",
+        "drawing_redo",
+        "drawing_undo",
+        "entity_array_polar",
+        "entity_array_rectangular",
+        "entity_chamfer",
+        "entity_copy",
+        "entity_create_arc",
+        "entity_create_block_ref",
+        "entity_create_circle",
+        "entity_create_ellipse",
+        "entity_create_hatch",
+        "entity_create_line",
+        "entity_create_mtext",
+        "entity_create_point",
+        "entity_create_polyline",
+        "entity_create_spline",
+        "entity_create_table",
+        "entity_create_text",
+        "entity_delete",
+        "entity_edit_geometry",
+        "entity_edit_text",
+        "entity_extend",
+        "entity_fillet",
+        "entity_mirror",
+        "entity_move",
+        "entity_offset",
+        "entity_rotate",
+        "entity_scale",
+        "entity_set_properties",
+        "entity_set_xdata",
+        "entity_trim",
+        "hatch_add_boundary",
+        "hatch_edit",
+        "hatch_set_gradient",
+        "image_attach",
+        "layer_create",
+        "layer_delete",
+        "layer_freeze",
+        "layer_hide",
+        "layer_lock",
+        "layer_modify",
+        "layer_set_current",
+        "layer_show",
+        "layer_state_delete",
+        "layer_state_restore",
+        "layer_state_save",
+        "layer_thaw",
+        "layer_unlock",
+        "layout_copy",
+        "layout_create",
+        "layout_delete",
+        "layout_rename",
+        "layout_set_current",
+        "leader_create_mleader",
+        "linetype_load",
+        "mleaderstyle_create",
+        "page_setup_apply",
+        "solid_boolean",
+        "solid_box",
+        "solid_cylinder",
+        "solid_extrude",
+        "solid_revolve",
+        "system_run_command",
+        "system_run_lisp",
+        "system_set_variable",
+        "text_find_replace",
+        "text_set_background",
+        "textstyle_create",
+        "textstyle_set_current",
+        "transaction_rollback",
+        "ucs_restore",
+        "ucs_set",
+        "view_named_restore",
+        "view_named_save",
+        "viewport_create",
+        "viewport_delete",
+        "viewport_lock",
+        "viewport_set_scale",
+        "xref_attach",
+        "xref_manage",
+    }
+)
+
+for _name in sorted(_MUTATING_METHODS):
+    # ``__dict__``, not getattr: a name the class does not define itself fails
+    # loudly at import instead of wrapping an inherited contract default.
+    setattr(ComBackend, _name, _mutating(ComBackend.__dict__[_name]))
+del _name

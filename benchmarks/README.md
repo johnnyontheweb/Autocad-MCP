@@ -12,7 +12,8 @@ This repository publishes two deliberately separate forms of evidence:
    dated data lives in [`source_review.json`](source_review.json), and the README
    graphic is generated—not hand-edited—from that file.
 2. **Fixed-task runtime benchmark.** Adapters execute the same task matrix and
-   return `pass`, `partial`, `unsupported`, `fail`, `timeout`, or `not_run`.
+   return `pass`, `partial`, `unsupported`, `fail`, `timeout`, `not_run` or
+   `environment_blocked`.
    AutoCAD MCP Pro currently has the reference adapter; other projects do not
    receive runtime scores until an adapter actually runs their public interface.
 
@@ -30,7 +31,7 @@ dates, evidence grades, project URLs, and the boundary are stored with the data.
 
 The runner separates runtime evidence from the source-review rubric. Every
 adapter receives the same tasks and produces the same closed result enum:
-`pass`, `partial`, `unsupported`, `fail`, `timeout`, or `not_run`. A timeout is
+`pass`, `partial`, `unsupported`, `fail`, `timeout`, `not_run` or `environment_blocked`. A timeout is
 reported per task, and a capability refusal is recorded `unsupported` rather
 than `fail` — "cannot reach this" and "got this wrong" are different findings.
 Execution is in-process, so adapters that delegate blocking work must provide
@@ -38,16 +39,18 @@ cancellation-safe task implementations or be wrapped by an external process
 supervisor. Reports include commit SHA, Python/platform details, backend
 capability claims, durations, coverage, and hashes for returned artifacts.
 Unsupported tasks remain in the fixed-matrix denominator with score zero,
-preventing partial implementations from receiving an inflated score.
+preventing partial implementations from receiving an inflated score. `not_run`
+and `environment_blocked` say the task was never attempted and stay out of
+every denominator (matrix v8 below).
 
 ```bash
-python -m benchmarks.run_competitors --list --matrix v7
-python -m benchmarks.run_competitors --server autocad-mcp-pro --backend ezdxf --matrix v7 --json
+python -m benchmarks.run_competitors --list --matrix v8
+python -m benchmarks.run_competitors --server autocad-mcp-pro --backend ezdxf --matrix v8 --timeout 180 --json
 python -m benchmarks.run_competitors --task table_mleader --task hatch_islands --json
 ```
 
-The release-machine ezdxf self-check is **21/21 (100.0)** on the v7 matrix
-(`--matrix v6` … `--matrix v2` reproduce the earlier sets); the published
+The release-machine ezdxf self-check is **31/31 (100.0)** on the v8 matrix
+(`--matrix v7` … `--matrix v2` reproduce the earlier sets); the published
 report is [`results/published/autocad-mcp-pro.json`](results/published/autocad-mcp-pro.json).
 Repository stars and raw tool counts do not contribute to the score. Adapter
 registration lives in `competitors.yaml`.
@@ -139,6 +142,29 @@ The competitor reports carry no result for it.
 
 The competitor reports carry no result for them.
 
+### Matrix v8 (v1.7.0) — measured acceptance, safe execution, the rivals' ground
+
+`tasks_v8.py` keeps the v7 twenty-one unchanged and adds ten. Each runs once in `tests/test_benchmark_v8.py` and once on a broken input, where its gate must fail and say what failed:
+
+| Task | Category | Verified against | Broken input that must fail it |
+|---|---|---|---|
+| `requirements_roundtrip` | verify | a 120 × 80 plate drawn from its part model in mm: four requirements bound by feature tag (Ø20 bore, 90 pitch, bore 51.478 = √(45² + 25²) from c1, exactly four Ø8) pass on the document; the saved file's bore is moved 3 mm inside the outline (counts and extents unchanged — what 1.6's parity compared) and **exactly R3** fails (54.120 = √(48² + 25²)), re-bound from the document and opened alone by a fresh engine | `verify_artifact` replaced by a read of the in-memory document |
+| `cancel_safety` | reliability | a call cancelled while its worker holds the drawing; the next call runs after the worker (trace A, then B) | an `_async` that releases the drawing on cancel |
+| `qa_large_drawing` | reliability | 10,000 lines with CONSTRUCTION lines at position 5,001, after 10,000 and on Layout1, and a duplicate pair drawn backwards: all found by handle, no `scan_incomplete`, no `check_failed` | `MAX_QA_ENTITIES = 5000` |
+| `export_safety` | reliability | a P&ID whose authored line number is `=1+1` (read back off the drawing) and block attributes / an ACADMCP_MECH payload carrying `@SUM(A1:A9)`, `+cmd\|…`, `-2+3`: no CSV cell a spreadsheet would evaluate, only string cells in XLSX, the `-12.5` mass numeric | a `csv_text` without the `'` |
+| `stale_preview` | preview | a `cad_batch` dry run, the line recoloured directly in the document, the apply refused `stale_revision` naming that handle, the line unmoved; a fresh preview applies | a fingerprint that cannot see the edit |
+| `revision_guarded_edit` | preview | beiming183's ground: two guarded edits move the revision forward; a third on the first revision is refused with expected / actual revisions and changes nothing | a revision that never moves |
+| `pid_file_roundtrip` | pid | puran-water's ground: `EXAMPLE_SPEC` drawn, saved, reopened by a fresh engine: same tags, edges, line numbers, instrument index, equipment list, nothing dangling | a save that drops a process line |
+| `foreign_edit_verified` | verify | a raw-ezdxf plate (no record of ours) measured by geometric selectors: only H3 (drawn Ø9) fails; repaired by a `cad_batch` under its fingerprint precondition; the saved file passes all six and a diff shows one changed entity | an `entity_edit_geometry` that does nothing |
+| `damaged_dxf_refusal` | reliability | a truncated DXF and a non-DXF refused with the fault named, the open document kept (same id, revision, entities). 1.7.0 refuses; `recover` is B09, 1.7.1 | an open that silently returns an empty drawing |
+| `dimension_binding` | verify | best-cad's claim: four DIMENSIONs bound to the features at their defpoints; rows measured on geometry (42, 40, 21, Ø40 all pass), the "42" override over 40 and the DIMLFAC 2 over 21 are `dimension_mismatch` findings that block acceptance | a displayed value that believes the geometry |
+
+The v8 tasks stage their inputs inside the headless engine; on the live engine they report `not_run` (the live evidence is the COM harness, `scripts/live`).
+
+**No zero for a task nobody asked.** A rival lane reports a task it has no playbook for as `not_run` (a v2 task keeps the v1.4 verdict, `unsupported`), and a lane whose environment is absent — no cached checkout or venv at the pinned commit with `--no-fetch`, a clone or install that cannot run — as `environment_blocked`. Neither enters the score: `summary.score` is over attempted tasks and is `null` when nothing was attempted. `competitors.yaml` lists best-cad-mcp with `"adapter": null` (COM-only), so its lane is `not_run`. The v8 rival records live in [`results/published/lanes-v8/`](results/published/lanes-v8/); the v1.4 rival reports are not touched.
+
+**Run manifest.** Every report carries `manifest`: the server's commit and whether tracked files were modified (`dirty`), the sha256 of the files that generate the fixtures (`FIXTURE_SOURCES`), `EVALUATOR_VERSION` and the installed versions of ezdxf, fastmcp, mcp, numpy, openpyxl, matplotlib and pywin32.
+
 ## Live competitor lane (v1.4)
 
 Two competitor adapters now execute the exact same task matrix, black-box over
@@ -146,12 +172,12 @@ MCP stdio, against commits pinned in `competitors.yaml`:
 
 | Server | Matrix | Pinned | Score | Pass | Coverage |
 |---|---|---|---:|---:|---:|
-| autocad-mcp-pro (reference) | v7 (21) | 1.6.0 tree | 100.0 | 21/21 | 100% |
+| autocad-mcp-pro (reference) | v8 (31) | 1.7.0 tree | 100.0 | 31/31 | 100% |
 | beiming183-cloud/AutoCAD-MCP | v2 (10) | `11f7c47e` | 50.0 | 5/10 | 50% |
 | puran-water/autocad-mcp | v2 (10) | `95476a33` | 45.0 | 4/10 | 50% |
 
 The competitor rows are the v1.4 runs, unchanged. Read the matrix column
-before the score column: the denominators differ because the eleven tasks
+before the score column: the denominators differ because the twenty-one tasks
 added since v2 came after those runs and have not been put to them.
 
 Method and boundaries:
@@ -204,6 +230,36 @@ claims are made.
 ```bash
 python -m benchmarks.perf_suite --out benchmarks/results/published/perf-ezdxf.json
 python -m benchmarks.render_perf_chart
+```
+
+### v1.6.0 against v1.7.0 (the spec §8.3 gate)
+
+1.7.0 must not be slower than 1.6.0. `perf_compare.py` builds a v1.6.0 worktree
+and measures both trees in alternating rounds (base, head, head, base, ...)
+with one interpreter, each tree importing its own packages and running this
+checkout's workloads: `perf_suite`'s four plus `server_create_lines_2k`, 2,000
+`entity_create_line` calls through an in-memory FastMCP client, so the
+middleware is measured too. `--aa` measures the base a second time in every
+round; the spread of those base / base ratios is the noise floor, and the
+bound is `1 + max(0.05, 2 × spread)`. Medians of 20 rounds after 5 warm-ups,
+from [`results/published/perf-v1.6.0-vs-v1.7.0.json`](results/published/perf-v1.6.0-vs-v1.7.0.json):
+
+| Workload | v1.6.0 | v1.7.0 | ratio |
+|---|---:|---:|---:|
+| 2,000 lines, one call each | 492.1 ms | 454.9 ms | 0.95 |
+| 10,000 lines: build, DXF export, reopen | 5,139.3 ms | 4,986.8 ms | 0.91 |
+| Region query over 10,000 entities | 1,377.6 ms | 1,012.8 ms | 1.02 |
+| Premium quality pass | 182.7 ms | 108.0 ms | 0.62 |
+| 2,000 `entity_create_line` calls through the MCP server | 14,414.4 ms | 13,412.6 ms | 0.96 |
+
+Measured on an idle machine: the A/A spread was 5.5 %, so the bound was
+1.11, and the region query's 1.02 is inside that noise. The ratio is the
+median of each round's paired head / base ratio, not the ratio of the two
+medians, which is why that row's medians point the other way. 1.7.0 does not win back
+v1.4.0's creation throughput; that is B10, 1.7.1.
+
+```bash
+python -m benchmarks.perf_compare --base v1.6.0 --aa --out out/perf/compare.json
 ```
 
 ### v1.4.0 against v1.6.0, and what the call-timeout guard costs
@@ -293,17 +349,52 @@ Reproduce:
 python benchmarks/compare_versions.py            # current tree vs origin/main
 python benchmarks/compare_versions.py v1.0.0     # vs a tag/ref
 python benchmarks/compare_versions.py --json results.json
+python benchmarks/compare_versions.py v1.6.0 --fail-on-regression   # exit 1 on any regression
 ```
 
-### Result — v1.6.0 vs v1.5.1 (release gate)
+### Result — v1.7.0 vs v1.6.0 (release gate)
 
-48 checks, ezdxf backend, one subprocess per check. Machine-readable report:
+61 checks, ezdxf backend, one subprocess per check. Machine-readable report:
+[`results/published/ab-v1.6.0-vs-v1.7.0.json`](results/published/ab-v1.6.0-vs-v1.7.0.json).
+
+| Version | Checks passing | Pass rate | Fixed | Regressed |
+|---------|----------------|-----------|-------|-----------|
+| **v1.6.0** (baseline)     | 48 / 61 | 78.7 % | — | — |
+| **v1.7.0** (this release) | 61 / 61 | 100 % | 13 | **0** |
+
+Thirteen are fixed. Four are `fail → pass`: v1.6.0 has every method they call and gets the
+answer wrong. They are the three reproducers of the 1.7.0 W1 review focus and
+the shared spec validation. `cancel_never_overlaps` cancels a call whose worker
+is blocked and starts a second one: on v1.6.0 the second ran while the first
+worker was still inside the drawing; now it waits for that worker (B01).
+`qa_scan_finds_entity_5001` puts a construction line at position 5,001: the
+1.6.0 critique read the first 5,000 entities and reported nothing (B02).
+`export_text_never_formula` writes a parts list whose designations are `=1+1`,
+`@x` and a tab-led text beside a `-12.5` mass: 1.6.0 wrote the text verbatim
+to CSV and as formula cells to XLSX; now CSV carries a leading `'` on text
+only and XLSX holds string cells and a numeric mass (B03).
+`spec_refuses_non_finite` hands a vessel a NaN width and an infinite height
+and `pid_from_spec`'s dry run a NaN scale: 1.6.0 accepted the first, died in
+a `RuntimeError` on the second and approved the third; each is now refused by
+its path (B07). The other nine are `miss → pass`: the roadmap's acceptance
+scenarios T05, T09-T13, T18, T25 and T36 (`verify_t*`), which call the
+verification engine 1.7.0 added - a stale preview refused with nothing moved,
+a Ø39.8 bore failing under its "Ø40" label, a moved hole failing against the
+model that still says it did not move, an inner hole moved inside a saved
+file, two equal holes left ambiguous, five and seven holes failing "exactly
+six", an override and a DIMLFAC made blocking findings, a renumbering save
+re-bound by geometry, and a delivery made stale by an edit after it. The 48
+checks v1.6.0 was released on all still pass.
+
+### Result — v1.6.0 vs v1.5.1
+
+48 checks at the time, ezdxf backend, one subprocess per check. Machine-readable report:
 [`results/published/ab-v1.5.1-vs-v1.6.0.json`](results/published/ab-v1.5.1-vs-v1.6.0.json).
 
 | Version | Checks passing | Pass rate | Fixed | Regressed |
 |---------|----------------|-----------|-------|-----------|
 | **v1.5.1** (baseline)     | 26 / 48 | 54.2 % | — | — |
-| **v1.6.0** (this release) | 48 / 48 | 100 % | 22 | **0** |
+| **v1.6.0** (that release) | 48 / 48 | 100 % | 22 | **0** |
 
 The twenty-two are all `miss → pass` — v1.5.1 has none of the methods. Five are track H: `scale_check_detects_schematic` (the synthetic P&ID is schematic against its layout; a uniform 2× copy is to scale with factor 2), `pipe_takeoff_rmst_exact` (eight routable runs, each exactly the rectilinear MST of its tags), `cable_takeoff_roundup` (9 / 17 / 19 / 10 m, the unstated power left empty), `diff_detects_known_edits` (five known edits and nothing else) and `topology_known_defects` (one near miss, one crossing, a clean T). Four are track F: `arch_junction_l_t_x` (L, T and X junction outlines against hand-computed corners and wall areas), `arch_room_area_net` (a 4 × 5 m room between 200 mm walls is labelled 20.00 m², not its 21.84 m² axis area), `arch_opening_cuts_wall` (both faces interrupted across a door, two jambs) and `arch_rooms_detect_foreign` (plain lines on a WALLS layer read as 20 and 15 m² at confidence 0.6, nothing written). Seven
 are tracks B and G: `mech_part_roundtrip` (a part read back from its own

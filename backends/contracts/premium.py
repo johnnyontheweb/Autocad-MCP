@@ -11,8 +11,6 @@ import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from backends.quarantine import DocumentQuarantineError
-
 if TYPE_CHECKING:
     from backends.base import EntityInfo
     from engineering.plan_spec import (
@@ -24,6 +22,26 @@ if TYPE_CHECKING:
         SheetSize,
         SnapType,
     )
+
+
+#: Slack on a segment's parameter: an intersection computed at a drawn end
+#: lands within it.
+_ON_SEGMENT_TOL = 1e-9
+
+
+def _on_entity(kind: str, props: dict, point) -> bool:
+    """Does ``point`` - already on the infinite line, or on the circle - lie on
+    the drawn entity? A LINE checks the parameter along its segment."""
+    if kind != "LINE":
+        return True
+    x1, y1 = float(props["start"][0]), float(props["start"][1])
+    x2, y2 = float(props["end"][0]), float(props["end"][1])
+    dx, dy = x2 - x1, y2 - y1
+    length2 = dx * dx + dy * dy
+    if length2 == 0.0:
+        return math.dist((x1, y1), point) <= _ON_SEGMENT_TOL
+    t = ((point[0] - x1) * dx + (point[1] - y1) * dy) / length2
+    return -_ON_SEGMENT_TOL <= t <= 1.0 + _ON_SEGMENT_TOL
 
 
 class PremiumContract(ABC):
@@ -94,12 +112,21 @@ class PremiumContract(ABC):
         notes: list[str] | None = None,
         requirements: dict | None = None,
         spec_hash: str | None = None,
+        persist_requirements: bool = False,
     ) -> PlanSpec:
         """Commit a drawing intent before any geometry is created.
         Returns a PlanSpec and stores it on the backend; read it back with
         `get_plan_spec()`. (N8: the previous claim that `drawing_critique`
         replays this plan was untrue — critique runs geometric checks, not a
-        plan diff.)"""
+        plan diff.)
+
+        v1.7.0 (B15 residue): typed ``requirements["items"]`` are parsed (a
+        malformed item raises with its path) and the plan carries their
+        digest. ``persist_requirements=True`` also writes the set - typed
+        items and any legacy ``dimensions`` - into the drawing as the
+        ACADMCP_REQUIREMENTS record, so a reopened file carries it; with
+        neither it is refused ("nothing to read"). When parsing or storing
+        fails, nothing is stored and no plan is committed."""
         from engineering.plan_spec import PlanSpec
 
         await self._ensure_document_state()
@@ -142,6 +169,18 @@ class PremiumContract(ABC):
             dim_style = normalized_plan["dim_style"]
             requirements = normalized_plan["requirements"]
 
+        typed = None
+        if persist_requirements or "items" in (requirements or {}):
+            from engineering.verification.requirements import parse_requirements
+
+            typed = parse_requirements(dict(requirements or {}))
+        persisted = False
+        if persist_requirements:
+            from engineering.verification.requirements import store_requirements
+
+            await store_requirements(self, typed)
+            persisted = True
+
         plan = PlanSpec(
             intent=str(intent),
             sheet_size=sheet_size,
@@ -153,6 +192,8 @@ class PremiumContract(ABC):
             requirements=dict(requirements or {}),
             spec_hash=spec_hash,
             preflight_status=preflight_status,
+            requirement_digest=None if typed is None else typed.digest(),
+            requirements_persisted=persisted,
         )
         self._plan_spec = plan
         return plan
@@ -160,14 +201,20 @@ class PremiumContract(ABC):
     async def drawing_critique(
         self,
         focus: list[CritiqueFocus] | None = None,
+        *,
+        shared: dict | None = None,
     ) -> list[Issue]:
         """Run premium-quality geometric checks; return zero issues before
         `drawing_finalize`. `focus=None` runs all checks. (N8: this does NOT
-        replay the committed PlanSpec — it inspects the live drawing geometry.)"""
+        replay the committed PlanSpec — it inspects the live drawing geometry.)
+
+        `shared` is the run context `run_critique` reads its all-spaces
+        snapshot and domain indexes from; pass the dict the validator used so
+        a finalize reads the drawing once."""
         from engineering.critique import run_critique
 
         await self._ensure_document_state()
-        return await run_critique(self, focus)
+        return await run_critique(self, focus, shared=shared)
 
     def get_plan_spec(self) -> dict | None:
         """Return the PlanSpec committed by `drawing_plan` as a dict, or None
@@ -379,10 +426,30 @@ class PremiumContract(ABC):
         Supports LINE-LINE, LINE-CIRCLE, and CIRCLE-CIRCLE cases. When
         multiple intersections exist (e.g. two circles), ``ref_x``/``ref_y``
         selects the candidate nearest to that reference point. If omitted the
-        first candidate is returned.
+        first candidate is returned. ``point_intersection_detail`` also says
+        whether the point lies on both drawn entities.
 
         Raises RuntimeError when no real intersection exists or entity types
         are unsupported.
+        """
+        found = await self.point_intersection_detail(handle1, handle2, ref_x, ref_y)
+        return (found["x"], found["y"])
+
+    async def point_intersection_detail(
+        self,
+        handle1: str,
+        handle2: str,
+        ref_x: float | None = None,
+        ref_y: float | None = None,
+    ) -> dict:
+        """The intersection point and whether it lies on both drawn entities (v1.7.0, B18).
+
+        A LINE is intersected as the infinite line through it, so the point may
+        lie beyond a segment's ends: ``on_first`` / ``on_second`` say whether it
+        lies on each drawn segment (its parameter along the segment within
+        [0, 1], to 1e-9); a CIRCLE always holds its own intersection points.
+        Returns ``{"x", "y", "on_first", "on_second", "on_both", "candidates"}``.
+        Refusals are ``point_intersection``'s.
         """
         info1 = await self.entity_get(handle1)
         info2 = await self.entity_get(handle2)
@@ -450,14 +517,25 @@ class PremiumContract(ABC):
                 "Supported: LINE-LINE, LINE-CIRCLE, CIRCLE-CIRCLE."
             )
 
-        if len(candidates) == 1:
-            return candidates[0]
-        if ref_x is not None and ref_y is not None:
-            return min(
+        # a tangent touch solves to the same point twice: one intersection
+        candidates = list(dict.fromkeys(candidates))
+        if len(candidates) > 1 and ref_x is not None and ref_y is not None:
+            chosen = min(
                 candidates,
                 key=lambda p: (p[0] - float(ref_x)) ** 2 + (p[1] - float(ref_y)) ** 2,
             )
-        return candidates[0]
+        else:
+            chosen = candidates[0]
+        on_first = _on_entity(t1, props1, chosen)
+        on_second = _on_entity(t2, props2, chosen)
+        return {
+            "x": float(chosen[0]),
+            "y": float(chosen[1]),
+            "on_first": on_first,
+            "on_second": on_second,
+            "on_both": on_first and on_second,
+            "candidates": len(candidates),
+        }
 
     async def point_tangent(
         self,
@@ -583,26 +661,38 @@ class PremiumContract(ABC):
         self,
         layer: str | None = None,
     ) -> dict:
-        """Delete every entity on the active layer set's construction layer.
-        Must be called before `drawing_finalize`."""
+        """Delete every entity on the active layer set's construction layer, in
+        model space and every paper layout, however many there are. Must be
+        called before `drawing_finalize`.
+
+        It read `entity_list(limit=5000)` of the current space, while
+        `construction_left` reads every space: a construction line on a paper
+        layout, or the 5,001st one, was flagged with "call construction_clear()"
+        and survived the call (W1 review). `deleted_handles` names what went;
+        `failed` names an entity that could not be deleted (a locked layer on
+        the live engine) with the reason, rather than skipping it silently.
+        A quarantine refusal propagates: "deleted: 0" would read as "nothing
+        to clear" on a document the backend has declared untrusted.
+        """
         layer = layer or self._role_layer("construction")
-        try:
-            ents = await self.entity_list(layer_filter=layer, limit=5000)
-        except DocumentQuarantineError:
-            # "deleted: 0" here would read as "there was nothing to clear" on a
-            # document the backend has declared untrusted -- and this is step 9
-            # of the standard workflow, immediately before finalize.
-            raise
-        except Exception:
-            ents = []
-        deleted = 0
-        for ent in ents:
-            try:
-                await self.entity_delete(ent.handle)
-                deleted += 1
-            except Exception:
-                continue
-        return {"ok": True, "layer": layer, "deleted": deleted}
+        result = await self._delete_layer_entities(layer)
+        return {
+            "ok": True,
+            "layer": layer,
+            "deleted": len(result["deleted"]),
+            "deleted_handles": list(result["deleted"]),
+            "failed": list(result["failed"]),
+        }
+
+    @abstractmethod
+    async def _delete_layer_entities(self, layer: str) -> dict:
+        """Delete every entity on `layer` (case-insensitive, as layer names
+        are) in model space and every paper layout, in one locked call.
+
+        Returns ``{"deleted": [handle, ...], "failed": [{"handle", "error"}]}``.
+        Backend-specific: headless walks every ezdxf layout; live walks each
+        ``Layout.Block`` (members measured on AutoCAD 2026)."""
+        ...
 
     async def drawing_apply_iso_layers(
         self,

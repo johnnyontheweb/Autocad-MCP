@@ -23,6 +23,9 @@ readers join later. SECTION 26's four readers (`drawing_understand`,
 `drawing_scale_check`, `drawing_diff`, `drawing_topology_check`) stay in
 `core`: understanding, comparing and checking a drawing is not a vertical.
 Lean gains `drawing_understand` and reaches 65.
+
+v1.7.0 adds `drawing_verify_requirements` to SECTION 26 (core) and to lean,
+which reaches 66 (56 with TOOL_PACKS=core).
 """
 
 from __future__ import annotations
@@ -34,8 +37,6 @@ import pytest_asyncio
 
 import config
 import server
-
-pytestmark = pytest.mark.asyncio
 
 PID_TOOLS = {
     "pid_symbol_list",
@@ -147,6 +148,7 @@ UNDERSTAND_TOOLS = {
     "drawing_scale_check",
     "drawing_diff",
     "drawing_topology_check",
+    "drawing_verify_requirements",
 }
 
 PLANT_TOOLS = {
@@ -154,7 +156,7 @@ PLANT_TOOLS = {
     "cable_takeoff",
 }
 
-LEAN_UNDERSTAND_ESSENTIALS = {"drawing_understand"}
+LEAN_UNDERSTAND_ESSENTIALS = {"drawing_understand", "drawing_verify_requirements"}
 
 LEAN_ARCH_ESSENTIALS = {
     "arch_wall",
@@ -218,6 +220,7 @@ def test_pack_registry_names_real_tools_and_only_them():
     )
 
 
+@pytest.mark.asyncio
 async def test_every_pack_member_is_a_registered_tool():
     registered = {tool.name for tool in await server._registered_tools()}
     for pack, names in server.PACK_TOOL_NAMES.items():
@@ -225,6 +228,7 @@ async def test_every_pack_member_is_a_registered_tool():
         assert not missing, f"pack {pack!r} names unregistered tools: {sorted(missing)}"
 
 
+@pytest.mark.asyncio
 async def test_core_only_hides_pid_and_settings_but_keeps_styles_and_page_setup(monkeypatch):
     monkeypatch.setattr(config.settings, "tool_packs", "core")
     info = await server._apply_tool_profile("full")
@@ -242,6 +246,7 @@ async def test_core_only_hides_pid_and_settings_but_keeps_styles_and_page_setup(
     assert info["tool_packs"] == {"enabled": ["core"], "available": ALL_PACKS, "ignored": []}
 
 
+@pytest.mark.asyncio
 async def test_settings_pack_alone_keeps_pid_hidden(monkeypatch):
     monkeypatch.setattr(config.settings, "tool_packs", "settings")
     info = await server._apply_tool_profile("full")
@@ -251,6 +256,7 @@ async def test_settings_pack_alone_keeps_pid_hidden(monkeypatch):
     assert info["tool_packs"]["enabled"] == ["core", "settings"]
 
 
+@pytest.mark.asyncio
 async def test_the_plant_pack_alone_adds_the_takeoffs_to_core(monkeypatch):
     monkeypatch.setattr(config.settings, "tool_packs", "plant")
     info = await server._apply_tool_profile("full")
@@ -261,6 +267,7 @@ async def test_the_plant_pack_alone_adds_the_takeoffs_to_core(monkeypatch):
     assert info["tool_packs"]["enabled"] == ["core", "plant"]
 
 
+@pytest.mark.asyncio
 async def test_all_is_the_default_and_enables_every_pack(monkeypatch):
     monkeypatch.setattr(config.settings, "tool_packs", "all")
     info = await server._apply_tool_profile("full")
@@ -269,6 +276,7 @@ async def test_all_is_the_default_and_enables_every_pack(monkeypatch):
     assert info["tool_packs"]["enabled"] == ALL_PACKS_ENABLED
 
 
+@pytest.mark.asyncio
 async def test_unknown_pack_is_ignored_with_a_warning_and_core_cannot_be_dropped(
     monkeypatch, caplog
 ):
@@ -283,6 +291,7 @@ async def test_unknown_pack_is_ignored_with_a_warning_and_core_cannot_be_dropped
     assert "mech3000" in caplog.text
 
 
+@pytest.mark.asyncio
 async def test_lean_intersects_with_packs(monkeypatch):
     assert {"pid_symbol_insert", "pid_line_draw", "pid_graph"} <= server.LEAN_TOOL_NAMES
     monkeypatch.setattr(config.settings, "tool_packs", "core")
@@ -291,11 +300,13 @@ async def test_lean_intersects_with_packs(monkeypatch):
     assert "entity_create_line" not in info["disabled_tools"]
 
 
+@pytest.mark.asyncio
 async def test_lean_carries_the_five_settings_essentials_and_nothing_from_the_settings_pack(
     monkeypatch,
 ):
-    """Spec §8.2: lean = 65 (55 + the five mechanical/sheet essentials + track
-    F's four architectural ones + track H's `drawing_understand`). The five
+    """Spec §8.2: lean = 66 (55 + the five mechanical/sheet essentials + track
+    F's four architectural ones + track H's `drawing_understand` + 1.7.0's
+    `drawing_verify_requirements`). The five
     settings essentials and `drawing_understand` are core-pack tools, so
     `TOOL_PACKS=core` leaves them on a lean surface; no environment tool and no
     takeoff is lean."""
@@ -306,18 +317,19 @@ async def test_lean_carries_the_five_settings_essentials_and_nothing_from_the_se
     assert server.LEAN_TOOL_NAMES & UNDERSTAND_TOOLS == LEAN_UNDERSTAND_ESSENTIALS
     assert not (PLANT_TOOLS & server.LEAN_TOOL_NAMES)
     assert not (SETTINGS_TOOLS & server.LEAN_TOOL_NAMES)
-    assert len(server.LEAN_TOOL_NAMES) == 65
+    assert len(server.LEAN_TOOL_NAMES) == 66
     monkeypatch.setattr(config.settings, "tool_packs", "core")
     info = await server._apply_tool_profile("lean")
     disabled = set(info["disabled_tools"])
     assert not (LEAN_SETTINGS_ESSENTIALS & disabled)
     assert not ({"sheet_frame", "titleblock_apply"} & disabled), "sheet tools are core"
     assert "drawing_understand" not in disabled, "the one-call report is core"
-    assert info["enabled_count"] == 65 - 10, (
+    assert info["enabled_count"] == 66 - 10, (
         "lean minus the three pid, three mech and four arch tools"
     )
 
 
+@pytest.mark.asyncio
 async def test_the_three_track_e_sections_file_under_their_own_groups():
     """Pack, group and SECTION are the same list, so `system_about` and
     `docs/tool-inventory.json` describe the surface the packs gate."""
@@ -333,9 +345,71 @@ async def test_the_three_track_e_sections_file_under_their_own_groups():
     assert len(groups) == 28
 
 
+@pytest.mark.asyncio
 async def test_system_about_reports_packs():
     from fastmcp import Client
 
     async with Client(server.mcp) as client:
         about = (await client.call_tool("system_about", {})).structured_content
     assert about["tool_packs"]["available"] == ALL_PACKS
+
+
+# ── backlog W4-T18-02 / -03 / -04 / -05 (1.7.0 triage, Task 8) ──────────────
+
+#: The tag every member of a pack carries on its @mcp.tool; the registry, not a
+#: hand-copied set, is what a pack is checked against.
+PACK_TAG = {
+    "pid": "pid",
+    "settings": "environment",
+    "mech": "mech",
+    "arch": "arch",
+    "plant": "plant",
+}
+
+
+@pytest.mark.asyncio
+async def test_every_pack_equals_the_registered_tools_carrying_its_tag():
+    """W4-T18-05 — RED: the pack sets were compared with hand-copied sets, and
+    the registry check ran one direction only: a new tool tagged `pid` but left
+    out of PACK_TOOL_NAMES stayed advertised under TOOL_PACKS=core."""
+    tools = await server._registered_tools()
+    assert set(PACK_TAG) == set(server.PACK_TOOL_NAMES)
+    for pack, tag in PACK_TAG.items():
+        tagged = {tool.name for tool in tools if tag in (tool.tags or set())}
+        assert tagged == server.PACK_TOOL_NAMES[pack], pack
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_entry_beside_all_is_reported(monkeypatch, caplog):
+    """W4-T18-03 — RED: TOOL_PACKS=all,mech3000 dropped the typo silently."""
+    monkeypatch.setattr(config.settings, "tool_packs", "all,mech3000")
+    with caplog.at_level(logging.WARNING, logger="autocad_mcp"):
+        info = await server._apply_tool_profile("full")
+    assert info["tool_packs"]["enabled"] == ALL_PACKS_ENABLED
+    assert info["tool_packs"]["ignored"] == ["mech3000"]
+    assert "mech3000" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_one_apply_warns_once_per_unknown_entry(monkeypatch, caplog):
+    """W4-T18-04 — RED: one apply resolved TOOL_PACKS twice, so 'core,foo,foo'
+    logged four warnings and reported ignored ['foo', 'foo']."""
+    monkeypatch.setattr(config.settings, "tool_packs", "core,foo,foo")
+    with caplog.at_level(logging.WARNING, logger="autocad_mcp"):
+        info = await server._apply_tool_profile("full")
+    assert info["tool_packs"]["ignored"] == ["foo"]
+    warnings = [r for r in caplog.records if "Unknown TOOL_PACKS" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_the_lean_count_in_the_comments_is_the_lean_set():
+    """W4-T18-02 — RED: config.py, .env.example and server.py still said ~47 /
+    47 lean tools while LEAN_TOOL_NAMES holds 65."""
+    import re
+    from pathlib import Path
+
+    root = Path(server.__file__).parent
+    for name in ("config.py", ".env.example", "server.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        counts = [int(n) for n in re.findall(r"(\d+)-tool drafting/inspection", text)]
+        assert counts == [len(server.LEAN_TOOL_NAMES)], (name, counts)

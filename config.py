@@ -72,6 +72,19 @@ class Settings:
         # names the file's size and this variable.
         self.max_dxf_bytes: int = int(os.environ.get("MAX_DXF_BYTES", str(DEFAULT_MAX_DXF_BYTES)))
 
+        # Ceiling on one QA read (drawing_critique, the validator, drawing_finalize,
+        # drawing_deliver): the entities of every space are counted first and a
+        # drawing holding more is refused with `scan_incomplete` rather than
+        # read in part. 0 disables the check; a negative value is refused here
+        # (it used to disable the check silently, because the ceiling is only
+        # applied when positive).
+        self.max_qa_entities: int = int(os.environ.get("MAX_QA_ENTITIES", "2000000"))
+        if self.max_qa_entities < 0:
+            raise ValueError(
+                f"MAX_QA_ENTITIES={self.max_qa_entities} is negative. Set the most entities "
+                "one QA read may scan (default 2000000), or 0 to disable the check."
+            )
+
         # Hard cap on list/select limit params to keep tool responses bounded.
         self.max_list_limit: int = int(os.environ.get("MAX_LIST_LIMIT", "5000"))
 
@@ -87,6 +100,14 @@ class Settings:
         # slow. Set to 0 to disable the check.
         self.ezdxf_call_timeout: float = float(os.environ.get("EZDXF_CALL_TIMEOUT", "120"))
 
+        # How long disconnect() (server shutdown) waits for a worker thread that
+        # is still inside a call, in seconds. Nothing can stop a worker thread:
+        # with EZDXF_CALL_TIMEOUT=0 a cancelled call keeps the document lock
+        # until its worker ends and nothing is ever quarantined, and at shutdown
+        # a worker still running after this grace is logged and left behind on a
+        # daemon thread, so the process still exits. 0 = do not wait.
+        self.shutdown_grace: float = max(0.0, float(os.environ.get("SHUTDOWN_GRACE", "5")))
+
         # How many undo steps the headless backend keeps. 0 = off, which is the
         # default because it is not free: ezdxf has no journal, so a step is a
         # full DXF snapshot. Measured — 10 entities 3.1 ms / 19 KB, 1000
@@ -95,6 +116,16 @@ class Settings:
         # is a real trade the user should make deliberately rather than inherit.
         self.ezdxf_undo_depth: int = max(0, int(os.environ.get("EZDXF_UNDO_DEPTH", "0")))
 
+        # Spec budgets (B07): a count above one of these is refused by path,
+        # naming the variable, before anything is drawn; 0 disables a budget.
+        # MAX_SPEC_ITEMS bounds each list of a pid_from_spec / arch_plan_from_spec
+        # document (measured 2026-10-24: 200 P&ID items place in 451 ms headless,
+        # so 2,000 is about 4.5 s there and far longer on a live seat).
+        # MAX_VESSEL_TRAYS bounds a column's trays (10,000 trays build in 3.2 ms;
+        # the budget bounds the block definition, not the time).
+        self.max_spec_items: int = int(os.environ.get("MAX_SPEC_ITEMS", "2000"))
+        self.max_vessel_trays: int = int(os.environ.get("MAX_VESSEL_TRAYS", "500"))
+
         # HTTP transport: refuse non-loopback bind unless explicitly opted in.
         self.allow_remote_http: bool = (
             os.environ.get("ALLOW_REMOTE_HTTP", "false").lower().strip() == "true"
@@ -102,7 +133,7 @@ class Settings:
         self.mcp_auth_token: str = os.environ.get("MCP_AUTH_TOKEN", "").strip()
 
         # Exposed tool profile: "full" (default, everything) or "lean" (a
-        # curated ~47-tool drafting/inspection core for clients with tight tool
+        # curated 66-tool drafting/inspection core for clients with tight tool
         # caps). Invalid values fall back to "full" with a warning at startup;
         # so does the "core" profile removed in v1.5.0 (see
         # server.REMOVED_TOOL_PROFILES).

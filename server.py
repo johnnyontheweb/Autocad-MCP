@@ -11,14 +11,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import math
+import re
 import sys
 import time
 from dataclasses import asdict
 from typing import Annotated, Any
 
+import anyio
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import StaticTokenVerifier
@@ -32,6 +35,12 @@ from pydantic import Field
 
 import config
 from backends.base import BlockInfo, EntityInfo, LayerInfo
+from backends.operations import (
+    CURRENT_OPERATION,
+    OperationConflictError,
+    OperationJournal,
+    RequiresReconcileError,
+)
 from discovery.aliases import aliases_for
 from engineering.fits import fit_lookup
 from engineering.measure import is_self_intersecting, polygon_area_perimeter
@@ -135,15 +144,44 @@ async def autocad_lifespan(server):
         await _apply_tool_profile()
     except Exception as exc:  # profile trouble must never block startup
         log.warning("Tool profile could not be applied: %s", exc)
+    backend = None
+    # B12: the operation journal lives as long as the server: in memory, so a
+    # restart forgets every operation id (B13 makes it durable in 1.8.0).
+    operations = OperationJournal()
     try:
         backend = await _make_backend()
         log.info("Backend ready: %s", backend.name)
-        yield {"backend": backend}
+        context: dict = {"backend": backend, "operations": operations}
     except Exception as exc:
         log.error("Backend initialization failed: %s", exc)
-        yield {"backend": None, "init_error": str(exc)}
+        context = {"backend": None, "init_error": str(exc), "operations": operations}
+    # One yield, outside the try that builds the backend: an exception thrown
+    # into the generator at shutdown must reach `finally`, not a second yield.
+    try:
+        yield context
     finally:
         log.info("AutoCAD MCP Pro shutting down")
+        if backend is not None:
+            await _disconnect_backend(backend)
+
+
+async def _disconnect_backend(backend) -> None:
+    """Release the backend at shutdown, shielded and bounded (B01).
+
+    ``disconnect()`` waits up to ``SHUTDOWN_GRACE`` for a worker still inside
+    a call, then logs it; a few seconds more are allowed for the release
+    itself, and past that the server exits without it. Shielded, because the
+    host cancels the server's scope on the way out; a failure is logged, never
+    raised over the shutdown.
+    """
+    budget = config.settings.shutdown_grace + 5.0
+    with anyio.move_on_after(budget, shield=True) as scope:
+        try:
+            await backend.disconnect()
+        except Exception as exc:
+            log.warning("Backend disconnect failed: %s", exc)
+    if scope.cancelled_caught:
+        log.warning("Backend disconnect did not finish within %.1fs; exiting without it", budget)
 
 
 # ---------------------------------------------------------------------------
@@ -152,11 +190,76 @@ async def autocad_lifespan(server):
 
 
 class AuditMiddleware(Middleware):
-    """Log all tool calls with timing for audit trail."""
+    """Log every tool call with timing, and keep its operation record (B12).
+
+    The record (``backends/operations.py``) is opened before the call and
+    closed with an honest state after it: the result, a refusal, an exception,
+    or a cancellation - ``unknown_commit`` when a mutating call's worker was
+    already running (the backend's ``call_outcomes`` rows carry the id). A
+    client's own id (``_meta.operation_id``, or ``cad_batch``'s
+    ``operation_id``) replays a recorded result, is refused with
+    ``requires_reconcile`` after an ``unknown_commit`` and with
+    ``operation_conflict`` for another request. A call re-entering the
+    middleware (the search proxy's ``call_tool``) reuses the id already set:
+    one request, one record.
+    """
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         tool_name = context.message.name
         start = time.monotonic()
+        if CURRENT_OPERATION.get() is not None:
+            return await self._logged(context, call_next, tool_name, start)
+        lifespan = _lifespan_context_or_none(context)
+        journal = _operations_journal(lifespan)
+        backend = lifespan.get("backend") if lifespan is not None else None
+        # getattr: a hand-built context (tests/test_cancel_rollbacks.py) has no arguments.
+        arguments = dict(getattr(context.message, "arguments", None) or {})
+        effective = _effective_tool(tool_name, arguments)
+        try:
+            supplied = _client_operation_id(tool_name, arguments, _request_meta(context))
+            record, replay = journal.begin(
+                tool_name, arguments, operation_id=supplied, document=_identity_of(backend)
+            )
+        except (OperationConflictError, RequiresReconcileError) as exc:
+            elapsed = (time.monotonic() - start) * 1000
+            log.warning("TOOL ERR %-40s %6.1fms  (%s)", tool_name, elapsed, exc.kind)
+            payload = {**exc.to_dict(), "tool": tool_name}
+            return ToolResult(content=str(exc), structured_content=payload, is_error=True)
+        except ValueError as exc:
+            elapsed = (time.monotonic() - start) * 1000
+            log.warning("TOOL ERR %-40s %6.1fms  (invalid operation id)", tool_name, elapsed)
+            payload = {"ok": False, "kind": "invalid_args", "error": str(exc), "tool": tool_name}
+            return ToolResult(content=str(exc), structured_content=payload, is_error=True)
+        if replay is not None:
+            log.info("TOOL REPLAY %-37s %s", tool_name, record.operation_id)
+            return _replayed_result(replay, record.operation_id)
+        token = CURRENT_OPERATION.set(record.operation_id)
+        try:
+            result = await self._logged(context, call_next, tool_name, start)
+        except asyncio.CancelledError:
+            journal.finish(
+                record,
+                _interrupted_state(backend, record.operation_id, effective),
+                error_kind="cancelled",
+                document=_identity_of(backend),
+            )
+            raise
+        except Exception as exc:
+            state, kind = _exception_outcome(backend, record.operation_id, effective, exc)
+            journal.finish(
+                record, state, result=exc, error_kind=kind, document=_identity_of(backend)
+            )
+            raise
+        finally:
+            CURRENT_OPERATION.reset(token)
+        state, kind = _result_outcome(effective, result)
+        journal.finish(
+            record, state, result=result, error_kind=kind, document=_identity_of(backend)
+        )
+        return result
+
+    @staticmethod
+    async def _logged(context: MiddlewareContext, call_next, tool_name: str, start: float):
         try:
             result = await call_next(context)
             elapsed = (time.monotonic() - start) * 1000
@@ -168,10 +271,178 @@ class AuditMiddleware(Middleware):
             else:
                 log.info("TOOL OK  %-40s %6.1fms", tool_name, elapsed)
             return result
+        except asyncio.CancelledError:
+            # B01: a cancellation is a BaseException, so the handler below never
+            # saw one and a cancelled call left no line in the audit log at all.
+            elapsed = (time.monotonic() - start) * 1000
+            log.warning("TOOL CANCELLED %-34s %6.1fms", tool_name, elapsed)
+            raise
         except Exception as exc:
             elapsed = (time.monotonic() - start) * 1000
             log.warning("TOOL ERR %-40s %6.1fms  %s", tool_name, elapsed, exc)
             raise
+
+
+#: Where an operation is recorded when no lifespan journal is reachable (a
+#: direct call in a test or a script), so recording never fails a call.
+_FALLBACK_OPERATIONS = OperationJournal()
+
+#: ``call_outcomes`` outcomes meaning the worker ran on past the caller (a
+#: cancellation or a deadline): a write may have landed.
+_RAN_PAST_THE_CALLER = frozenset(
+    {"cancelled_running", "completed_after_cancel", "failed_after_cancel", "abandoned_deadline"}
+)
+
+#: The record state for an error kind. Every kind not listed declined before
+#: doing its work, so it is ``refused``.
+_STATE_OF_KIND = {
+    "failed": "failed",
+    "timed_out": "failed",
+    "quarantined": "quarantined",
+    "unknown_commit": "unknown_commit",
+    "cancelled": "cancelled",
+}
+
+
+def _lifespan_context_or_none(context) -> dict | None:
+    try:
+        lifespan = context.fastmcp_context.lifespan_context
+    except Exception:  # no request context: a direct call
+        return None
+    return lifespan if isinstance(lifespan, dict) else None
+
+
+def _operations_journal(lifespan) -> OperationJournal:
+    journal = lifespan.get("operations") if isinstance(lifespan, dict) else None
+    return journal if isinstance(journal, OperationJournal) else _FALLBACK_OPERATIONS
+
+
+def _request_meta(context):
+    """The request's ``_meta`` (a client's ``operation_id`` travels there), or None."""
+    try:
+        return context.fastmcp_context.request_context.meta
+    except Exception:  # no request context: a direct call
+        return None
+
+
+def _effective_tool(tool: str, arguments: dict) -> str:
+    """The tool a call really runs: the search proxy's ``call_tool`` names it."""
+    if tool == "call_tool" and isinstance(arguments.get("name"), str):
+        return arguments["name"]
+    return tool
+
+
+def _client_operation_id(tool: str, arguments: dict, meta) -> str | None:
+    """A client's own id: ``_meta.operation_id``, or ``cad_batch``'s ``operation_id``."""
+    from_meta = getattr(meta, "operation_id", None) if meta is not None else None
+    from_args = None
+    if tool == "cad_batch":
+        from_args = arguments.get("operation_id")
+    elif tool == "call_tool" and arguments.get("name") == "cad_batch":
+        inner = arguments.get("arguments")
+        from_args = inner.get("operation_id") if isinstance(inner, dict) else None
+    if from_meta is not None and from_args is not None and from_meta != from_args:
+        raise ValueError(
+            f"operation_id: _meta.operation_id {from_meta!r} and cad_batch's operation_id "
+            f"{from_args!r} disagree; send one id"
+        )
+    return from_meta if from_meta is not None else from_args
+
+
+def _identity_of(backend) -> dict | None:
+    reader = getattr(backend, "document_identity", None)
+    if reader is None:
+        return None
+    try:
+        return reader()
+    except Exception:  # an identity is evidence, never a reason to fail a call
+        return None
+
+
+def _worker_outcome(backend, operation_id: str) -> str | None:
+    """The latest ``call_outcomes`` outcome recorded under ``operation_id``, or None."""
+    found = None
+    for row in list(getattr(backend, "call_outcomes", None) or ()):
+        if isinstance(row, dict) and row.get("operation_id") == operation_id:
+            found = row.get("outcome")
+    return found
+
+
+def _read_only_tool(tool: str) -> bool:
+    return tool in _batch_read_only_tools()
+
+
+def _timeout_kind(backend, operation_id: str, tool: str) -> str | None:
+    """``unknown_commit`` / ``timed_out`` when a worker outran its deadline, else None."""
+    worker = _worker_outcome(backend, operation_id)
+    if worker == "abandoned_deadline":
+        return "timed_out" if _read_only_tool(tool) else "unknown_commit"
+    if worker == "readonly_overrun":
+        return "timed_out"
+    return None
+
+
+def _interrupted_state(backend, operation_id: str, tool: str) -> str:
+    """A cancelled call: ``unknown_commit`` when a write's worker ran on, else ``cancelled``."""
+    ran_on = _worker_outcome(backend, operation_id) in _RAN_PAST_THE_CALLER
+    if ran_on and not _read_only_tool(tool):
+        return "unknown_commit"
+    return "cancelled"
+
+
+def _exception_outcome(
+    backend, operation_id: str, tool: str, exc: BaseException
+) -> tuple[str, str]:
+    timed = _timeout_kind(backend, operation_id, tool)
+    if timed == "unknown_commit":
+        return "unknown_commit", "timed_out"
+    if timed == "timed_out":
+        return "failed", "timed_out"
+    kind = _classify_batch_error(exc)["kind"]
+    return _STATE_OF_KIND.get(kind, "refused"), kind
+
+
+def _result_outcome(tool: str, result) -> tuple[str, str | None]:
+    structured = getattr(result, "structured_content", None)
+    payload = structured if isinstance(structured, dict) else {}
+    if getattr(result, "is_error", False):
+        kind = str(payload.get("kind") or "refused")
+        return ("quarantined" if kind == "quarantined" else "refused"), kind
+    if tool == "cad_batch" and payload.get("dry_run") is False:
+        if payload.get("ok") is True:
+            return "committed", None
+        first = next(
+            (
+                row["error"]["kind"]
+                for row in payload.get("results", [])
+                if row.get("status") == "error"
+            ),
+            "failed",
+        )
+        if (payload.get("atomicity") or {}).get("rolled_back") or not payload.get("succeeded"):
+            return "failed", first
+        return "partial", first
+    if payload.get("ok") is False and not _read_only_tool(tool):
+        return "refused", "refused"
+    return "committed", None
+
+
+def _replayed_result(stored, operation_id: str):
+    """The recorded answer of ``operation_id``, marked ``replayed`` - nothing runs again."""
+    if isinstance(stored, BaseException):
+        raise ToolError(
+            f"operation {operation_id!r} already ran and failed: {_refusal_message(stored)} "
+            "(replayed, not run again; send a new operation_id to try again)"
+        ) from stored
+    structured = getattr(stored, "structured_content", None)
+    if not isinstance(structured, dict):
+        return stored
+    payload = {**structured, "replayed": True, "operation_id": operation_id}
+    return ToolResult(
+        content=json.dumps(payload, ensure_ascii=False, default=str),
+        structured_content=payload,
+        is_error=bool(getattr(stored, "is_error", False)),
+    )
 
 
 def _backend_name_or_none(context) -> str | None:
@@ -203,15 +474,36 @@ class CapabilityRefusalMiddleware(Middleware):
     boundary — the engine can draw a circle perfectly well, the document it would
     draw into is untrusted — so it gets ``kind: "quarantined"`` and carries the
     abandoned-call record instead of a capability key.
+
+    v1.7.0 (B11) added a third kind: ``active_document_changed``, the live
+    engine's refusal when AutoCAD's active document is not the bound one. It
+    carries ``bound`` and ``active`` instead of a capability or a quarantine.
     """
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         try:
             return await call_next(context)
         except Exception as exc:
+            # B12: a refusal names the operation it ended.
+            operation_id = CURRENT_OPERATION.get()
+            changed = _document_changed_of(exc)
+            if changed is not None:
+                # B11: not a capability boundary and not a quarantine - the
+                # operator switched AutoCAD's active document; nothing was written.
+                payload = {
+                    **changed,
+                    "tool": context.message.name,
+                    "backend": _backend_name_or_none(context),
+                }
+                if operation_id is not None:
+                    payload["operation_id"] = operation_id
+                return ToolResult(
+                    content=payload["error"], structured_content=payload, is_error=True
+                )
             capability = _batch_capability_of(exc)
             quarantine = None if capability else _batch_quarantine_of(exc)
-            if capability is None and quarantine is None:
+            stale = None if (capability or quarantine is not None) else _batch_stale_of(exc)
+            if capability is None and quarantine is None and stale is None:
                 raise  # not ours — leave it byte-for-byte as it was
             message = _refusal_message(exc)
             payload = {
@@ -220,9 +512,20 @@ class CapabilityRefusalMiddleware(Middleware):
                 "tool": context.message.name,
                 "backend": _backend_name_or_none(context),
             }
+            if operation_id is not None:
+                payload["operation_id"] = operation_id
             if capability is not None:
                 payload["kind"] = "unsupported"
                 payload["capability"] = capability
+            elif stale is not None:
+                # Task 12: the preview no longer holds; nothing was changed.
+                payload["kind"] = "stale_revision"
+                for key in ("expected_revision", "actual_revision", "changed"):
+                    payload[key] = stale[key]
+            elif _batch_refusal_kind(exc) == "busy":
+                # A detached read holds the document: not untrusted, busy.
+                payload["kind"] = "busy"
+                payload["detached_read"] = quarantine
             else:
                 payload["kind"] = "quarantined"
                 payload["quarantine"] = quarantine
@@ -314,10 +617,11 @@ mcp.add_middleware(CapabilityRefusalMiddleware())
 # Tool discovery mode (DISCOVERY_MODE)
 # ---------------------------------------------------------------------------
 # "off"    the whole catalog is advertised (default, backwards compatible)
-# "search" list_tools returns a search tool + a call_tool proxy instead, and
-#          the catalog is reached through discovery/transform.py — which
-#          indexes each tool's AutoCAD command aliases as well as its
-#          description, so BPOLY/QSELECT/MATCHPROP resolve at all.
+# "search" list_tools returns a search tool + a call_tool proxy + describe_tool
+#          (one tool's full schema) instead, and the catalog is reached through
+#          discovery/transform.py — which indexes each tool's AutoCAD command
+#          aliases as well as its description, so BPOLY/QSELECT/MATCHPROP
+#          resolve at all.
 #
 # Tool *counts* are unaffected: system_status / system_about / _tool_groups /
 # _apply_tool_profile all read the untransformed registry (_registered_tools).
@@ -325,6 +629,18 @@ mcp.add_middleware(CapabilityRefusalMiddleware())
 DISCOVERY_MODES = ("off", "search")
 
 _discovery_transform = None
+
+
+def _tool_pack(name: str) -> str:
+    """The TOOL_PACKS pack a tool belongs to: its claiming pack, else ``core``.
+
+    Handed to the search transform so ``describe_tool`` can report it;
+    ``PACK_TOOL_NAMES`` is defined further down and read at call time.
+    """
+    for pack, names in PACK_TOOL_NAMES.items():
+        if name in names:
+            return pack
+    return "core"
 
 
 def _apply_discovery_mode(mode: str | None = None) -> str:
@@ -353,9 +669,12 @@ def _apply_discovery_mode(mode: str | None = None) -> str:
         # modules are kept out of import time.
         from discovery.transform import CadSearchTransform
 
-        _discovery_transform = CadSearchTransform()
+        _discovery_transform = CadSearchTransform(pack_of=_tool_pack)
         mcp.add_transform(_discovery_transform)
-        log.info("Tool discovery: search transform attached (clients see search_tools/call_tool)")
+        log.info(
+            "Tool discovery: search transform attached "
+            "(clients see search_tools/call_tool/describe_tool)"
+        )
     return selected
 
 
@@ -628,7 +947,7 @@ async def _registered_tools() -> list:
       * *server-level* — ``mcp.add_transform(...)``, which is what
         ``_apply_discovery_mode("search")`` installs — is applied by the public
         ``mcp.list_tools()``, i.e. at the wire, where a client sees
-        ``search_tools``/``call_tool`` in place of the catalog.
+        ``search_tools``/``call_tool``/``describe_tool`` in place of the catalog.
         ``mcp._list_tools()`` sits upstream of that chain and still lists the
         full inventory, so search mode as shipped does not move these counts.
       * *provider-level* — ``provider.add_transform(...)`` — is applied inside
@@ -861,7 +1180,7 @@ def cad_tool(*, summary: str, cost: str):
 # Some MCP clients degrade (or hard-cap) when a server exposes 100+ tools.
 # TOOL_PROFILE selects how much of the surface is advertised:
 #   full — everything (default, backwards compatible)
-#   lean — a curated 47-tool drafting/inspection core
+#   lean — a curated 66-tool drafting/inspection core (LEAN_TOOL_NAMES)
 # Disabled tools stay registered (system_about still reports the full
 # inventory) but are hidden from MCP list_tools and rejected if called.
 
@@ -983,6 +1302,11 @@ LEAN_TOOL_NAMES = frozenset(
         # tool, so TOOL_PACKS=core keeps it; with the four architectural ones
         # above, lean is 65. The takeoffs are `plant`-pack, full-profile work.
         "drawing_understand",
+        # Verification (1.7.0, B22) - the one call that says whether the
+        # drawing meets its requirements, measured on the geometry. A
+        # core-pack tool, so TOOL_PACKS=core keeps it; lean is 66 (56 with
+        # TOOL_PACKS=core).
+        "drawing_verify_requirements",
     }
 )
 
@@ -1103,25 +1427,34 @@ def _enabled_packs() -> tuple[set[str], list[str]]:
     """
     raw = (config.settings.tool_packs or "all").lower()
     requested = [p.strip() for p in raw.split(",") if p.strip()]
-    if not requested or "all" in requested:
-        return set(TOOL_PACK_NAMES), []
     enabled = {"core"}
     ignored: list[str] = []
-    for pack in requested:
-        if pack in TOOL_PACK_NAMES:
+    for pack in dict.fromkeys(requested):  # each entry once, in the order given
+        if pack == "all":
+            enabled.update(TOOL_PACK_NAMES)
+        elif pack in TOOL_PACK_NAMES:
             enabled.add(pack)
         else:
+            # Reported beside "all" too: `all,mech3000` used to drop the typo
+            # without a word (backlog W4-T18-03).
             ignored.append(pack)
             log.warning(
                 "Unknown TOOL_PACKS entry %r ignored. Valid packs: %s.",
                 pack,
                 ", ".join(TOOL_PACK_NAMES),
             )
+    if not requested:
+        enabled.update(TOOL_PACK_NAMES)
     return enabled, ignored
 
 
-def _profile_enabled_names(profile: str, registered: set[str]) -> set[str]:
-    packs, _ignored = _enabled_packs()
+def _profile_enabled_names(
+    profile: str, registered: set[str], packs: set[str] | None = None
+) -> set[str]:
+    """The tool names a profile advertises. ``packs`` is the caller's already
+    resolved TOOL_PACKS, so one apply resolves (and warns) once."""
+    if packs is None:
+        packs, _ignored = _enabled_packs()
     hidden_by_pack: set[str] = set().union(
         *(names for pack, names in PACK_TOOL_NAMES.items() if pack not in packs)
     )
@@ -1161,7 +1494,9 @@ async def _apply_tool_profile(profile: str | None = None) -> dict:
             )
         selected = "full"
     registered = {tool.name for tool in await _registered_tools() if getattr(tool, "name", None)}
-    enabled = _profile_enabled_names(selected, registered)
+    # Resolved once per apply: twice warned twice per unknown entry (W4-T18-04).
+    packs, ignored = _enabled_packs()
+    enabled = _profile_enabled_names(selected, registered, packs)
     disabled = sorted(registered - enabled)
     # Replace the previous profile's visibility, never stack on it. fastmcp 3's
     # enable()/disable() append a Visibility transform per call and a tool lookup
@@ -1187,7 +1522,6 @@ async def _apply_tool_profile(profile: str | None = None) -> dict:
         "disabled_count": len(disabled),
         "disabled_tools": disabled,
     }
-    packs, ignored = _enabled_packs()
     _active_tool_profile["tool_packs"] = {
         "enabled": sorted(packs),
         "available": list(TOOL_PACK_NAMES),
@@ -1220,7 +1554,12 @@ async def drawing_info(ctx: Context) -> dict:
     """Get comprehensive metadata for the current drawing.
 
     Returns: name, path, entity_count, layer_count, block_count,
-    extents (min/max), units, version, backend name.
+    extents (min/max), units, version, backend name, and the document's
+    `document_id` (a uuid4 hex minted when it was opened or created) and
+    `revision` (its content revision: moved by every content change, never by
+    a save, an export, a finalize or a delivery). On the live engine a call
+    made after the operator switched AutoCAD's active document is refused with
+    `kind: "active_document_changed"` (`bound`, `active`).
     """
     await ctx.info("Fetching drawing info")
     result = await _backend(ctx).drawing_info()
@@ -1408,7 +1747,14 @@ async def drawing_export_dxf(
     path: Annotated[str, "Output .dxf file path"],
     ctx: Context = None,
 ) -> dict:
-    """Export the current drawing as a DXF file."""
+    """Export the current drawing as a DXF copy.
+
+    The open document is never re-pointed: it keeps its name, path and saved flag
+    (drawing_save_as is the call that re-points). Live: `Document.Export`, renamed to
+    the name given; headless: a copy written by ezdxf. The result names the method
+    and the DXF version written. Refused: a name that is not .dxf (a .dwg headlessly
+    with capability `dwg`).
+    """
     validated = validate_path(path, allow_write=True)
     await ctx.info(f"Exporting DXF: {validated}")
     return await _backend(ctx).drawing_export_dxf(str(validated))
@@ -2589,6 +2935,64 @@ async def text_set_background(
     return await _backend(ctx).text_set_background(handle, enabled, color or None, scale)
 
 
+async def _guarded_text_find_replace(
+    backend, find, replace, layer, match_case, expected_revision, preconditions
+) -> dict:
+    """``text_find_replace`` applied only if its preview still holds (Task 12).
+
+    The preconditions are checked, then the search runs again as a dry run: a
+    match the preview did not list (a text added since) refuses the apply as
+    surely as an edited one, because a precondition vouches only for the
+    entities it names. Search and apply are two locked calls; a change another
+    call makes before either refuses too, before anything is written.
+    """
+    from engineering.changes.preview import (
+        RevisionWatch,
+        StaleRevisionError,
+        check_preconditions,
+        parse_preconditions,
+    )
+
+    rows = parse_preconditions(preconditions)
+    await check_preconditions(backend, expected_revision=expected_revision, preconditions=rows)
+    watch = await RevisionWatch.begin(backend)
+
+    async def _settled(label: str) -> None:
+        if await watch.before(f"text_find_replace: {label}"):
+            raise StaleRevisionError(
+                "stale_revision: another call changed the document after the preconditions "
+                "were checked; nothing was changed. Run the dry run again and apply its new "
+                "preview.",
+                expected=expected_revision,
+                actual=watch.last,
+            )
+
+    await _settled("search")
+    probe = await backend.text_find_replace(find, replace, layer, match_case, True)
+    await watch.after()
+    if not probe.get("ok"):
+        return probe
+    if preconditions is not None:
+        listed = {row["handle"] for row in rows if "handle" in row}
+        unlisted = sorted({str(row["handle"]).upper() for row in probe["entities"]} - listed)
+        if unlisted:
+            raise StaleRevisionError(
+                f"stale_revision: {len(unlisted)} entity(ies) now match {find!r} that the "
+                f"preview did not list ({', '.join(unlisted[:5])}); nothing was changed. Run "
+                "the dry run again and apply its new preview.",
+                expected=expected_revision,
+                actual=watch.last,
+                changed=[
+                    {"handle": h, "expected": "not in the preview", "actual": "matches"}
+                    for h in unlisted
+                ],
+            )
+    await _settled("apply")
+    result = await backend.text_find_replace(find, replace, layer, match_case, False)
+    await watch.after()
+    return {**result, "revision": watch.report()}
+
+
 @cad_tool(summary="Find and replace text across the drawing.", cost="mutate")
 @mcp.tool(
     annotations={"title": "Find and Replace Text", "destructiveHint": False},
@@ -2599,21 +3003,71 @@ async def text_find_replace(
     replace: Annotated[str, "Replacement text."],
     layer: Annotated[str, "Restrict to one layer. Empty searches every layer."] = "",
     match_case: Annotated[bool, "Case-sensitive search."] = True,
-    dry_run: Annotated[bool, "Report what would change without changing it."] = False,
+    dry_run: Annotated[
+        bool, "Report what would change, with a `preview` to apply it by; change nothing."
+    ] = False,
+    expected_revision: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "Apply only at this content revision (a dry run's `preview.revision`); "
+                "otherwise refused stale_revision and nothing is replaced."
+            ),
+        ),
+    ] = None,
+    preconditions: Annotated[
+        list[dict] | None,
+        Field(
+            default=None,
+            description=(
+                "A dry run's `preview.preconditions` ({handle, fingerprint} per match): apply "
+                "only if each is unchanged and nothing else now matches; otherwise refused "
+                "stale_revision and nothing is replaced."
+            ),
+        ),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Replace text in TEXT, MTEXT and block attributes (ATTRIB and ATTDEF).
 
+    Both engines search the same places (`searched_scope`): model space, every
+    paper layout, every named block definition - so the next insert does not
+    reintroduce the old text - and the attributes of every block reference in
+    any of them; an xref's block holds another file's text and is not searched.
     `searched_types` is on the response because "no matches" and "that type was
-    never searched" are different answers. Block *definitions* are included, so
-    the next insert does not reintroduce the old text. DIMENSION text is out of
+    never searched" are different answers. DIMENSION text is out of
     scope: its text field holds the `<>` override placeholder rather than the
-    measurement, so editing it would break the association. A multi-line
+    measurement, so editing it would break the association. Anonymous blocks
+    (`*D` - a dimension's rendered measurement - `*T`, `*U`, `*X`) are
+    renderings regenerated from their owner and are not searched either. A multi-line
     attribute is matched and rewritten as the whole value (`Line1\\PLine2`),
     the same value `block_get_attributes` reports and `block_explode` bursts.
+
+    dry_run=True adds `preview`: the document's content revision, the exact
+    fingerprint of every matched entity and the planned rows. Applied with that
+    `revision` (expected_revision) and/or its `preconditions`, the search runs
+    again first: an edited entity, a moved revision or a new match the preview
+    did not list refuses the call with kind stale_revision and nothing is
+    replaced. A guarded apply reports `revision` ({checked, after, interleaved}).
     """
     await ctx.info(f"Replacing {find!r} with {replace!r}{' (dry run)' if dry_run else ''}")
-    return await _backend(ctx).text_find_replace(find, replace, layer or None, match_case, dry_run)
+    backend = _backend(ctx)
+    if dry_run:
+        from engineering.changes.preview import make_preview
+
+        result = await backend.text_find_replace(find, replace, layer or None, match_case, True)
+        if not result.get("ok"):
+            return result
+        rows = list(result.get("entities") or [])
+        preview = await make_preview(backend, handles=[row["handle"] for row in rows], planned=rows)
+        return {**result, "preview": preview.to_dict()}
+    if expected_revision is None and preconditions is None:
+        return await backend.text_find_replace(find, replace, layer or None, match_case, False)
+    return await _guarded_text_find_replace(
+        backend, find, replace, layer or None, match_case, expected_revision, preconditions
+    )
 
 
 @cad_tool(
@@ -2745,7 +3199,22 @@ async def entity_get(
     handle: Annotated[str, "Entity handle"],
     ctx: Context = None,
 ) -> dict:
-    """Get all properties of a specific entity by its handle."""
+    """Get all properties of a specific entity by its handle.
+
+    Coordinates are WCS. A HATCH also reports every boundary loop: `loops`
+    (each with `kind`, `flags`, `depth`, `points` and the parallel `bulges`,
+    `edges` for an edge path, `exact` and its `area`), `hatch_style` and the
+    filled `area` - outer loops minus islands by the hatch's own island style,
+    the rule `analysis_measure_entity` applies; None when a loop has an ellipse
+    or spline edge. A DIMENSION also reports `dimension`: `dimtype`, the five
+    `defpoints`, its own `measurement` (before DIMLFAC), `text_override`,
+    `dimstyle`, `dimlfac` and `angle`. On the live engine those two are read
+    from the drawing's DXF export (one export per call; `detail_source` says
+    so), and a member of a block definition reports `detail_unavailable`. An
+    entity in a plane tilted out of WCS XY reports `plane_normal` (or
+    `tilted`) and omits what xy cannot express. Refused: a handle the drawing
+    does not hold.
+    """
     result = await _backend(ctx).entity_get(handle)
     return _dc(result)
 
@@ -3779,6 +4248,15 @@ BATCH_ERROR_KINDS = (
     "unsupported",  # this backend cannot do it (carries `capability`)
     "refused",  # the tool declined on purpose (path/command validation, ...)
     "failed",  # attempted and broke
+    "quarantined",  # the document is quarantined after an abandoned call (R32)
+    "busy",  # a detached read holds the document (W1 review follow-up)
+    "stale_revision",  # the document moved since its preview (Task 12)
+    "active_document_changed",  # live engine: the operator switched documents (B11)
+    "scan_incomplete",  # a QA or verification read could not read everything (B02)
+    "unknown_commit",  # a write that outran its deadline: it may have landed (B12)
+    "timed_out",  # a read that outran its deadline
+    "cancelled",  # the request was cancelled
+    "operation_conflict",  # an operation id reused for another request (B12)
 )
 
 #: What a rollback is actually worth, per backend transaction implementation.
@@ -3959,6 +4437,52 @@ def _batch_quarantine_of(exc: BaseException) -> dict | None:
     return None
 
 
+def _document_changed_of(exc: BaseException) -> dict | None:
+    """The ``ActiveDocumentChangedError`` payload on ``exc``'s cause chain, or None (B11).
+
+    Recognised by type; the error lives in ``backends.document_guard``, which
+    imports nothing, so this resolves on any box.
+    """
+    from backends.document_guard import ActiveDocumentChangedError
+
+    for error in _batch_cause_chain(exc):
+        if isinstance(error, ActiveDocumentChangedError):
+            return error.to_dict()
+    return None
+
+
+def _batch_refusal_kind(exc: BaseException) -> str:
+    """``"busy"`` for a detached read's ``DocumentBusyError``, else ``"quarantined"``.
+
+    ``DocumentBusyError`` subclasses ``DocumentQuarantineError`` so every QA
+    reader lets it propagate; its ``kind`` keeps a busy document from being
+    reported to the client as an untrusted one.
+    """
+    try:
+        quarantine_type = _quarantine_refusal_type()
+    except Exception:  # pragma: no cover - core module
+        return "quarantined"
+    for error in _batch_cause_chain(exc):
+        if isinstance(error, quarantine_type):
+            return str(getattr(error, "kind", "quarantined"))
+    return "quarantined"
+
+
+def _batch_stale_of(exc: BaseException) -> dict | None:
+    """The ``StaleRevisionError.to_dict()`` refusal ``exc`` carries, or None.
+
+    By type, like the quarantine: a preview whose precondition no longer holds
+    is neither an engine boundary nor a failure to act - the caller re-runs the
+    dry run and applies its new preview (spec section 5, Task 12).
+    """
+    from engineering.changes.preview import StaleRevisionError
+
+    for error in _batch_cause_chain(exc):
+        if isinstance(error, StaleRevisionError):
+            return error.to_dict()
+    return None
+
+
 def _refusal_message(exc: BaseException) -> str:
     """The most specific message on the cause chain, in full.
 
@@ -3998,6 +4522,17 @@ def _classify_batch_error(exc: BaseException) -> dict:
     from fastmcp.exceptions import ValidationError as FastMCPValidationError
     from pydantic import ValidationError as PydanticValidationError
 
+    changed = _document_changed_of(exc)
+    if changed is not None:
+        # B11: its own kind - the step was refused before anything was written,
+        # and every later step is refused the same way until the operator
+        # switches back or document_activate binds the other document.
+        return {
+            "kind": "active_document_changed",
+            "bound": changed["bound"],
+            "active": changed["active"],
+            "message": _batch_message(exc),
+        }
     capability = _batch_capability_of(exc)
     if capability:
         return {
@@ -4010,9 +4545,24 @@ def _classify_batch_error(exc: BaseException) -> dict:
         # R32: its own kind. Filing it under "unsupported" would tell the batch
         # reader the engine lacks a feature; filing it under "failed" would hide
         # that every remaining step will refuse for the same reason.
+        if _batch_refusal_kind(exc) == "busy":
+            return {
+                "kind": "busy",
+                "detached_read": quarantine,
+                "message": _batch_message(exc),
+            }
         return {
             "kind": "quarantined",
             "quarantine": quarantine,
+            "message": _batch_message(exc),
+        }
+    stale = _batch_stale_of(exc)
+    if stale is not None:
+        return {
+            "kind": "stale_revision",
+            "expected_revision": stale["expected_revision"],
+            "actual_revision": stale["actual_revision"],
+            "changed": stale["changed"],
             "message": _batch_message(exc),
         }
     chain = _batch_cause_chain(exc)
@@ -4130,6 +4680,30 @@ def _batch_sentinel_refs(value: Any) -> Any:
     return value
 
 
+#: An argument whose name says it carries entity handles: ``handle``,
+#: ``handles``, ``handle1`` / ``handle2``, ``target_handle``,
+#: ``overlay_handles``, ``circle_handle``, ... (every handle parameter the
+#: registered tools declare).
+_BATCH_HANDLE_ARG = re.compile(r"^(?:[a-z0-9_]+_)?handles?\d*$")
+
+
+def _batch_literal_handles(args: dict) -> list[str]:
+    """The literal entity handles in a step's handle parameters, upper-cased.
+
+    A ``$reference`` is skipped: it resolves only when the step that binds it
+    has run, so a dry run has nothing to fingerprint for it - and an entity a
+    step creates does not exist yet.
+    """
+    found: list[str] = []
+    for key, value in args.items():
+        if not isinstance(key, str) or not _BATCH_HANDLE_ARG.match(key):
+            continue
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, str) and item.strip() and not item.startswith(_BATCH_REF_SIGIL):
+                found.append(item.strip().upper())
+    return found
+
+
 # ── schema validation (dry_run, and the pre-flight of every real run) ───────
 
 
@@ -4237,6 +4811,134 @@ def _batch_transaction_ok(outcome) -> tuple[bool, str | None]:
     if outcome.get("ok", True):
         return True, None
     return False, str(outcome.get("error") or "backend declined")
+
+
+def _record_escaped_batch_rollback(
+    backend, ctx, outcome: str, error: str | None, started: float, cause: str
+) -> None:
+    """Leave a trace of a batch, ended by an exception, whose rollback failed.
+
+    Nothing can be returned from that path - a cancelled request has already
+    been answered by the SDK, any other exception is on its way to the client -
+    so the failure is logged naming the request id (an error when the rollback
+    raised, a warning otherwise) and appended to the backend's
+    ``call_outcomes`` (``system_status`` reports the last few). ``outcome`` is
+    ``rollback_declined`` (the backend answered ``ok: False``),
+    ``rollback_failed`` (it raised) or ``rollback_unverified`` (it answered ok,
+    but the fingerprint or the transaction depth differs from before the
+    batch). ``cause`` is ``"cancelled"`` or the ``Type: message`` of the
+    exception that ended the batch - only a cancellation is called one. Never
+    raises.
+    """
+    try:
+        request_id = ctx.request_id if ctx is not None else None
+    except Exception:  # no request context (a direct call in a test or script)
+        request_id = None
+    ended_by = (
+        f"cancelled request {request_id}"
+        if cause == "cancelled"
+        else f"request {request_id} ended by {cause}"
+    )
+    happened = (
+        "answered ok but was not verified"
+        if outcome == "rollback_unverified"
+        else "was not performed"
+    )
+    # A rollback that raised is an error, as before; one the backend declined
+    # is a warning, as _batch_transaction_ok reports it on the normal path.
+    log.log(
+        logging.ERROR if outcome == "rollback_failed" else logging.WARNING,
+        "cad_batch: the rollback after %s %s (%s: %s); "
+        "the steps that ran may still be in the drawing - check system_status and "
+        "transaction_rollback before retrying",
+        ended_by,
+        happened,
+        outcome,
+        error,
+    )
+    outcomes = getattr(backend, "call_outcomes", None)
+    if outcomes is None:
+        return
+    try:
+        outcomes.append(
+            {
+                "call": "cad_batch",
+                "outcome": outcome,
+                "started": started,
+                "ended": time.time(),
+                "document": None,
+                "request_id": None if request_id is None else str(request_id),
+                "error": error,
+                "cause": cause,
+            }
+        )
+    except Exception as exc:  # a foreign backend's container must not break the cancel
+        log.debug("cad_batch: call_outcomes not recordable: %s", exc)
+
+
+#: Upper bound on the checkpoints a batch's close unwinds above its own: a step
+#: loop that opened more than this is closed only this far, and the payload or
+#: the record says what depth is left.
+_BATCH_MAX_UNWIND = 64
+
+
+def _read_transaction_depth(backend) -> int | None:
+    try:
+        depth = backend.transaction_depth()
+    except Exception as exc:  # a probe must never break the close
+        log.debug("transaction depth unavailable: %s", exc)
+        return None
+    return depth if isinstance(depth, int) else None
+
+
+async def _close_batch_checkpoint(backend, close, base_depth: int | None):
+    """Close the batch's checkpoint, and every checkpoint a step opened above it.
+
+    ``close`` is the backend's ``transaction_rollback`` or
+    ``transaction_commit``. A step that called ``transaction_begin`` pushed a
+    checkpoint above the batch's; one close pops *that* one and answers ok,
+    leaving the batch's open (and, on a rollback, the steps before the inner
+    begin in the drawing). So the close repeats while the depth is above the
+    one read before the batch opened its own. Returns ``(performed, declined,
+    unwound, depth_left)``: ``unwound`` counts the closes beyond the first.
+    """
+    performed, declined = _batch_transaction_ok(await close())
+    unwound = 0
+    depth = _read_transaction_depth(backend)
+    while (
+        performed
+        and base_depth is not None
+        and depth is not None
+        and depth > base_depth
+        and unwound < _BATCH_MAX_UNWIND
+    ):
+        performed, declined = _batch_transaction_ok(await close())
+        unwound += 1
+        depth = _read_transaction_depth(backend)
+    return performed, declined, unwound, depth
+
+
+async def _escaped_rollback_problem(
+    backend, before: dict | None, base_depth: int | None, depth_left: int | None
+) -> str | None:
+    """Why a rollback that answered ok after an escaped exception is not verified.
+
+    The normal path's checks, for a path that has no payload to carry them:
+    the fingerprint taken before step 1 against one read now, then the depth.
+    ``None`` when both hold or cannot be read (the normal path reports that as
+    ``verified: None``, not as a failure).
+    """
+    after = await _batch_fingerprint(backend)
+    if before is not None and after is not None and before != after:
+        return (
+            "the document fingerprint differs from the one taken before step 1: "
+            f"before {before}, after {after}"
+        )
+    if base_depth is not None and depth_left is not None and depth_left > base_depth:
+        return (
+            f"transaction_depth is {depth_left} after the rollback, {base_depth} before the batch"
+        )
+    return None
 
 
 async def _batch_fingerprint(backend) -> dict | None:
@@ -4353,6 +5055,40 @@ async def cad_batch(
         bool,
         "Return each step's full result instead of just its handle.",
     ] = False,
+    expected_revision: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "Run only if the document's content revision is still this one (a dry "
+                "run's `preview.revision`); otherwise refused stale_revision, no step run."
+            ),
+        ),
+    ] = None,
+    preconditions: Annotated[
+        list[dict] | None,
+        Field(
+            default=None,
+            description=(
+                "A dry run's `preview.preconditions` ({handle, fingerprint} per literal "
+                "handle): run only if every entity is exactly as previewed; otherwise "
+                "refused stale_revision, no step run."
+            ),
+        ),
+    ] = None,
+    operation_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Your own id for this batch (1-128 printable characters). Sent again with the "
+                "same steps it returns the recorded result (replayed: true) instead of running "
+                "twice; with other steps it is refused (operation_conflict); after a run whose "
+                "outcome is unknown (cancelled or timed out mid-write) it is refused "
+                "(requires_reconcile). Held in memory only: a server restart forgets it."
+            )
+        ),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Execute an ordered list of tool calls in ONE round trip.
@@ -4379,12 +5115,34 @@ async def cad_batch(
 
     ERRORS are typed, never text: each failed step carries error.kind - one of
     unsupported (with the backend `capability`), invalid_args, refused, failed,
-    unknown_tool, unresolved_ref, denied, malformed_step.
+    unknown_tool, unresolved_ref, denied, malformed_step, quarantined, busy,
+    active_document_changed (live engine: the operator switched documents),
+    stale_revision, scan_incomplete, timed_out, unknown_commit (a write that
+    outran its deadline while its worker ran), cancelled, operation_conflict -
+    and its own `operation_id`.
+
+    PREVIEW AND APPLY. dry_run=True also returns `preview`: the document id and
+    content revision, the exact fingerprint of every LITERAL handle in a handle
+    parameter (a '$reference' resolves late and an entity a step creates has
+    none) and the planned steps. Pass its `revision` as expected_revision and
+    its `preconditions` back, and the batch runs only if nothing moved -
+    otherwise it is refused with kind stale_revision and no step runs. A
+    guarded batch reports `revision`: {checked, after, interleaved}; each step
+    is its own locked call, so a change another call made between two steps is
+    listed under `interleaved` (a rollback restores the checkpoint, that change
+    included).
+
+    OPERATIONS: the batch and each step are operations with their own ids
+    (system_status lists the recent ones). Pass `operation_id` (or the
+    request's `_meta.operation_id`) to make a retry safe: the same id with the
+    same steps replays the recorded result instead of drawing twice. The
+    journal is in memory: a server restart forgets it (durable in 1.8.0, B13).
 
     ATOMICITY is reported, not assumed. Read the `atomicity` block: on the
     headless backend rollback restores a full document snapshot; on live AutoCAD
     it sends an UNDO whose landing AutoCAD never confirms. The default
-    on_error="stop" claims nothing and is exact on both.
+    on_error="stop" claims nothing and is exact on both. A checkpoint a step
+    opens with transaction_begin is closed with the batch's (`unwound`).
 
     NOT CALLABLE from a batch: the raw command/LISP escape hatches, and
     cad_batch itself. Call those directly.
@@ -4469,7 +5227,8 @@ async def cad_batch(
             elif not card:
                 # Fail closed on unknown provenance. This is not a nicety: under
                 # DISCOVERY_MODE=search the advertised surface is search_tools +
-                # `call_tool`, and `call_tool` invokes any tool by name. It is a
+                # `call_tool` + `describe_tool` (also card-less, so also refused
+                # here), and `call_tool` invokes any tool by name. It is a
                 # general-purpose proxy living in the same server as this
                 # denylist, and being card-less is the ONLY thing that stops
                 # cad_batch -> call_tool -> system_run_command. The deny set
@@ -4510,9 +5269,18 @@ async def cad_batch(
         if mode == "rollback":
             guarantee, note = _batch_rollback_guarantee(_backend(ctx))
             note = f"Planned only - a dry run opens no checkpoint. {note}"
+        from engineering.changes.preview import make_preview
+
+        valid = [row for row in plans if row["status"] == "valid"]
+        preview = await make_preview(
+            _backend(ctx),
+            handles=sorted({h for row in valid for h in _batch_literal_handles(row["_args"])}),
+            planned=[{"i": row["i"], "tool": row["tool"], "args": row["_args"]} for row in valid],
+        )
         return {
             "ok": invalid == 0,
             "dry_run": True,
+            "operation_id": CURRENT_OPERATION.get() or operation_id,
             "on_error": mode,
             "steps": len(steps),
             "executed": 0,
@@ -4521,6 +5289,7 @@ async def cad_batch(
             "bindings": sorted(bound_names),
             "results": [{k: v for k, v in row.items() if not k.startswith("_")} for row in plans],
             "atomicity": _batch_atomicity(mode=mode, guarantee=guarantee, note=note),
+            "preview": preview.to_dict(),
             "note": (
                 "Validated against each tool's real JSON Schema; nothing was executed. "
                 "A '$reference' validates as a wildcard because its type is only known "
@@ -4536,20 +5305,48 @@ async def cad_batch(
         )
 
     backend = _backend(ctx)
+    journal = _operations_journal(ctx.lifespan_context)
+    # The middleware set the batch's own operation (a client's id included).
+    batch_id = CURRENT_OPERATION.get() or operation_id
+    watch = None
+    if expected_revision is not None or preconditions is not None:
+        # Task 12: checked before any checkpoint opens, so a refusal leaves
+        # nothing to close and nothing ran.
+        from engineering.changes.preview import RevisionWatch, check_preconditions
+
+        await check_preconditions(
+            backend, expected_revision=expected_revision, preconditions=preconditions
+        )
+        watch = await RevisionWatch.begin(backend)
     guarantee, note = "none", _BATCH_NO_CLAIM_NOTE.format(mode=mode)
     transaction = False
     before = None
+    base_depth = None
     if mode == "rollback":
         guarantee, note = _batch_rollback_guarantee(backend)
         if guarantee == "none":
             raise ToolError(f"cad_batch: on_error='rollback' is unavailable here. {note}")
         before = await _batch_fingerprint(backend)
-        opened = await backend.transaction_begin()
+        base_depth = _read_transaction_depth(backend)
+        # B01: the begin runs shielded. Cancelled mid-await, its worker would
+        # still finish (the lease follows the worker) and push a checkpoint
+        # this call never learns about - left open, a later bare rollback
+        # restores the pre-batch snapshot, and on COM `_transaction_active`
+        # blocks every later batch. Shielded, the outcome is always known: a
+        # cancellation that arrived meanwhile is delivered by the checkpoint
+        # at the top of the try below, whose handler rolls the begin back.
+        with anyio.CancelScope(shield=True):
+            opened = await backend.transaction_begin()
         if not (isinstance(opened, dict) and opened.get("ok")):
+            # Nothing to close; a cancellation that arrived during the begin
+            # must still end the request as one (answering it normally makes
+            # the SDK answer it twice).
+            await anyio.lowlevel.checkpoint_if_cancelled()
             reason = (opened or {}).get("error", "transaction_begin declined")
             return {
                 "ok": False,
                 "dry_run": False,
+                "operation_id": batch_id,
                 "on_error": mode,
                 "steps": len(steps),
                 "executed": 0,
@@ -4577,84 +5374,180 @@ async def cad_batch(
     results: list[dict] = []
     succeeded = failed = executed = 0
     total = len(plans)
-    await ctx.info(f"cad_batch: {total} step(s), on_error={mode}")
 
-    for position, plan in enumerate(plans):
-        await ctx.report_progress(position, total)
-        name = plan["tool"]
-        row: dict = {"i": plan["i"], "tool": name}
-        if failed and mode == "stop":
-            row["status"] = "skipped"
-            row["reason"] = "an earlier step failed (on_error='stop')"
-            results.append(row)
-            continue
-        try:
-            args = _substitute_batch_refs(plan["_args"], bindings)
-        except BatchReferenceError as exc:
-            failed += 1
-            row["status"] = "error"
-            row["error"] = {"kind": "unresolved_ref", "message": _batch_message(exc)}
-            log.warning("BATCH %d/%d %-38s unresolved_ref", position + 1, total, name)
-            results.append(row)
-            continue
-        try:
-            # run_middleware=False: the cad_batch call itself is already through
-            # the audit/timing chain, and skipping it keeps the error one wrap
-            # deep instead of three, which is what makes the taxonomy above
-            # readable. Each step is logged here instead, tagged as a batch step.
-            outcome = await ctx.fastmcp.call_tool(name, args, run_middleware=False)
-        except Exception as exc:
-            failed += 1
+    try:
+        # Inside the try: from here on an open checkpoint is closed by the
+        # handler below, whatever ends the call - including a cancellation
+        # that arrived while the shielded begin ran, delivered right here.
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        await ctx.info(f"cad_batch: {total} step(s), on_error={mode}")
+        for position, plan in enumerate(plans):
+            await ctx.report_progress(position, total)
+            name = plan["tool"]
+            row: dict = {"i": plan["i"], "tool": name}
+            if failed and mode == "stop":
+                row["status"] = "skipped"
+                row["reason"] = "an earlier step failed (on_error='stop')"
+                results.append(row)
+                continue
+            try:
+                args = _substitute_batch_refs(plan["_args"], bindings)
+            except BatchReferenceError as exc:
+                failed += 1
+                row["status"] = "error"
+                row["error"] = {"kind": "unresolved_ref", "message": _batch_message(exc)}
+                log.warning("BATCH %d/%d %-38s unresolved_ref", position + 1, total, name)
+                results.append(row)
+                continue
+            # B12: a step is an operation of its own. Steps skip the middleware,
+            # so the id is minted here and set for the step's backend calls,
+            # whose call_outcomes rows then carry it.
+            step, _ = journal.begin(name, args, document=_identity_of(backend))
+            step_token = CURRENT_OPERATION.set(step.operation_id)
+            if watch is not None:
+                await watch.before(f"step {plan['i']} ({name})")
+            try:
+                # run_middleware=False: the cad_batch call itself is already through
+                # the audit/timing chain, and skipping it keeps the error one wrap
+                # deep instead of three, which is what makes the taxonomy above
+                # readable. Each step is logged here instead, tagged as a batch step.
+                outcome = await ctx.fastmcp.call_tool(name, args, run_middleware=False)
+            except asyncio.CancelledError:
+                journal.finish(
+                    step,
+                    _interrupted_state(backend, step.operation_id, name),
+                    error_kind="cancelled",
+                    document=_identity_of(backend),
+                )
+                raise
+            except Exception as exc:
+                if watch is not None:
+                    await watch.after()
+                failed += 1
+                executed += 1
+                row["status"] = "error"
+                row["error"] = _classify_batch_error(exc)
+                timed = _timeout_kind(backend, step.operation_id, name)
+                if timed is not None:
+                    row["error"]["kind"] = timed
+                row["error"]["operation_id"] = step.operation_id
+                kind = row["error"]["kind"]
+                journal.finish(
+                    step,
+                    _STATE_OF_KIND.get(kind, "refused"),
+                    error_kind=kind,
+                    document=_identity_of(backend),
+                )
+                log.warning("BATCH %d/%d %-38s %s", position + 1, total, name, kind)
+                results.append(row)
+                if mode == "rollback":
+                    break
+                continue
+            finally:
+                CURRENT_OPERATION.reset(step_token)
+            if watch is not None:
+                await watch.after()
             executed += 1
-            row["status"] = "error"
-            row["error"] = _classify_batch_error(exc)
-            log.warning("BATCH %d/%d %-38s %s", position + 1, total, name, row["error"]["kind"])
+            structured = getattr(outcome, "structured_content", None)
+            # A tool may decline *by value* instead of raising: an `is_error` result
+            # from the refusal middleware, or an `{"ok": False, ...}` payload. Both
+            # mean the step did not do its work, and counting either as succeeded is
+            # the same class of lie as the DWG bytes and the unverified rollback —
+            # the batch would report succeeded:1 over work that never happened.
+            #
+            # `ok: False` only carries that meaning for a tool that was supposed to
+            # ACT. On a read-only checker it means "I looked and found something",
+            # and treating that as a refusal is how a `validation_check` step came
+            # to trigger a rollback that destroyed the batch's own geometry.
+            refused = bool(getattr(outcome, "is_error", False)) or (
+                name not in read_only
+                and isinstance(structured, dict)
+                and structured.get("ok") is False
+            )
+            if refused:
+                failed += 1
+                declined_payload = structured if isinstance(structured, dict) else {}
+                capability = declined_payload.get("capability")
+                row["status"] = "error"
+                row["error"] = {
+                    "kind": "unsupported" if capability else "refused",
+                    **({"capability": capability} if capability else {}),
+                    "message": _compact_batch_message(
+                        str(declined_payload.get("error") or "the tool declined")
+                    ),
+                    "operation_id": step.operation_id,
+                }
+                journal.finish(
+                    step,
+                    "refused",
+                    error_kind=row["error"]["kind"],
+                    document=_identity_of(backend),
+                )
+                log.warning("BATCH %d/%d %-38s %s", position + 1, total, name, row["error"]["kind"])
+                results.append(row)
+                # `failed` is what on_error='stop' reads at the top of the loop, so
+                # incrementing it above is the whole stop mechanism.
+                if mode == "rollback":
+                    break
+                continue
+            succeeded += 1
+            journal.finish(step, "committed", document=_identity_of(backend))
+            if plan["_bind"]:
+                bindings[plan["_bind"]] = structured
+                row["bind"] = plan["_bind"]
+            row["status"] = "ok"
+            row["result"] = _compact_batch_result(structured, verbose)
+            log.info("BATCH %d/%d %-38s ok", position + 1, total, name)
             results.append(row)
-            if mode == "rollback":
-                break
-            continue
-        executed += 1
-        structured = getattr(outcome, "structured_content", None)
-        # A tool may decline *by value* instead of raising: an `is_error` result
-        # from the refusal middleware, or an `{"ok": False, ...}` payload. Both
-        # mean the step did not do its work, and counting either as succeeded is
-        # the same class of lie as the DWG bytes and the unverified rollback —
-        # the batch would report succeeded:1 over work that never happened.
-        #
-        # `ok: False` only carries that meaning for a tool that was supposed to
-        # ACT. On a read-only checker it means "I looked and found something",
-        # and treating that as a refusal is how a `validation_check` step came
-        # to trigger a rollback that destroyed the batch's own geometry.
-        refused = bool(getattr(outcome, "is_error", False)) or (
-            name not in read_only and isinstance(structured, dict) and structured.get("ok") is False
-        )
-        if refused:
-            failed += 1
-            declined_payload = structured if isinstance(structured, dict) else {}
-            capability = declined_payload.get("capability")
-            row["status"] = "error"
-            row["error"] = {
-                "kind": "unsupported" if capability else "refused",
-                **({"capability": capability} if capability else {}),
-                "message": _compact_batch_message(
-                    str(declined_payload.get("error") or "the tool declined")
-                ),
-            }
-            log.warning("BATCH %d/%d %-38s %s", position + 1, total, name, row["error"]["kind"])
-            results.append(row)
-            # `failed` is what on_error='stop' reads at the top of the loop, so
-            # incrementing it above is the whole stop mechanism.
-            if mode == "rollback":
-                break
-            continue
-        succeeded += 1
-        if plan["_bind"]:
-            bindings[plan["_bind"]] = structured
-            row["bind"] = plan["_bind"]
-        row["status"] = "ok"
-        row["result"] = _compact_batch_result(structured, verbose)
-        log.info("BATCH %d/%d %-38s ok", position + 1, total, name)
-        results.append(row)
+    except BaseException as exc:
+        # B01: a cancellation (the MCP SDK cancels a request through an anyio
+        # scope) escaped the loop with the checkpoint still open and the steps
+        # that ran still in the drawing. Roll back, shielded: anyio
+        # cancellation is level-triggered, so a bare await here would itself be
+        # cancelled before the rollback body ran (engineering/pid/spec.py has
+        # the measurements). The rollback is checked the way the normal path
+        # checks it - its answer, every checkpoint a step opened above the
+        # batch's, and the fingerprint - and a failure is logged and recorded,
+        # never raised over the exception that ended the batch.
+        if transaction:
+            cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
+            cause = "cancelled" if cancelled else f"{type(exc).__name__}: {exc}"
+            with anyio.CancelScope(shield=True):
+                rollback_started = time.time()
+                try:
+                    performed, declined, _, depth_left = await _close_batch_checkpoint(
+                        backend, backend.transaction_rollback, base_depth
+                    )
+                except Exception as rollback_exc:
+                    if not cancelled:
+                        raise
+                    _record_escaped_batch_rollback(
+                        backend,
+                        ctx,
+                        "rollback_failed",
+                        f"{type(rollback_exc).__name__}: {rollback_exc}",
+                        rollback_started,
+                        cause,
+                    )
+                else:
+                    if not performed:
+                        _record_escaped_batch_rollback(
+                            backend, ctx, "rollback_declined", declined, rollback_started, cause
+                        )
+                    else:
+                        problem = await _escaped_rollback_problem(
+                            backend, before, base_depth, depth_left
+                        )
+                        if problem is not None:
+                            _record_escaped_batch_rollback(
+                                backend,
+                                ctx,
+                                "rollback_unverified",
+                                problem,
+                                rollback_started,
+                                cause,
+                            )
+        raise
 
     await ctx.report_progress(total, total)
 
@@ -4662,21 +5555,35 @@ async def cad_batch(
     verified = None
     after = None
     declined = None
+    unwound = 0
+    depth_left = None
     if transaction:
-        if failed:
-            await ctx.warning("cad_batch: rolling back")
-            # Read the backend's answer instead of asserting success from
-            # control flow. A step is free to call transaction_commit and pop
-            # the checkpoint out from under us, in which case the headless
-            # backend returns {"ok": False, "error": "No active transaction to
-            # rollback"} and the caller's work is still there. Reporting
-            # rolled_back=True off the bare await would be the same class of
-            # lie as writing DXF bytes into a .dwg.
-            rolled_back, declined = _batch_transaction_ok(await backend.transaction_rollback())
-            after = await _batch_fingerprint(backend)
-            verified = None if (before is None or after is None) else before == after
-        else:
-            committed, declined = _batch_transaction_ok(await backend.transaction_commit())
+        # B01: the commit or rollback that closes the checkpoint runs shielded;
+        # a cancellation arriving now must not leave it half-closed.
+        with anyio.CancelScope(shield=True):
+            if failed:
+                await ctx.warning("cad_batch: rolling back")
+                # Read the backend's answer instead of asserting success from
+                # control flow. A step is free to call transaction_commit and pop
+                # the checkpoint out from under us, in which case the headless
+                # backend returns {"ok": False, "error": "No active transaction to
+                # rollback"} and the caller's work is still there. Reporting
+                # rolled_back=True off the bare await would be the same class of
+                # lie as writing DXF bytes into a .dwg.
+                rolled_back, declined, unwound, depth_left = await _close_batch_checkpoint(
+                    backend, backend.transaction_rollback, base_depth
+                )
+                after = await _batch_fingerprint(backend)
+                verified = None if (before is None or after is None) else before == after
+            else:
+                committed, declined, unwound, depth_left = await _close_batch_checkpoint(
+                    backend, backend.transaction_commit, base_depth
+                )
+        # A request cancelled while the shield held still ends as a
+        # cancellation: returning normally makes the SDK answer it a second
+        # time, and `assert not self._completed` in mcp.shared.session kills
+        # the session (measured on 2026-10-24).
+        await anyio.lowlevel.checkpoint_if_cancelled()
 
     ok = failed == 0
     atomicity = _batch_atomicity(
@@ -4686,9 +5593,12 @@ async def cad_batch(
         atomicity.update(
             {"committed": committed, "verified": verified, "before": before, "after": after}
         )
+        if unwound:
+            atomicity["unwound"] = unwound
     payload = {
         "ok": ok,
         "dry_run": False,
+        "operation_id": batch_id,
         "on_error": mode,
         "steps": total,
         "executed": executed,
@@ -4699,6 +5609,8 @@ async def cad_batch(
         "results": results,
         "atomicity": atomicity,
     }
+    if watch is not None:
+        payload["revision"] = watch.report()
     if declined:
         payload["atomicity"]["note"] = (
             f"BACKEND DECLINED THE {'ROLLBACK' if failed else 'COMMIT'} ({declined}). "
@@ -4710,6 +5622,18 @@ async def cad_batch(
         payload["atomicity"]["note"] = (
             "ROLLBACK NOT VERIFIED - the document fingerprint differs from the one "
             f"taken before step 1. {note}"
+        )
+    elif base_depth is not None and depth_left is not None and depth_left > base_depth:
+        payload["atomicity"]["note"] = (
+            f"CHECKPOINT LEFT OPEN - transaction_depth is {depth_left} after closing "
+            f"{unwound + 1} checkpoint(s), {base_depth} before the batch: steps opened "
+            f"more than {_BATCH_MAX_UNWIND} with transaction_begin. {note}"
+        )
+    elif unwound:
+        closed = "rolled back" if failed else "committed"
+        payload["atomicity"]["note"] = (
+            f"A step opened {unwound} checkpoint(s) of its own with transaction_begin; "
+            f"they were {closed} with the batch's, so none is left open. {note}"
         )
     return payload
 
@@ -5215,9 +6139,20 @@ async def transaction_rollback(ctx: Context = None) -> dict:
 async def system_status(ctx: Context = None) -> dict:
     """Get full status of the AutoCAD MCP Pro server and backend connection.
 
-    Returns backend name, connection status, capabilities, document info.
+    Returns backend name, connection status, capabilities, document info, and
+    the document's `document_id` and content `revision` (headless: the active
+    registry entry; live: the bound document, plus `bound_document` and
+    `active_document_changed`). Live, the revision counts this server's own
+    writes; edits the operator makes in AutoCAD are not counted.
+
+    `operations` lists the last 20 operation records, newest last: one per
+    tool call (and per cad_batch step), with `operation_id`, `tool`,
+    `request_hash`, `state` (committed / partial / failed / refused /
+    quarantined / cancelled / unknown_commit / running), the document id and
+    the revision before and after. Held in memory; a restart forgets them.
     """
     b = ctx.lifespan_context.get("backend")
+    journal = _operations_journal(ctx.lifespan_context)
     # R20: tool_count may be None when the registry is unavailable; omit the
     # key rather than surface a bogus value (e.g. the old -1).
     tool_count = await _registered_tool_count()
@@ -5233,6 +6168,7 @@ async def system_status(ctx: Context = None) -> dict:
         }
         if tool_count is not None:
             out["tool_count"] = tool_count
+        out["operations"] = journal.recent()
         return out
     status = await b.system_status()
     status["server"] = "AutoCAD MCP Pro"
@@ -5243,6 +6179,7 @@ async def system_status(ctx: Context = None) -> dict:
         status["unsafe_mode_warning"] = (
             "DANGEROUS_COMMANDS_ENABLED=true — command/LISP sanitization disabled."
         )
+    status["operations"] = journal.recent()
     return status
 
 
@@ -5767,6 +6704,15 @@ async def drawing_finalize(
             "construction geometry) fail; warnings are surfaced in the payload.",
         ),
     ] = False,
+    requirements: Annotated[
+        dict | list | None,
+        Field(
+            default=None,
+            description="Source requirements to verify on the CAD geometry (the "
+            "drawing_verify_requirements shape). A requirement that does not pass fails the "
+            "gate (failed_acceptance), whatever the drafting score.",
+        ),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Premium completion gate: runs BOTH the 8-step validator AND the premium critique focuses
@@ -5783,11 +6729,40 @@ async def drawing_finalize(
     layers no P&ID or architectural focus reads, silent on every sheet this server draws),
     then saves to disk, exports a screenshot, and returns the DWG path.
 
+    The validator and the critique share one read of the drawing - every entity of
+    every space, model and paper, with no cap (one DXF export on the live engine). A
+    drawing over MAX_QA_ENTITIES (default 2,000,000; 0 disables) is not read in part:
+    the validator reports `scan_incomplete` and each entity check reports an issue with
+    detail.code `scan_incomplete`, so the gate fails. A check that raises is an `error`
+    issue with detail.code `check_failed`, never a clean result.
+
     Raises ToolError if any validator 'error' finding is present, or if critique reports an
     'error' (or, with strict_critique=True, any critique issue). Critique warnings are surfaced
-    under payload['critique'] without failing the gate by default.
+    under payload['critique'] without failing the gate by default. A quarantined document
+    is refused.
+
+    With `requirements` (the drawing_verify_requirements shape) every requirement is
+    measured on the CAD geometry after the save: the payload adds `geometry_acceptance`
+    (the full report), `drafting_quality` (the score, unchanged), `artifact_integrity`
+    (the saved file's sha256 and `reverified`: every requirement measured again on the
+    saved file, read fresh and re-bound by handle, feature tag, then geometry, with the
+    before / after comparison; a saved file that cannot be re-read - a .dwg AutoCAD
+    will not let us copy - fails the acceptance) and `coverage`, and a requirement
+    that does not pass,
+    stale evidence or a dimension that disagrees with its geometry raises
+    `failed_acceptance` - a high drafting score never offsets it. Requirements that do
+    not parse are refused before anything is saved (invalid_args).
     """
     from engineering import DrawingValidator
+
+    rs = None
+    if requirements is not None:
+        from engineering.verification.requirements import parse_requirements
+
+        try:
+            rs = parse_requirements(requirements)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolError(f"invalid_args: requirements: {exc}") from exc
 
     backend = _backend(ctx)
 
@@ -5810,11 +6785,14 @@ async def drawing_finalize(
             if ctx is not None:
                 await ctx.warning(f"Screenshot export failed: {exc}")
 
-    result = await DrawingValidator().run(backend, expected=expected or {})
+    # One run context for the validator and the critique: the drawing is read
+    # once (one Document.Export on the live engine), every space, no cap.
+    qa_shared: dict = {}
+    result = await DrawingValidator().run(backend, expected=expected or {}, shared=qa_shared)
     payload = result.to_dict()
 
     # I15 — the premium critique focuses are part of the finalize gate, not merely advisory.
-    critique_issues = await backend.drawing_critique(focus=None)
+    critique_issues = await backend.drawing_critique(focus=None, shared=qa_shared)
     crit_summary = {"error": 0, "warning": 0, "info": 0}
     for issue in critique_issues:
         crit_summary[issue.severity] = crit_summary.get(issue.severity, 0) + 1
@@ -5830,6 +6808,42 @@ async def drawing_finalize(
 
     info = await backend.drawing_info()
     payload["dwg_path"] = getattr(info, "full_path", "")
+
+    if rs is not None:
+        from pathlib import Path as _P
+
+        from backends.base import UnsupportedCapabilityError
+        from engineering.verification.artifact import verify_artifact
+        from engineering.verification.report import sha256_file, summarize, verify_requirements
+
+        saved_path = str(validated) if save_path else None
+        report = await verify_requirements(backend, rs)
+        reverified = None
+        if saved_path is not None:
+            try:
+                saved_report = await verify_artifact(saved_path, rs, backend=backend)
+                reverified = {
+                    **summarize(saved_report),
+                    "comparison": saved_report["comparison"],
+                    "rebinding": saved_report["rebinding"],
+                }
+            except (ValueError, OSError, UnsupportedCapabilityError) as exc:
+                reverified = {
+                    "status": "unknown",
+                    "accepted": False,
+                    "reason": str(exc),
+                    "blocking": [f"artifact_unread: {exc}"],
+                }
+        payload["geometry_acceptance"] = report
+        payload["drafting_quality"] = dict(payload["score"])
+        payload["artifact_integrity"] = {
+            "saved_path": saved_path,
+            "sha256": sha256_file(saved_path)
+            if saved_path is not None and _P(saved_path).is_file()
+            else None,
+            "reverified": reverified,
+        }
+        payload["coverage"] = dict(report["coverage"])
 
     if ctx is not None:
         for issue in critique_issues:
@@ -5853,6 +6867,20 @@ async def drawing_finalize(
             f"drawing_finalize: critique gate failed with {len(gate_failures)} blocking issue(s). "
             f"First: {first.focus}: {first.message}"
         )
+    if rs is not None:
+        report = payload["geometry_acceptance"]
+        blocking = list(report["blocking"])
+        reverified = payload["artifact_integrity"]["reverified"]
+        if reverified is not None and not reverified["accepted"]:
+            blocking.extend(f"saved file: {item}" for item in reverified["blocking"])
+        if blocking:
+            raise ToolError(
+                "drawing_finalize: failed_acceptance - "
+                + "; ".join(blocking[:5])
+                + f" ({report['counts']['pass']} of {report['counts']['required']} "
+                "requirement(s) pass on the drawing; drawing_verify_requirements returns the "
+                "full report)"
+            )
     return payload
 
 
@@ -5888,15 +6916,51 @@ async def drawing_deliver(
         dict | None,
         Field(default=None, description="Optional validator expectations for the drawing."),
     ] = None,
+    requirements: Annotated[
+        dict | list | None,
+        Field(
+            default=None,
+            description="Source requirements to verify (the drawing_verify_requirements "
+            "shape). A requirement that does not pass makes the status failed_acceptance, "
+            "whatever the drafting score.",
+        ),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Create a hashed, validated delivery bundle and verify DXF save/reopen parity.
 
-    The result status is ``success``, ``failed_validation`` or ``failed_export``.
-    Failure intentionally keeps all generated artifacts for diagnosis.
+    The result status is ``success``, ``failed_validation``, ``failed_export`` or
+    ``failed_acceptance``. Failure intentionally keeps all generated artifacts for
+    diagnosis.
+
+    The open document is never re-pointed or saved: the DXF is a copy (live:
+    ``Document.Export``), and the manifest records the document's id, revision, path
+    and saved flag, the DXF version, every sha256 and the build. Parity reads the
+    delivered DXF back and compares it with a fresh serialisation of the document over
+    every space: zero changed, added or removed entities, the same counts per space,
+    the same block definitions. Both sides are exports, so parity cannot see content
+    the export itself loses (`parity.scope` says so); with requirements,
+    `parity.content_check` is `acceptance`, the check that can.
+
+    With ``requirements`` every requirement is measured on the delivered DXF, read
+    fresh and re-bound from the document; the bundle gains ``acceptance.json`` and
+    ``acceptance.md``, the result ``geometry_acceptance``, ``drafting_quality`` (the
+    unchanged score), ``artifact_integrity``, ``coverage`` and ``blocking``, and a
+    requirement that does not pass, stale evidence or a dimension that disagrees
+    with its geometry makes the status ``failed_acceptance`` whatever the score
+    (``failed_export`` and ``failed_validation`` are reported first). Refused before
+    any work: requirements that do not parse (invalid_args).
     """
     from engineering import deliver_drawing
 
+    rs = None
+    if requirements is not None:
+        from engineering.verification.requirements import parse_requirements
+
+        try:
+            rs = parse_requirements(requirements)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolError(f"invalid_args: requirements: {exc}") from exc
     destination = validate_path(output_dir, allow_write=True)
     result = await deliver_drawing(
         _backend(ctx),
@@ -5905,6 +6969,7 @@ async def drawing_deliver(
         min_score=min_score,
         strict_critique=strict_critique,
         expected=expected,
+        requirements=rs,
     )
     return result.to_dict()
 
@@ -5914,7 +6979,10 @@ async def drawing_deliver(
 # ---------------------------------------------------------------------------
 # These tools wrap the entity primitives in a quality-first workflow:
 #   plan → snap-aware geometry → critique → finalize.
-# See `.claude/skills/autocad-mcp-premium/` for the full discipline.
+# See `.claude/skills/autocad-mcp-premium/` for the full discipline — the
+# canonical skill; the Claude Code plugin ships a generated copy as
+# `plugin/skills/premium/` (`/autocad-mcp-pro:premium`), rebuilt by
+# `scripts/build_plugin.py` and held to it by `--check`.
 
 
 @cad_tool(
@@ -5929,7 +6997,10 @@ async def drawing_preflight(
     intent: Annotated[str, "One-line description of what this drawing represents."],
     requirements: Annotated[
         dict | None,
-        "Units, part_type, dimensions, tolerance_policy and optional constraints.",
+        "Units, part_type, tolerance_policy and the requirements themselves: typed `items` "
+        "(each {id, quantity, target, features, provenance, source?, datum?, "
+        "manufacturing_tolerance?, verification_epsilon?}) and/or a legacy `dimensions` "
+        "object, kept read-only; optional constraints.",
     ] = None,
     sheet_size: Annotated[str, Field(default="A3", description="A4 / A3 / A2 / A1 / A0.")] = "A3",
     scale: Annotated[float, Field(default=1.0, gt=0)] = 1.0,
@@ -5945,7 +7016,20 @@ async def drawing_preflight(
     ] = False,
     ctx: Context = None,
 ) -> dict:
-    """Validate and normalize requirements before committing a drawing plan."""
+    """Validate and normalize requirements before committing a drawing plan.
+
+    Typed requirements go under `requirements.items`: each is checked with its
+    path (`items[2].target.nominal: must be greater than zero, got -1.0.` comes
+    back as an INVALID_REQUIREMENT conflict) and its canonical form replaces
+    the input in `normalized_spec`, so `spec_hash` covers what will be
+    verified; `requirement_set` carries the canonical set and its digest. A
+    legacy `dimensions` object is still accepted, kept as given and listed
+    under `legacy` - it is never measured. Conflicting provenance is kept and
+    reported (CONFLICTING_PROVENANCE, CONFLICTING_REQUIREMENT), never
+    collapsed to one value. Typed items are validated once `units` is known
+    (a MISSING_UNITS question asks for it). Nothing is refused: every problem
+    is a question or a conflict, and `ready` stays False until none is left.
+    """
     result = await _backend(ctx).drawing_preflight(
         intent,
         requirements,
@@ -5987,15 +7071,37 @@ async def drawing_plan(
         ),
     ] = "chain",
     notes: Annotated[list[str] | None, "Free-form constraint notes."] = None,
-    requirements: Annotated[dict | None, "Normalized preflight requirements."] = None,
+    requirements: Annotated[
+        dict | None,
+        "Normalized preflight requirements (typed `items` and/or a legacy `dimensions`).",
+    ] = None,
     spec_hash: Annotated[str | None, "Hash returned by the latest ready drawing_preflight."] = None,
+    persist_requirements: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Also write the requirement set into the drawing (an ACADMCP_REQUIREMENTS "
+                "record that travels with the saved file), so a reopened file carries it."
+            ),
+        ),
+    ] = False,
     ctx: Context = None,
 ) -> dict:
     """Commit a PlanSpec before any geometry is created.
 
     The PlanSpec is stored on the backend and surfaced for reference during
     the workflow (it is not replayed as a critique). Always call this FIRST
-    in a premium workflow.
+    in a premium workflow. With typed `requirements.items` the plan carries
+    `requirement_digest`; `persist_requirements=True` also writes the set into
+    the drawing (`requirements_persisted: true`) - the server's own XRECORD,
+    shown nowhere in AutoCAD.
+
+    Refused: a `spec_hash` that does not match the latest ready preflight; a
+    malformed typed item, by its path (`items[2].target.nominal: must be
+    greater than zero, got -1.0.`); `persist_requirements=True` with neither
+    typed `items` nor a legacy `dimensions` object ("nothing to read"). A
+    refusal stores nothing and commits no plan.
     """
     plan = await _backend(ctx).drawing_plan(
         intent,
@@ -6007,6 +7113,7 @@ async def drawing_plan(
         notes,
         requirements,
         spec_hash,
+        persist_requirements,
     )
     from engineering.preflight import pid_plan_warnings
 
@@ -6054,6 +7161,15 @@ async def drawing_critique(
     """Run premium-quality checks. Returns zero issues for a clean drawing.
 
     Standard production gate: must return [] before `drawing_finalize`.
+
+    The entity checks (construction_left, untrimmed_corner, duplicate_entities,
+    dim_overlap) read every entity of every space - model and every paper layout -
+    and compare pairs only within one space. Refusals and failures are issues, never
+    silence: a check that raises returns an `error` issue of its focus with
+    detail.code `check_failed`; a read that could not cover the drawing (more than
+    MAX_QA_ENTITIES entities, default 2,000,000; or a live export whose per-layout
+    counts differ from AutoCAD's) returns detail.code `scan_incomplete`. Neither code
+    is a focus name. A quarantined document is refused.
     """
     issues = await _backend(ctx).drawing_critique(focus)
     return [_dc(i) for i in issues]
@@ -6074,10 +7190,43 @@ async def drawing_refine(
     allowed_repairs: Annotated[
         list[str] | None, "Optional allowlist of repair focus names."
     ] = None,
-    dry_run: Annotated[bool, "Return the repair plan without modifying the drawing."] = False,
+    dry_run: Annotated[
+        bool, "Return the repair plan and its `preview` without modifying the drawing."
+    ] = False,
+    expected_revision: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "Repair only at this content revision (a dry run's `preview.revision`); "
+                "otherwise refused stale_revision and nothing is repaired."
+            ),
+        ),
+    ] = None,
+    preconditions: Annotated[
+        list[dict] | None,
+        Field(
+            default=None,
+            description=(
+                "A dry run's `preview.preconditions` ({handle, fingerprint} per entity a "
+                "planned repair touches): repair only if each is unchanged; otherwise "
+                "refused stale_revision and nothing is repaired."
+            ),
+        ),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
-    """Run a bounded, transaction-safe critique/repair/re-critique loop."""
+    """Run a bounded, transaction-safe critique/repair/re-critique loop.
+
+    dry_run=True returns the plan with `preview` - the content revision and the
+    exact fingerprint of every handle a planned repair touches - also when the
+    score already meets min_score: `threshold_met` then says an apply at that
+    min_score would stop before repairing. Applied with the preview's
+    `revision` (expected_revision) and/or `preconditions`, the call is refused
+    with kind stale_revision and nothing changed when the document moved since;
+    the result then carries `revision` ({checked, after, interleaved}).
+    """
     from engineering.refiner import refine_drawing
 
     result = await refine_drawing(
@@ -6087,6 +7236,8 @@ async def drawing_refine(
         focus=focus,
         allowed_repairs=allowed_repairs,
         dry_run=dry_run,
+        expected_revision=expected_revision,
+        preconditions=preconditions,
     )
     return result.to_dict()
 
@@ -6131,10 +7282,18 @@ async def point_intersection(
 ) -> dict:
     """Compute the intersection of two geometry entities (LINE-LINE, LINE-CIRCLE,
     CIRCLE-CIRCLE). When two candidates exist, ref_x/ref_y selects the nearest.
-    Returns {x, y}.
+
+    Returns {x, y, on_first, on_second, on_both, candidates}. A LINE is
+    intersected as the infinite line through it, so the point can lie beyond
+    a drawn end: `on_first` / `on_second` say whether it lies on each drawn
+    segment (a CIRCLE always holds its own intersection points) and `on_both`
+    whether on both - check it before using the point as a corner.
+    `candidates` is how many intersections existed. Refused, with the case
+    named: parallel or coincident lines, a line that misses the circle,
+    concentric circles, circles that do not meet, any other entity pair.
     """
-    pt = await _backend(ctx).point_intersection(handle1, handle2, ref_x, ref_y)
-    return {"x": float(pt[0]), "y": float(pt[1])}
+    found = await _backend(ctx).point_intersection_detail(handle1, handle2, ref_x, ref_y)
+    return {key: found[key] for key in ("x", "y", "on_first", "on_second", "on_both", "candidates")}
 
 
 @cad_tool(summary="Find where a line from an outside point touches a circle.", cost="read")
@@ -6979,6 +8138,18 @@ async def pid_graph(
     `dangling` with the nearest port as a hint — always within its own
     space, so `scope="all"` never joins two sheets. `stats.confidence_min`
     is the number to read before trusting a foreign drawing.
+
+    Returns nodes, edges, junctions, dangling, unclassified, offpage_links,
+    stats, tolerance, scope and backend:
+    - node: id, kind, block_name, family, symbol, tag, tag_parsed, tag_source,
+      x, y, rotation_deg, scale, y_scale, mirrored, layer, space, description
+      (its DESC attribute), source, confidence, notes, and ports
+      {name, x, y, direction_deg, kind, radius, inferred, edges};
+    - edge: id, line_class, class_source, line_number, number_source, size,
+      service, spec, insulation, from, to, length (plus length_approximate
+      when the engine measured none), layer, space, source; vertices and
+      bulges with include_geometry;
+    - junction: id, x, y, edges, space; dangling: edge, end, x, y, nearest.
     """
     from engineering.pid.graph import build_graph
 
@@ -6987,34 +8158,63 @@ async def pid_graph(
     )
 
 
+_PID_LIST_CSV = Annotated[
+    str | None,
+    "Write the rows as CSV here (inside ALLOWED_PATHS); text that starts like a "
+    "formula (= + - @ tab CR) is prefixed with ' so a spreadsheet never runs it",
+]
+_PID_LIST_TOLERANCE = Annotated[
+    float, Field(default=0.5, gt=0, description="Endpoint-to-port snap distance (mm)")
+]
+_PID_LIST_LABEL_SEARCH = Annotated[
+    float,
+    Field(default=15.0, gt=0, description="How far to look for tag/line-number text (mm)"),
+]
+_PID_LIST_FOREIGN = Annotated[bool, "Classify INSERTs not placed by this server (confidence < 1)"]
+
+
 @cad_tool(
     summary=(
         "Instrument index derived from the P&ID graph (tag, function, loop, "
         "connections); optional CSV."
     ),
-    cost="read",
+    cost="safe",
 )
 @mcp.tool(
-    annotations={"title": "P&ID: Instrument Index", "readOnlyHint": True},
+    annotations={
+        "title": "P&ID: Instrument Index",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+    },
     tags={"pid", "query"},
 )
 async def pid_instrument_index(
-    csv_path: Annotated[str | None, "Write the rows as CSV here (inside ALLOWED_PATHS)"] = None,
-    tolerance: Annotated[
-        float, Field(default=0.5, gt=0, description="Endpoint-to-port snap distance (mm)")
-    ] = 0.5,
+    csv_path: _PID_LIST_CSV = None,
+    tolerance: _PID_LIST_TOLERANCE = 0.5,
     scope: Annotated[str, "current_space | all"] = "current_space",
+    label_search: _PID_LIST_LABEL_SEARCH = 15.0,
+    include_foreign: _PID_LIST_FOREIGN = True,
     ctx: Context = None,
 ) -> dict:
     """Every instrument bubble with its ISA-5.1 reading and what it connects to.
 
     Rows come from `pid_graph`, never from typed-in lists; the drawing is not
-    modified. `csv_path` is the only file this tool writes.
+    modified. `csv_path` is the only file this tool writes (so it is not
+    annotated read-only); it is validated before the drawing is read, and an
+    empty path, a directory or a missing parent folder is refused.
+    `signal_lines` counts ISA-5.1 signal lines only; `connected_to` names a
+    tag, a handle, or the lines a junction on the instrument's line joins.
     """
     from engineering.pid.deliverables import deliverable
 
     return await deliverable(
-        _backend(ctx), "instrument_index", csv_path, tolerance=tolerance, scope=scope
+        _backend(ctx),
+        "instrument_index",
+        csv_path,
+        tolerance=tolerance,
+        label_search=label_search,
+        scope=scope,
+        include_foreign=include_foreign,
     )
 
 
@@ -7022,57 +8222,78 @@ async def pid_instrument_index(
     summary=(
         "Line list derived from the P&ID graph (number, class, size, spec, from/to); optional CSV."
     ),
-    cost="read",
+    cost="safe",
 )
 @mcp.tool(
-    annotations={"title": "P&ID: Line List", "readOnlyHint": True},
+    annotations={"title": "P&ID: Line List", "readOnlyHint": False, "destructiveHint": False},
     tags={"pid", "query"},
 )
 async def pid_line_list(
-    csv_path: Annotated[str | None, "Write the rows as CSV here (inside ALLOWED_PATHS)"] = None,
-    tolerance: Annotated[
-        float, Field(default=0.5, gt=0, description="Endpoint-to-port snap distance (mm)")
-    ] = 0.5,
+    csv_path: _PID_LIST_CSV = None,
+    tolerance: _PID_LIST_TOLERANCE = 0.5,
     scope: Annotated[str, "current_space | all"] = "current_space",
+    label_search: _PID_LIST_LABEL_SEARCH = 15.0,
+    include_foreign: _PID_LIST_FOREIGN = True,
     ctx: Context = None,
 ) -> dict:
     """Every P&ID line with its number, class, size/service/spec/insulation and endpoints.
 
     Rows come from `pid_graph`; untagged lines sort last with `line_number: null`.
-    The drawing is not modified; `csv_path` is the only file this tool writes.
+    An end names a node's tag (its handle when untagged) and port, or — at a
+    junction — the line numbers (or handles) of the lines it joins.
+    The drawing is not modified; `csv_path` is the only file this tool writes,
+    validated before the drawing is read.
     """
     from engineering.pid.deliverables import deliverable
 
-    return await deliverable(_backend(ctx), "line_list", csv_path, tolerance=tolerance, scope=scope)
+    return await deliverable(
+        _backend(ctx),
+        "line_list",
+        csv_path,
+        tolerance=tolerance,
+        label_search=label_search,
+        scope=scope,
+        include_foreign=include_foreign,
+    )
 
 
 @cad_tool(
     summary=(
         "Equipment list derived from the P&ID graph (tag, kind, ports, connections); optional CSV."
     ),
-    cost="read",
+    cost="safe",
 )
 @mcp.tool(
-    annotations={"title": "P&ID: Equipment List", "readOnlyHint": True},
+    annotations={
+        "title": "P&ID: Equipment List",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+    },
     tags={"pid", "query"},
 )
 async def pid_equipment_list(
-    csv_path: Annotated[str | None, "Write the rows as CSV here (inside ALLOWED_PATHS)"] = None,
-    tolerance: Annotated[
-        float, Field(default=0.5, gt=0, description="Endpoint-to-port snap distance (mm)")
-    ] = 0.5,
+    csv_path: _PID_LIST_CSV = None,
+    tolerance: _PID_LIST_TOLERANCE = 0.5,
     scope: Annotated[str, "current_space | all"] = "current_space",
+    label_search: _PID_LIST_LABEL_SEARCH = 15.0,
+    include_foreign: _PID_LIST_FOREIGN = True,
     ctx: Context = None,
 ) -> dict:
     """Every equipment, valve and connector node with its ports and how many lines reach them.
 
     Rows come from `pid_graph`; the drawing is not modified and `csv_path` is
-    the only file this tool writes.
+    the only file this tool writes, validated before the drawing is read.
     """
     from engineering.pid.deliverables import deliverable
 
     return await deliverable(
-        _backend(ctx), "equipment_list", csv_path, tolerance=tolerance, scope=scope
+        _backend(ctx),
+        "equipment_list",
+        csv_path,
+        tolerance=tolerance,
+        label_search=label_search,
+        scope=scope,
+        include_foreign=include_foreign,
     )
 
 
@@ -7092,6 +8313,28 @@ async def pid_from_spec(
         "{sheet, equipment[], valves[], instruments[], lines[], connectors[]} — see the P&ID prompt",
     ],
     dry_run: Annotated[bool, "Validate and route in memory; draw nothing"] = False,
+    expected_revision: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "Draw only at this content revision (a dry run's `preview.revision`); "
+                "otherwise refused stale_revision and nothing is drawn."
+            ),
+        ),
+    ] = None,
+    preconditions: Annotated[
+        list[dict] | None,
+        Field(
+            default=None,
+            description=(
+                "A dry run's `preview.preconditions` (the routing region's fingerprint): "
+                "draw only if nothing in the region changed; otherwise refused "
+                "stale_revision and nothing is drawn."
+            ),
+        ),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Equipment, valves, instruments and connectors placed, then every line
@@ -7106,12 +8349,27 @@ async def pid_from_spec(
     by path before anything is placed. The response carries the graph read
     back from the drawing and the P&ID critique issues, so the caller sees
     dangling ends or duplicate tags in the same round trip. `dry_run` returns
-    the planned vertices and crossings without touching the drawing.
+    the planned vertices and crossings without touching the drawing; crossings
+    are counted, on both runs, against the spec's own lines and the P&ID lines
+    already on the current layout (`crossings_scope`). The dry run also returns
+    the routing `region` and a `preview` whose precondition is the fingerprint
+    of every entity in that region. Applied with the preview's `revision`
+    (expected_revision) and/or `preconditions`, the run is refused with kind
+    stale_revision and nothing drawn when anything in the region (or the
+    revision) changed; a region precondition taken from another spec is
+    refused by path. A guarded run reports `revision` ({checked, after,
+    interleaved}).
     """
     from engineering.pid.spec import run_spec
 
     await ctx.info("P&ID from spec" + (" (dry run)" if dry_run else ""))
-    return await run_spec(_backend(ctx), spec, dry_run)
+    return await run_spec(
+        _backend(ctx),
+        spec,
+        dry_run,
+        expected_revision=expected_revision,
+        preconditions=preconditions,
+    )
 
 
 @cad_tool(
@@ -7681,7 +8939,8 @@ async def drawing_template_save(
 )
 async def document_list(ctx: Context = None) -> dict:
     """Every open document with `name`, `path`, `active`, `saved` and
-    `entity_count`.
+    `entity_count`. Each row also carries the document's `document_id` and
+    content `revision` (None, live, for a document this session never bound).
 
     Headless, the server keeps its own registry: `drawing_new` / `drawing_open`
     add an entry (`untitled-N` or the file path) instead of replacing the only
@@ -8717,13 +9976,21 @@ async def std_part_list(
     its `source`. Coverage is deliberately narrow: ISO 261 first-choice sizes
     only (M5-M36, M3-M24 for ISO 4762) and ISO 15 bore numbers 00-10 in the
     600x / 620x / 630x series. A size outside a table is refused by name by
-    `std_part_insert` with the nearest entries, never interpolated. An unknown
-    `standard` is refused with the list of catalogue standards.
-    """
-    from engineering.mech.stdparts import FAMILY_STANDARDS, catalogue
+    `std_part_insert` with the nearest entries, never interpolated and never
+    substituted. An unknown `standard` is refused with the list of catalogue
+    standards.
 
-    rows = catalogue(query, standard)
-    return {"count": len(rows), "standards": list(FAMILY_STANDARDS), "parts": list(rows)}
+    `coverage` is the standards coverage manifest (also the resource
+    `autocad://standards/coverage`): one record per registered table - the
+    fastener and bearing tables above, ISO 261 and the feature tables
+    `std_feature_draw` reads - with edition, table locator, implemented sizes,
+    range and source. DIN 509, DIN 471/472, DIN 332-1 and ISO 3601-2 report
+    "no rows transcribed"; transcriber and reviewer are null because the
+    repository records none.
+    """
+    from engineering.mech.stdparts import catalogue_listing
+
+    return catalogue_listing(query, standard)
 
 
 @cad_tool(
@@ -10592,7 +11859,7 @@ async def arch_plan_from_spec(
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 26: Understanding & QA (4 tools) ────────────────────────────────
+# ── SECTION 26: Understanding & QA (5 tools) ────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -11061,6 +12328,211 @@ async def drawing_topology_check(
     return report
 
 
+@cad_tool(
+    summary="Verify source requirements on the CAD geometry: pass/fail/unknown each, with evidence.",
+    cost="safe",
+)
+@mcp.tool(
+    annotations={
+        "title": "Understand: Verify Requirements",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+    },
+    tags={"understand", "analysis", "validation"},
+)
+async def drawing_verify_requirements(
+    requirements: Annotated[
+        dict | list | None,
+        Field(
+            default=None,
+            description="Typed requirements ({units, items: [{id, quantity, target, "
+            "features, provenance, source, ...}]}) or a legacy {dimensions: {...}} carried "
+            "read-only.",
+        ),
+    ] = None,
+    use_stored: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Verify the set drawing_plan(persist_requirements=True) stored in the "
+            "drawing.",
+        ),
+    ] = False,
+    binding_policy: Annotated[
+        str,
+        Field(
+            default="strict",
+            description="strict or lenient: how a requirement is bound to its feature. Two "
+            "equal candidates are ambiguous under both.",
+        ),
+    ] = "strict",
+    artifact_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="A saved file of this drawing (.dxf; a .dwg only on a live seat) to "
+            "measure instead of the open document - read fresh, never the model in memory.",
+        ),
+    ] = None,
+    manifest_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="A drawing_deliver manifest.json: re-hash its artifacts and list the "
+            "stale and missing ones. Its own mode.",
+        ),
+    ] = None,
+    report_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Also write the report here: .json, or .md (Markdown; not in manifest "
+            "mode).",
+        ),
+    ] = None,
+    ctx: Context = None,
+) -> dict:
+    """Measure source requirements on the CAD geometry and say, per requirement,
+    pass / fail / unknown / unsupported / ambiguous - with the evidence.
+
+    Each requirement is bound to the real feature (by handle, feature tag, arch
+    element, geometric predicate or DIMENSION; two equal candidates are
+    `ambiguous`, never a pick) and measured on the geometry read from the drawing
+    - never on a label, a stored model or the numbers that were typed in. A row
+    gives target, measured, delta, tolerance basis, status, handles and source;
+    `counts` gives the denominators (required = pass + fail + unknown +
+    unsupported + ambiguous). `status` is `pass` only when every requirement
+    passes; `accepted` also needs fresh evidence and no `dimension_mismatch`
+    finding (a DIMENSION whose text or DIMLFAC disagrees with the geometry).
+
+    Modes:
+    - `requirements` ({"units": ..., "items": [typed requirements]}, or a
+      legacy {"dimensions": {...}} that is carried read-only and verifies
+      nothing) or `use_stored=True`: measured on
+      the current document. `evidence` records its id and content revision; a
+      later revision makes the report stale.
+    - `artifact_path`: measured on that saved file, read fresh (a .dwg on a live seat
+      through a private copy), each feature re-bound from the current document - by
+      handle while handles are stable, then by feature tag, then by geometry, two
+      candidates being `unknown` - with `rebinding` and the before / after
+      `comparison` in the report. A count or absence is counted afresh on the
+      file, never carried over; a DIMENSION not found again there is a blocking
+      `dimension_unverified` finding. `provenance` says whether the current
+      document can be the file's source (at least half of the entities match
+      unchanged); when not, a blocking `artifact_source_mismatch` finding, no
+      comparison, and a handle-naming requirement is `unknown`.
+    - `manifest_path`: re-hashes a drawing_deliver bundle and lists every
+      artifact whose sha256 no longer matches (`stale`) or that is gone
+      (`missing`).
+
+    `report_path` writes the report as JSON (.json) or Markdown (.md); nothing
+    else is written, and the drawing never is.
+
+    Refused before any work: `requirements` together with `use_stored`
+    (invalid_args); neither of them without `manifest_path`
+    (missing_requirement); `use_stored` on a drawing that stores no
+    requirements (missing_requirement); requirements that do not parse
+    (invalid_args, the offending path named); a `binding_policy` other than
+    strict / lenient; `manifest_path` together with `requirements`, `use_stored`
+    or `artifact_path`; an `artifact_path` or `manifest_path` that does not
+    exist; a manifest that is not a delivery manifest; a `report_path` not
+    ending in .json or .md (only .json in manifest mode); a DWG artifact on the
+    headless engine (capability `dwg`). A quarantined document is refused.
+    """
+    from engineering.delivery import verify_manifest
+    from engineering.verification.report import (
+        BINDING_POLICIES,
+        render_markdown,
+        verify_requirements,
+    )
+    from engineering.verification.requirements import load_requirements, parse_requirements
+
+    report_target = None
+    if report_path is not None:
+        report_target = validate_path(report_path, allow_write=True)
+        allowed = (".json",) if manifest_path is not None else (".json", ".md")
+        if report_target.suffix.lower() not in allowed:
+            raise ToolError(
+                "invalid_args: report_path must end in .json or .md (only .json in manifest "
+                f"mode); got {report_target.name!r}"
+            )
+    if binding_policy not in BINDING_POLICIES:
+        raise ToolError(
+            f"invalid_args: binding_policy must be one of {', '.join(BINDING_POLICIES)}; "
+            f"got {binding_policy!r}"
+        )
+    backend = _backend(ctx)
+
+    if manifest_path is not None:
+        if requirements is not None or use_stored or artifact_path is not None:
+            raise ToolError(
+                "invalid_args: manifest_path is its own mode - it re-hashes a delivery's "
+                "artifacts. Verify requirements in a separate call (requirements= or "
+                "use_stored=True, optionally artifact_path=)."
+            )
+        manifest = validate_path(manifest_path)
+        if not manifest.is_file():
+            raise ToolError(f"manifest_path: no such file {str(manifest)!r}")
+        try:
+            result = await asyncio.to_thread(verify_manifest, str(manifest))
+        except ValueError as exc:
+            raise ToolError(f"invalid_args: {exc}") from exc
+        result = {"mode": "manifest", **result}
+        if report_target is not None:
+            report_target.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            result["report_path"] = str(report_target)
+        return result
+
+    if requirements is not None and use_stored:
+        raise ToolError("invalid_args: pass requirements or use_stored=True, not both")
+    if requirements is None and not use_stored:
+        raise ToolError(
+            "missing_requirement: nothing to verify - pass requirements, use_stored=True "
+            "(the set drawing_plan(persist_requirements=True) stored) or manifest_path"
+        )
+    if use_stored:
+        rs = await load_requirements(backend)
+        if rs is None:
+            raise ToolError(
+                "missing_requirement: this drawing stores no requirements - persist them with "
+                "drawing_plan(..., persist_requirements=True) or pass requirements"
+            )
+    else:
+        try:
+            rs = parse_requirements(requirements)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolError(f"invalid_args: requirements: {exc}") from exc
+    artifact = None
+    if artifact_path is not None:
+        artifact = validate_path(artifact_path)
+        if not artifact.is_file():
+            raise ToolError(f"artifact_path: no such file {str(artifact)!r}")
+    await ctx.info(
+        f"drawing_verify_requirements: {len(rs.requirements)} requirement(s) on "
+        f"{artifact or 'the current document'}"
+    )
+    try:
+        report = await verify_requirements(
+            backend,
+            rs,
+            binding_policy=binding_policy,
+            artifact_path=str(artifact) if artifact is not None else None,
+        )
+    except (ValueError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+    report["mode"] = "artifact" if artifact is not None else "document"
+    if report_target is not None:
+        if report_target.suffix.lower() == ".md":
+            text = render_markdown(report)
+        else:
+            text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+        report_target.write_text(text, encoding="utf-8")
+        report["report_path"] = str(report_target)
+    return report
+
+
 # ---------------------------------------------------------------------------
 # ── SECTION 27: Plant Takeoffs (2 tools) ────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -11501,9 +12973,78 @@ async def resource_isa51() -> str:
     return json.dumps(describe_tables(), indent=2)
 
 
+@mcp.resource(
+    "autocad://standards/coverage",
+    name="Standards Coverage Manifest",
+    description=(
+        "Every authored standards table: edition, table locator, implemented sizes, "
+        "coverage range and source; the empty feature tables say no rows transcribed"
+    ),
+    mime_type="application/json",
+    annotations={"readOnlyHint": True},
+    tags={"mech", "standards"},
+)
+async def resource_standards_coverage() -> str:
+    from engineering.mech.standards.coverage import coverage_manifest
+
+    return json.dumps(coverage_manifest(), indent=2)
+
+
+@mcp.resource(
+    "autocad://recipes/index",
+    name="Task Recipe Index",
+    description=(
+        "Versioned task recipes: preconditions (backends, capabilities, packs, profiles), "
+        "inputs, tools and how to run one through cad_batch"
+    ),
+    mime_type="application/json",
+    annotations={"readOnlyHint": True},
+    tags={"recipes", "workflow"},
+)
+async def resource_recipes_index() -> str:
+    from engineering.recipes import recipe_index
+
+    return json.dumps(recipe_index(), indent=2, ensure_ascii=False)
+
+
+@mcp.resource(
+    "autocad://recipes/{recipe_id}",
+    name="Task Recipe",
+    description=(
+        "One task recipe: steps in cad_batch's {tool, args, bind} shape, the evidence each "
+        "leaves and the postconditions to check; an unknown id is refused with the known ones"
+    ),
+    mime_type="application/json",
+    annotations={"readOnlyHint": True},
+    tags={"recipes", "workflow"},
+)
+async def resource_recipe(recipe_id: str) -> str:
+    from fastmcp.exceptions import ResourceError
+
+    from engineering.recipes import RecipeError, get_recipe
+
+    try:
+        return json.dumps(get_recipe(recipe_id), indent=2, ensure_ascii=False)
+    except RecipeError as exc:
+        raise ResourceError(str(exc)) from exc
+
+
 # ---------------------------------------------------------------------------
 # ── PROMPTS ──────────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
+
+
+def _plan_scale_denominator(scale: str) -> tuple[int, str | None]:
+    """``"1:100"`` / ``"100"`` -> 100; anything else -> 100 and the reason."""
+    text = str(scale).strip()
+    tail = text.split(":", 1)[1] if ":" in text else text
+    try:
+        value = float(tail)
+    except ValueError:
+        return 100, f"scale {scale!r} is not 1:N; 1:100 is used"
+    if not (math.isfinite(value) and value > 0) or value != int(value):
+        return 100, f"scale {scale!r} is not 1:N with a whole N; 1:100 is used"
+    return int(value), None
 
 
 @mcp.prompt(tags={"template", "architectural"})
@@ -11513,34 +13054,82 @@ def prompt_floor_plan(
     units: str = "mm",
 ) -> str:
     """Generate a prompt for creating a floor plan drawing."""
-    return f"""You are creating a floor plan for '{building_name}' at scale {scale} in {units}.
+    denominator, scale_note = _plan_scale_denominator(scale)
+    spec = {
+        "sheet": {
+            "intent": f"{building_name} floor plan",
+            "sheet_size": "A3",
+            "scale": denominator,
+        },
+        "lang": "en",
+        "walls": [
+            {
+                "id": "EXT",
+                "axis": [[0, 0], [9000, 0], [9000, 6000], [0, 6000]],
+                "thickness": 250,
+                "closed": True,
+                "material": "brick",
+            },
+            {"id": "INT", "axis": [[5000, 0], [5000, 6000]], "thickness": 100, "material": "aac"},
+        ],
+        "openings": [
+            {"id": "D1", "wall": "EXT", "kind": "door", "offset": 1000, "width": 1000, "tag": "D1"},
+            {
+                "id": "W1",
+                "wall": "EXT",
+                "kind": "window",
+                "offset": 11000,
+                "width": 1200,
+                "sill": 900,
+                "height": 1200,
+                "tag": "W1",
+            },
+        ],
+        "rooms": [
+            {"id": "R1", "name": "LIVING", "number": "01", "at": [2500, 3000]},
+            {"id": "R2", "name": "HALL", "number": "02", "at": [7000, 3000]},
+        ],
+        "chains": {"sides": ["bottom", "left"]},
+        "schedules": [{"kind": "rooms", "at": [10500, 6000]}],
+    }
+    notes = []
+    if scale_note:
+        notes.append(f"NOTE: {scale_note}.")
+    if units.strip().lower() != "mm":
+        notes.append(
+            f"NOTE: {units!r} was requested, but the plan model's lengths are millimetres: "
+            "convert every dimension to mm before writing the spec."
+        )
+    note_text = ("\n".join(notes) + "\n\n") if notes else ""
+    return f"""You are drawing the floor plan of '{building_name}' at 1:{denominator} with the plan model.
+{note_text}A wall is an axis, a thickness, a justification and a material; a door or window is hosted
+in its wall. Never draw walls, doors or windows from lines, rectangles and arcs: the plan engine
+resolves L / T / X junctions, cuts the openings, hatches the cut faces by material and lists in
+`omitted` whatever it could not place. Lengths are millimetres; text follows the plot scale
+(`scale` is a denominator: {denominator} means 1:{denominator}).
 
-LAYER SETUP (create these layers first):
-  - WALLS       color=7 (white)  linetype=Continuous  lineweight=50
-  - DOORS       color=3 (green)  linetype=Continuous  lineweight=25
-  - WINDOWS     color=4 (cyan)   linetype=Continuous  lineweight=25
-  - FURNITURE   color=8 (gray)   linetype=Continuous  lineweight=13
-  - DIMENSIONS  color=2 (yellow) linetype=Continuous  lineweight=13
-  - TEXT        color=7 (white)  linetype=Continuous  lineweight=13
-  - GRID        color=9          linetype=DASHED       lineweight=13
+WORKFLOW
+1. drawing_new() — then drawing_settings(settings={{"units": "mm"}}).
+2. arch_catalogue_list() when furniture or sanitary blocks are wanted (nominal sizes, not a code).
+3. arch_plan_from_spec(spec) — the whole plan in one transaction: walls, openings, stairs, room
+   labels whose areas are measured off the walls just drawn, the exterior dimension chains and the
+   schedules. Every item is validated first; a refusal names its path and draws nothing. A room
+   `area` is refused: areas are measured, never typed. A starting spec:
+{json.dumps(spec, indent=2)}
+   Stairs: "stairs": [{{"id", "start", "direction_deg", "width", "risers", "riser_height", "going"}}]
+   (the Blondel check 2R + G within 600–650 mm is reported as a design rule, not a building code).
+4. Read the result's `omitted` list and the arch_* critique it carries; fix the spec, not the lines.
+5. arch_rooms_detect() — read the rooms back from the drawn walls (confidence 1.0 for our walls).
+   Every labelled room's area must match its detected face; a gap or an unlabelled face is a finding.
+6. arch_schedule(kind="doors"|"windows"|"rooms", x, y, scale={denominator}) for any schedule the
+   spec did not place — a schedule is a read of the drawn records, drawn as a real table.
+7. arch_grid(...), arch_symbol(...), arch_catalogue_insert(...) for grids, north arrows and furniture.
+8. drawing_critique(focus=None) — must be clean (arch_room_unlabelled, arch_wall_gap and
+   arch_opening_clash run in it).
+9. drawing_finalize(save_path=...) — or drawing_deliver(output_dir=...) for a hashed bundle.
 
-WORKFLOW:
-1. drawing_new() → create new drawing
-2. layer_create() for each layer above
-3. entity_create_rectangle() on WALLS layer for outer boundary
-4. entity_create_polyline() on WALLS for interior walls (width ~200mm)
-5. entity_create_arc() on DOORS for door swings (radius=900mm)
-6. entity_create_rectangle() on WINDOWS for window openings
-7. dimension_aligned() on DIMENSIONS layer for key measurements
-8. entity_create_text() on TEXT layer for room labels
-9. view_zoom_and_screenshot() to verify layout
-
-CONVENTIONS:
-- Exterior walls: 300mm thick
-- Interior walls: 150mm thick
-- Door openings: 900mm wide
-- Window sills: 900mm from floor (not shown in plan)
-- Room labels: centered in each space, height=300mm at 1:100
+TURKISH SHEETS: "lang": "tr" in the spec (or lang="tr" on a tool) switches labels and schedules to
+Turkish with a decimal comma; any other language is refused with the list.
 """
 
 
@@ -11592,41 +13181,34 @@ def prompt_electrical_schematic(
     voltage: str = "400V/230V",
 ) -> str:
     """Generate a prompt for creating an electrical schematic diagram."""
-    return f"""You are creating an electrical schematic for '{circuit_name}' at {voltage}.
+    return f"""You are drafting an electrical schematic for '{circuit_name}' ({voltage}) with the tools this
+server has today.
 
-LAYER SETUP:
-  - POWER_LINES     color=7  lineweight=50
-  - CONTROL_LINES   color=3  lineweight=25
-  - COMPONENTS      color=2  lineweight=25
-  - TERMINALS       color=4  lineweight=25
-  - WIRE_NUMBERS    color=7  lineweight=13
-  - COMPONENT_TAGS  color=8  lineweight=13
-  - BORDER          color=7  lineweight=100
+WHAT IS NOT HERE YET: electrical schematics are a 1.9.0 item. There is no IEC 60617 symbol
+catalogue, no wire-numbering or ladder tool and no electrical critique, so nothing checks that
+the circuit is right. Label the result a DRAFT, say so in the title block, and keep every
+symbol a real block with attributes so the 1.9.0 tools can read it later.
 
-STANDARD IEC 60617 SYMBOLS:
-  - Circuit breaker: rectangle with diagonal line
-  - Contactor: circle with cross
-  - Relay coil: rectangle
-  - Motor: circle with 'M'
-  - Fuse: rectangle with horizontal line
-  - Switch NO: two points with gap
-  - Switch NC: two points with diagonal slash
-
-LADDER DIAGRAM CONVENTIONS:
-  - Power rails: vertical lines on left (L1/L2/L3) and right (N/PE)
-  - Rungs: horizontal lines connecting rails
-  - Load elements (coils, motors): always on right side of rung
-  - Contact elements: always to the left of loads
-  - Rung numbers: on left margin
-
-WORKFLOW:
-1. layer_create() for all layers
-2. entity_create_line() for power rails (vertical)
-3. entity_create_polyline() for each circuit rung
-4. Place component symbols with entity_create_*
-5. Add wire numbers as text entities
-6. Add component reference tags
-7. view_zoom_and_screenshot() to verify
+WORKFLOW
+1. drawing_new() — then drawing_settings(settings={{"units": "mm"}}).
+2. layer_create(name, color, linetype, lineweight) for POWER, CONTROL, SYMBOLS, WIRE_NUMBERS,
+   TAGS; lineweights from the ISO 128 series only (0.25 / 0.35 / 0.50 / 0.70 mm).
+3. block_define(name, entities, attdefs) — each symbol ONCE, from typed primitives (line, circle,
+   arc, polyline, text) in block-local mm, with TAG and DESIGNATION attribute definitions, e.g.
+     {{"name": "BREAKER_3P", "entities": [...], "attdefs": [{{"tag": "TAG", "x": 0, "y": -6, "height": 2.5}},
+      {{"tag": "DESIGNATION", "x": 0, "y": -10, "height": 2.5, "invisible": true}}]}}
+   Draw each symbol to the IEC 60617 sheet you are working from; the server has no catalogue
+   to check it against.
+4. block_insert(name, x, y, attributes={{"TAG": "-Q1", "DESIGNATION": "MCB 3P C16"}}) for every
+   device; keep the handles.
+5. entity_create_line(...) / entity_create_polyline(...) for the rails and the rungs, on POWER or
+   CONTROL; read the inserted blocks' positions with entity_get(handle) instead of guessing.
+6. entity_create_text(text, x, y, height=2.5, layer="WIRE_NUMBERS") for wire numbers.
+7. titleblock_apply(title="{circuit_name} - DRAFT", drawing_no=..., size="A3") — the ISO 7200 block.
+8. bom_extract() — the device list, read from each block's DESIGNATION attribute (a block
+   without one is skipped and counted, never guessed).
+9. drawing_critique(focus=None) — drafting checks only (layers, lineweights, text, overlaps).
+10. drawing_finalize(save_path=...).
 """
 
 

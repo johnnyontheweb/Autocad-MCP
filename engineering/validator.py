@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backends.quarantine import DOCUMENT_REFUSALS
+
+from .qa_scan import qa_snapshot
+from .understand.snapshot import dxf_version_of
+
 if TYPE_CHECKING:
     from backends.base import AutoCADBackend
 
@@ -86,6 +91,30 @@ class ValidationResult:
         }
 
 
+def _delivered_findings(path: str) -> list[ValidationFinding]:
+    """Step 6 in a delivery: the bundle's canonical DXF exists and is a DXF."""
+    target = Path(path)
+    if not target.is_file():
+        return [
+            ValidationFinding(
+                "error",
+                "delivery_artifact_missing",
+                f"The delivered DXF is not on disk: {target}",
+                {"path": str(target)},
+            )
+        ]
+    if target.stat().st_size == 0 or dxf_version_of(target) is None:
+        return [
+            ValidationFinding(
+                "error",
+                "delivery_artifact_unreadable",
+                f"The delivered DXF has no $ACADVER header: {target}",
+                {"path": str(target)},
+            )
+        ]
+    return []
+
+
 class DrawingValidator:
     """8-step pre-completion validator."""
 
@@ -94,60 +123,80 @@ class DrawingValidator:
         backend: AutoCADBackend,
         *,
         expected: dict | None = None,
+        shared: dict | None = None,
+        delivered_path: str | None = None,
     ) -> ValidationResult:
-        """Run all 8 checks; return aggregate ValidationResult."""
+        """Run all 8 checks; return aggregate ValidationResult.
+
+        Steps 1, 2, 4 and 5 read the run's all-spaces QA snapshot
+        (``engineering/qa_scan.py``): every entity of every space, by its DXF
+        type name on both engines. ``shared`` is that run's context - pass the
+        dict ``run_critique`` will receive so a finalize reads the drawing
+        once. A read that did not cover the drawing is an ``error`` finding
+        ``scan_incomplete``; a step that raises is a finding naming the step;
+        a quarantine refusal, or a live active-document switch, propagates
+        (``DOCUMENT_REFUSALS``). Nothing is swallowed.
+
+        ``delivered_path`` is the delivery context (``drawing_deliver``): the
+        bundle's canonical DXF. Steps 6 and 8 then check that file - on disk,
+        not empty, a ``$ACADVER`` header - instead of the open document's saved
+        flag and path, because a delivery exports a copy and never saves or
+        re-points the document.
+        """
 
         findings: list[ValidationFinding] = []
         expected = expected or {}
-        ents: list = []
+        if shared is None:
+            shared = {}
+        records: tuple = ()
+
+        snap, coverage = await qa_snapshot(backend, shared)
+        if snap is not None:
+            records = snap.records
+        if not coverage.complete:
+            findings.append(
+                ValidationFinding(
+                    "error",
+                    "scan_incomplete",
+                    f"The drawing was not read in full: {coverage.reason}",
+                    coverage.to_dict(),
+                )
+            )
 
         # 1 — fake dimensions
-        try:
-            ents = await backend.entity_list(limit=10000)
-            text_likes = [
-                e
-                for e in ents
-                if e.type in ("TEXT", "MTEXT")
-                and looks_like_dimension(getattr(e, "properties", {}).get("text", "") or "")
-            ]
-            real_dims = [e for e in ents if e.type in REAL_DIMENSION_TYPES]
-            if text_likes:
-                findings.append(
-                    ValidationFinding(
-                        "warning",
-                        "fake_dimension_text",
-                        f"{len(text_likes)} TEXT/MTEXT entities look like dimensions "
-                        "(Ø, ±, R, etc.) — use dimension_* tools instead",
-                        {
-                            "sample_handles": [t.handle for t in text_likes[:5]],
-                            "real_dim_count": len(real_dims),
-                        },
-                    )
-                )
-        except Exception as exc:
+        text_likes = [
+            r for r in records if r.type in ("TEXT", "MTEXT") and looks_like_dimension(r.text or "")
+        ]
+        real_dims = [r for r in records if r.type in REAL_DIMENSION_TYPES]
+        if text_likes:
             findings.append(
                 ValidationFinding(
                     "warning",
-                    "dim_check_failed",
-                    str(exc),
+                    "fake_dimension_text",
+                    f"{len(text_likes)} TEXT/MTEXT entities look like dimensions "
+                    "(Ø, ±, R, etc.) — use dimension_* tools instead",
+                    {
+                        "sample_handles": [t.handle for t in text_likes[:5]],
+                        "real_dim_count": len(real_dims),
+                    },
                 )
             )
 
         # 2 — hidden orphans
-        try:
-            hidden = [e for e in ents if not e.visible]
-            if hidden:
-                findings.append(
-                    ValidationFinding(
-                        "error",
-                        "hidden_orphans",
-                        f"{len(hidden)} entities have visible=False — hide-fallback "
-                        "is forbidden, use entity_delete",
-                        {"sample_handles": [h.handle for h in hidden[:5]]},
-                    )
+        hidden = [r for r in records if not r.visible]
+        if hidden:
+            findings.append(
+                ValidationFinding(
+                    "error",
+                    "hidden_orphans",
+                    f"{len(hidden)} entities have visible=False — hide-fallback "
+                    "is forbidden, use entity_delete",
+                    {
+                        "sample_handles": [h.handle for h in hidden[:5]],
+                        "spaces": sorted({h.space for h in hidden}),
+                    },
                 )
-        except Exception:
-            pass
+            )
 
         # 3 — linetypes
         try:
@@ -162,6 +211,8 @@ class DrawingValidator:
                         {"missing": missing},
                     )
                 )
+        except DOCUMENT_REFUSALS:
+            raise
         except Exception as exc:
             findings.append(
                 ValidationFinding(
@@ -173,7 +224,7 @@ class DrawingValidator:
 
         # 4 — gear views (heuristic, only if expected demands)
         if expected.get("must_have_bore") or expected.get("must_have_keyway"):
-            bore_circles = [e for e in ents if e.type == "CIRCLE" and e.layer == "GEOMETRY"]
+            bore_circles = [r for r in records if r.type == "CIRCLE" and r.layer == "GEOMETRY"]
             if expected.get("must_have_bore") and len(bore_circles) < 1:
                 findings.append(
                     ValidationFinding(
@@ -186,11 +237,11 @@ class DrawingValidator:
             # on GEOMETRY — requiring `closed` here made this a permanent
             # false-negative. Match a small (3-6 point) polyline, open or closed.
             keyway_polys = [
-                e
-                for e in ents
-                if e.type in ("LWPOLYLINE", "POLYLINE")
-                and e.layer == "GEOMETRY"
-                and 3 <= len(e.properties.get("points", [])) <= 6
+                r
+                for r in records
+                if r.type in ("LWPOLYLINE", "POLYLINE")
+                and r.layer == "GEOMETRY"
+                and 3 <= len(r.points) <= 6
             ]
             if expected.get("must_have_keyway") and len(keyway_polys) < 1:
                 findings.append(
@@ -209,17 +260,17 @@ class DrawingValidator:
             # TITLEBLOCK layer); fall back to all TEXT-layer text if no title
             # layer carries any text.
             title_block_texts = [
-                e.properties.get("text", "") or ""
-                for e in ents
-                if e.type in ("TEXT", "MTEXT") and e.layer in _TITLE_LAYERS
+                r.text or ""
+                for r in records
+                if r.type in ("TEXT", "MTEXT") and r.layer in _TITLE_LAYERS
             ]
             if title_block_texts:
                 title_texts = title_block_texts
             else:
                 title_texts = [
-                    e.properties.get("text", "") or ""
-                    for e in ents
-                    if e.type in ("TEXT", "MTEXT") and e.layer == "TEXT"
+                    r.text or ""
+                    for r in records
+                    if r.type in ("TEXT", "MTEXT") and r.layer == "TEXT"
                 ]
             joined = " | ".join(title_texts)
             # R27 — whole-word matching so "SPURIOUS" no longer trips SPUR.
@@ -244,7 +295,50 @@ class DrawingValidator:
                     )
                 )
 
-        # 6 — saved to disk
+        # 6 — saved to disk (in a delivery: the delivered DXF)
+        if delivered_path is not None:
+            findings.extend(_delivered_findings(delivered_path))
+        else:
+            await self._saved_step(backend, findings)
+
+        # 7 — screenshot
+        try:
+            shot = await backend.view_screenshot()
+            if not shot:
+                findings.append(
+                    ValidationFinding(
+                        "info",
+                        "screenshot_unavailable",
+                        "Screenshot returned no bytes (ezdxf needs matplotlib install)",
+                    )
+                )
+        except DOCUMENT_REFUSALS:
+            raise
+        except Exception as exc:
+            findings.append(
+                ValidationFinding(
+                    "info",
+                    "screenshot_failed",
+                    str(exc),
+                )
+            )
+
+        # 8 — dwg path returned (in a delivery the delivered DXF is the path)
+        if delivered_path is None:
+            await self._path_step(backend, findings)
+
+        summary = {
+            sev: sum(1 for f in findings if f.severity == sev)
+            for sev in ("error", "warning", "info")
+        }
+        return ValidationResult(
+            ok=summary["error"] == 0,
+            findings=findings,
+            summary=summary,
+        )
+
+    @staticmethod
+    async def _saved_step(backend: AutoCADBackend, findings: list[ValidationFinding]) -> None:
         try:
             info = await backend.drawing_info()
             saved_attr = getattr(info, "saved", None)
@@ -266,6 +360,8 @@ class DrawingValidator:
                         f"Drawing reports saved=True but file not on disk: {full_path}",
                     )
                 )
+        except DOCUMENT_REFUSALS:
+            raise
         except Exception as exc:
             findings.append(
                 ValidationFinding(
@@ -275,27 +371,8 @@ class DrawingValidator:
                 )
             )
 
-        # 7 — screenshot
-        try:
-            shot = await backend.view_screenshot()
-            if not shot:
-                findings.append(
-                    ValidationFinding(
-                        "info",
-                        "screenshot_unavailable",
-                        "Screenshot returned no bytes (ezdxf needs matplotlib install)",
-                    )
-                )
-        except Exception as exc:
-            findings.append(
-                ValidationFinding(
-                    "info",
-                    "screenshot_failed",
-                    str(exc),
-                )
-            )
-
-        # 8 — dwg path returned
+    @staticmethod
+    async def _path_step(backend: AutoCADBackend, findings: list[ValidationFinding]) -> None:
         try:
             info = await backend.drawing_info()
             if not getattr(info, "full_path", ""):
@@ -306,15 +383,13 @@ class DrawingValidator:
                         "drawing_info.full_path is empty",
                     )
                 )
-        except Exception:
-            pass
-
-        summary = {
-            sev: sum(1 for f in findings if f.severity == sev)
-            for sev in ("error", "warning", "info")
-        }
-        return ValidationResult(
-            ok=summary["error"] == 0,
-            findings=findings,
-            summary=summary,
-        )
+        except DOCUMENT_REFUSALS:
+            raise
+        except Exception as exc:
+            findings.append(
+                ValidationFinding(
+                    "warning",
+                    "path_check_failed",
+                    str(exc),
+                )
+            )

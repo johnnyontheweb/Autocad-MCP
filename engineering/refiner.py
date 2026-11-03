@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import anyio
+
+from .changes.preview import RevisionWatch, check_preconditions, make_preview
+from .critique import CHECK_FAILED, SCAN_INCOMPLETE
 from .plan_spec import Issue
 from .repairs import (
     repair_construction_left,
@@ -23,6 +28,8 @@ if TYPE_CHECKING:
     from backends.base import AutoCADBackend
 
 RepairHandler = Callable[["AutoCADBackend", Issue], Awaitable[dict]]
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,15 +79,26 @@ class RefineResult:
     final_score: float
     rounds: list[RefineRound]
     remaining_issues: list[dict]
+    #: A dry run's ChangePreview (``ChangePreview.to_dict()``).
+    preview: dict | None = None
+    #: A dry run's answer to "would an apply at this min_score stop at once?".
+    threshold_met: bool | None = None
+    #: A guarded apply's ``RevisionWatch.report()``.
+    revision: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "status": self.status,
             "initial_score": self.initial_score,
             "final_score": self.final_score,
             "rounds": [item.to_dict() for item in self.rounds],
             "remaining_issues": list(self.remaining_issues),
         }
+        for key in ("preview", "threshold_met", "revision"):
+            value = getattr(self, key)
+            if value is not None:
+                payload[key] = value
+        return payload
 
 
 class RepairRegistry:
@@ -99,6 +117,19 @@ class RepairRegistry:
 
     def get(self, focus: str) -> RepairHandler | None:
         return self._handlers.get(focus)
+
+
+#: ``Issue.detail["code"]`` values that are not findings: a check that raised,
+#: or a read that did not cover the drawing. They carry no handles and no
+#: layer, so no repair handler can act on them - sent to one, it raised and the
+#: whole round rolled back, the valid repairs beside it included (W1 review).
+UNREPAIRABLE_CODES = frozenset({CHECK_FAILED, SCAN_INCOMPLETE})
+
+
+def unrepairable_code(issue: Issue) -> str | None:
+    """The issue's ``detail["code"]`` when it is one of ``UNREPAIRABLE_CODES``."""
+    code = (issue.detail or {}).get("code")
+    return code if code in UNREPAIRABLE_CODES else None
 
 
 def issue_fingerprint(issue: Issue) -> str:
@@ -127,26 +158,41 @@ async def refine_drawing(
     dry_run: bool = False,
     *,
     registry: RepairRegistry | None = None,
+    expected_revision: int | None = None,
+    preconditions: list[dict] | None = None,
 ) -> RefineResult:
-    """Apply deterministic repairs without allowing quality to regress."""
+    """Apply deterministic repairs without allowing quality to regress.
+
+    ``dry_run`` returns the plan and its ChangePreview (``preview``: the
+    revision and the exact fingerprints of every handle a planned repair
+    touches) - also when the score already meets ``min_score``, which
+    ``threshold_met`` then says. An apply given ``expected_revision`` and/or
+    ``preconditions`` (a dry run's ``preview``) checks them before the first
+    critique and raises ``StaleRevisionError`` (kind ``stale_revision``) with
+    nothing changed when the document moved; its result carries ``revision``,
+    the RevisionWatch report of changes interleaved between its own calls. A
+    dry run ignores both.
+    """
     max_rounds = max(1, min(3, int(max_rounds)))
     min_score = max(0.0, min(100.0, float(min_score)))
     registry = registry or RepairRegistry(defaults=True)
     allowed = set(allowed_repairs) if allowed_repairs is not None else None
+    watch: RevisionWatch | None = None
+    if not dry_run and (expected_revision is not None or preconditions is not None):
+        await check_preconditions(
+            backend, expected_revision=expected_revision, preconditions=preconditions
+        )
+        watch = await RevisionWatch.begin(backend)
 
     issues = await backend.drawing_critique(focus)
     initial_score, _initial_errors = _metrics(issues)
     rounds: list[RefineRound] = []
 
-    if initial_score >= min_score:
-        return RefineResult(
-            "threshold_met", initial_score, initial_score, [], [item.to_dict() for item in issues]
-        )
-
     if dry_run:
         actions = []
         for issue in issues:
-            handler = registry.get(issue.focus)
+            code = unrepairable_code(issue)
+            handler = registry.get(issue.focus) if code is None else None
             permitted = allowed is None or issue.focus in allowed
             actions.append(
                 RepairAction(
@@ -154,17 +200,56 @@ async def refine_drawing(
                     issue_fingerprint(issue),
                     list(issue.handles),
                     "planned" if handler is not None and permitted else "manual_required",
+                    {"code": code} if code is not None else {},
                 )
             )
         score, errors = _metrics(issues)
         rounds.append(RefineRound(1, score, score, errors, errors, "not_started", actions))
-        return RefineResult("dry_run", initial_score, score, rounds, [i.to_dict() for i in issues])
+        preview = await make_preview(
+            backend,
+            handles=sorted({h for a in actions if a.status == "planned" for h in a.handles}),
+            planned=[action.to_dict() for action in actions],
+        )
+        return RefineResult(
+            "dry_run",
+            initial_score,
+            score,
+            rounds,
+            [i.to_dict() for i in issues],
+            preview=preview.to_dict(),
+            threshold_met=initial_score >= min_score,
+        )
+
+    if initial_score >= min_score:
+        return RefineResult(
+            "threshold_met",
+            initial_score,
+            initial_score,
+            [],
+            [item.to_dict() for item in issues],
+            revision=None if watch is None else watch.report(),
+        )
 
     status = "max_rounds"
     for number in range(1, max_rounds + 1):
         score_before, errors_before = _metrics(issues)
         candidates: list[tuple[Issue, RepairHandler]] = []
+        # A check_failed / scan_incomplete issue is reported, never repaired:
+        # the round's real repairs go ahead beside it.
+        manual: list[RepairAction] = []
         for issue in issues:
+            code = unrepairable_code(issue)
+            if code is not None:
+                manual.append(
+                    RepairAction(
+                        issue.focus,
+                        issue_fingerprint(issue),
+                        list(issue.handles),
+                        "manual_required",
+                        {"code": code},
+                    )
+                )
+                continue
             handler = registry.get(issue.focus)
             if handler is not None and (allowed is None or issue.focus in allowed):
                 candidates.append((issue, handler))
@@ -172,9 +257,20 @@ async def refine_drawing(
             status = "manual_required"
             break
 
-        transaction = await backend.transaction_begin()
-        actions: list[RepairAction] = []
+        # B01: the begin runs shielded, so its outcome is always known: a
+        # cancelled begin's worker would still push the checkpoint (the lease
+        # follows the worker) and nothing would close it. A cancellation that
+        # arrived meanwhile is delivered by the checkpoint at the top of the
+        # try below, whose handler rolls the round back.
+        if watch is not None:
+            await watch.before(f"round {number}: transaction_begin")
+        with anyio.CancelScope(shield=True):
+            transaction = await backend.transaction_begin()
+        if watch is not None:
+            await watch.after()
+        actions: list[RepairAction] = list(manual)
         if not isinstance(transaction, dict) or not transaction.get("ok"):
+            await anyio.lowlevel.checkpoint_if_cancelled()
             detail = transaction if isinstance(transaction, dict) else {"result": transaction}
             actions.append(RepairAction("internal", "", [], "failed", detail))
             rounds.append(
@@ -191,8 +287,13 @@ async def refine_drawing(
             status = "transaction_unavailable"
             break
         try:
+            await anyio.lowlevel.checkpoint_if_cancelled()
             for issue, handler in candidates:
+                if watch is not None:
+                    await watch.before(f"round {number}: repair {issue.focus}")
                 detail = await handler(backend, issue)
+                if watch is not None:
+                    await watch.after()
                 actions.append(
                     RepairAction(
                         issue.focus,
@@ -204,8 +305,28 @@ async def refine_drawing(
                 )
             after = await backend.drawing_critique(focus)
             score_after, errors_after = _metrics(after)
-        except Exception as exc:
-            await backend.transaction_rollback()
+        except BaseException as exc:
+            # B01: a cancellation is a BaseException; `except Exception` let it
+            # leave the round's repairs inside an open transaction. The
+            # rollback is shielded (engineering/pid/spec.py explains why) and,
+            # after anything but an ordinary error, a failed rollback is
+            # logged rather than raised over the cancellation.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await backend.transaction_rollback()
+                except Exception as rollback_exc:
+                    if isinstance(exc, Exception):
+                        raise
+                    log.error(
+                        "drawing_refine: rollback after %s failed (%s: %s); the round's "
+                        "repairs may still be in the drawing - check system_status and "
+                        "transaction_rollback before retrying",
+                        type(exc).__name__,
+                        type(rollback_exc).__name__,
+                        rollback_exc,
+                    )
+            if not isinstance(exc, Exception):
+                raise
             actions.append(RepairAction("internal", "", [], "failed", {"error": str(exc)}))
             rounds.append(
                 RefineRound(
@@ -223,7 +344,11 @@ async def refine_drawing(
             break
 
         if score_after < score_before or errors_after > errors_before:
+            if watch is not None:
+                await watch.before(f"round {number}: transaction_rollback")
             await backend.transaction_rollback()
+            if watch is not None:
+                await watch.after()
             rounds.append(
                 RefineRound(
                     number,
@@ -239,7 +364,11 @@ async def refine_drawing(
             issues = await backend.drawing_critique(focus)
             break
 
+        if watch is not None:
+            await watch.before(f"round {number}: transaction_commit")
         await backend.transaction_commit()
+        if watch is not None:
+            await watch.after()
         rounds.append(
             RefineRound(
                 number,
@@ -268,4 +397,5 @@ async def refine_drawing(
         final_score,
         rounds,
         [item.to_dict() for item in issues],
+        revision=None if watch is None else watch.report(),
     )
