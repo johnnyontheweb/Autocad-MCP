@@ -19,12 +19,11 @@ import re
 import sys
 import time
 from dataclasses import asdict
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import anyio
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.server.lifespan import lifespan
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
@@ -34,17 +33,62 @@ from fastmcp.tools.tool import ToolResult
 from pydantic import Field
 
 import config
-from backends.base import BlockInfo, EntityInfo, LayerInfo
+import http_guard
+import policy
+from backends.base import (
+    LINEWEIGHT_HELP,
+    LINEWEIGHT_LAYER_NOTE,
+    BlockInfo,
+    EntityInfo,
+    LayerInfo,
+    Lineweight,
+)
+from backends.journal_store import open_journal, state_store_status
 from backends.operations import (
     CURRENT_OPERATION,
     OperationConflictError,
     OperationJournal,
     RequiresReconcileError,
 )
-from discovery.aliases import aliases_for
+from backends.session_metrics import SESSION_METRICS, result_text_bytes
+from discovery.aliases import aliases_for, tools_for_command
+from discovery.descriptions import record_wire_description
+from engineering.errors import (
+    ERROR_KINDS,
+    CommandRefusedError,
+    GateFailure,
+    annotate,
+    capability_of,
+    cause_chain,
+    classify,
+    compact_message,
+    describe,
+    document_changed_of,
+    gate_failure_payload,
+    quarantine_of,
+    refusal_kind,
+    refusal_message,
+    retryable_for,
+    short_message,
+    stale_of,
+)
 from engineering.fits import fit_lookup
 from engineering.measure import is_self_intersecting, polygon_area_perimeter
-from security import sanitize_command, sanitize_lisp, validate_path
+from security import (
+    DIRECTORY,
+    KINDS_DRAWING,
+    KINDS_DWG,
+    KINDS_DXF,
+    KINDS_IMAGE,
+    KINDS_PDF,
+    KINDS_REPORT,
+    KINDS_TABLE,
+    KINDS_TEMPLATE,
+    command_verbs,
+    sanitize_command,
+    sanitize_lisp,
+    validate_path,
+)
 from version import __version__
 
 # ---------------------------------------------------------------------------
@@ -145,16 +189,28 @@ async def autocad_lifespan(server):
     except Exception as exc:  # profile trouble must never block startup
         log.warning("Tool profile could not be applied: %s", exc)
     backend = None
-    # B12: the operation journal lives as long as the server: in memory, so a
-    # restart forgets every operation id (B13 makes it durable in 1.8.0).
-    operations = OperationJournal()
+    # B12/B13: one operation journal per server, written through to
+    # <ACADMCP_STATE_DIR>/journal.sqlite3 so a client id replays after a restart
+    # (backends/journal_store.py). It never fails startup: a refused folder or
+    # an unusable file leaves it in memory, reported by system_status.state_store.
+    operations = open_journal(is_read_only=_read_only_tool)
+    # 1.8-04: saves a dead process left half done are resolved before any
+    # call (backends/atomic_write.py); system_status reports them.
+    save_recovery = _resolve_interrupted_saves()
     try:
         backend = await _make_backend()
         log.info("Backend ready: %s", backend.name)
+        # A reopened file never re-issues a revision the journal saw (lineage).
+        if hasattr(backend, "revision_high_lookup"):
+            backend.revision_high_lookup = getattr(operations, "max_revision", None)
+        # 1.8-08: drawing_open reports the calls a reopened file no longer holds.
+        if hasattr(backend, "lost_since_save_lookup"):
+            backend.lost_since_save_lookup = getattr(operations, "lost_since_save", None)
         context: dict = {"backend": backend, "operations": operations}
     except Exception as exc:
         log.error("Backend initialization failed: %s", exc)
         context = {"backend": None, "init_error": str(exc), "operations": operations}
+    context["save_recovery"] = save_recovery
     # One yield, outside the try that builds the backend: an exception thrown
     # into the generator at shutdown must reach `finally`, not a second yield.
     try:
@@ -163,6 +219,20 @@ async def autocad_lifespan(server):
         log.info("AutoCAD MCP Pro shutting down")
         if backend is not None:
             await _disconnect_backend(backend)
+        closer = getattr(operations, "close", None)
+        if callable(closer):
+            closer()
+
+
+def _resolve_interrupted_saves() -> list[dict]:
+    """Every pending save marker of a dead process, resolved (never fails startup)."""
+    try:
+        from backends.atomic_write import resolve_pending
+
+        return resolve_pending()
+    except Exception as exc:  # recovery is reported, never a reason not to start
+        log.error("Interrupted saves could not be resolved: %s", exc)
+        return [{"outcome": "unresolved", "error": f"{type(exc).__name__}: {exc}"}]
 
 
 async def _disconnect_backend(backend) -> None:
@@ -202,37 +272,100 @@ class AuditMiddleware(Middleware):
     ``operation_conflict`` for another request. A call re-entering the
     middleware (the search proxy's ``call_tool``) reuses the id already set:
     one request, one record.
+
+    1.8-14: every top-level call is also counted for its connection
+    (``backends/session_metrics.py``) - the call, its tool, the bytes of text
+    it returned, its error kind, its latency - read by
+    ``system_status(metrics=True)``. A re-entering call is not counted again.
     """
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
+        if CURRENT_OPERATION.get() is not None:
+            return await self._journalled(context, call_next)
+        # by_tool counts what really ran: the search proxy's call_tool names it
+        tool_name = _effective_tool(
+            context.message.name, dict(getattr(context.message, "arguments", None) or {})
+        )
+        start = time.monotonic()
+        try:
+            result = await self._journalled(context, call_next)
+        except BaseException as exc:
+            _count_call(context, tool_name, start, None, exc)
+            raise
+        _count_call(context, tool_name, start, result, None)
+        return result
+
+    async def _journalled(self, context: MiddlewareContext, call_next):
         tool_name = context.message.name
         start = time.monotonic()
+        # getattr: a hand-built context (tests/test_cancel_rollbacks.py) has no arguments.
+        arguments = dict(getattr(context.message, "arguments", None) or {})
+        effective = _effective_tool(tool_name, arguments)
+        # 1.8-17: the tool policy, before any record is opened - on the tool the
+        # call really runs (call_tool's target), under this request's ceiling
+        # (a read-only token holds it to `read`).
+        ceiling_token = policy.REQUEST_CEILING.set(
+            _request_token_ceiling() or policy.REQUEST_CEILING.get()
+        )
+        tool_token = policy.CURRENT_TOOL.set(effective)
+        try:
+            refused = _policy_refusal(effective)
+            if refused is not None:
+                elapsed = (time.monotonic() - start) * 1000
+                log.warning("TOOL ERR %-40s %6.1fms  (policy_refused)", tool_name, elapsed)
+                return _journal_refusal(context, "policy_refused", str(refused), refused.fields())
+            return await self._call(context, call_next, tool_name, start, arguments, effective)
+        finally:
+            policy.CURRENT_TOOL.reset(tool_token)
+            policy.REQUEST_CEILING.reset(ceiling_token)
+
+    async def on_list_tools(self, context: MiddlewareContext, call_next):
+        """A read-only token's catalog: the tools its `read` ceiling lets it call (1.8-17).
+
+        The server-wide policy already shrank the catalog (the profile
+        visibility transform); only a per-request ceiling filters here.
+        """
+        tools = await call_next(context)
+        limit = _request_token_ceiling()
+        if limit is None:
+            return tools
+        token = policy.REQUEST_CEILING.set(limit)
+        try:
+            return [tool for tool in tools if _policy_refusal(tool.name, tool) is None]
+        finally:
+            policy.REQUEST_CEILING.reset(token)
+
+    async def _call(self, context, call_next, tool_name, start, arguments, effective):
         if CURRENT_OPERATION.get() is not None:
             return await self._logged(context, call_next, tool_name, start)
         lifespan = _lifespan_context_or_none(context)
         journal = _operations_journal(lifespan)
         backend = lifespan.get("backend") if lifespan is not None else None
-        # getattr: a hand-built context (tests/test_cancel_rollbacks.py) has no arguments.
-        arguments = dict(getattr(context.message, "arguments", None) or {})
-        effective = _effective_tool(tool_name, arguments)
         try:
-            supplied = _client_operation_id(tool_name, arguments, _request_meta(context))
+            meta = _request_meta(context)
+            supplied = _client_operation_id(tool_name, arguments, meta)
+            label = _client_label(tool_name, arguments, meta)
             record, replay = journal.begin(
-                tool_name, arguments, operation_id=supplied, document=_identity_of(backend)
+                tool_name,
+                arguments,
+                operation_id=supplied,
+                document=_identity_of(backend),
+                label=label,
             )
         except (OperationConflictError, RequiresReconcileError) as exc:
             elapsed = (time.monotonic() - start) * 1000
             log.warning("TOOL ERR %-40s %6.1fms  (%s)", tool_name, elapsed, exc.kind)
-            payload = {**exc.to_dict(), "tool": tool_name}
-            return ToolResult(content=str(exc), structured_content=payload, is_error=True)
+            return _journal_refusal(context, exc.kind, str(exc), exc.to_dict())
         except ValueError as exc:
             elapsed = (time.monotonic() - start) * 1000
             log.warning("TOOL ERR %-40s %6.1fms  (invalid operation id)", tool_name, elapsed)
-            payload = {"ok": False, "kind": "invalid_args", "error": str(exc), "tool": tool_name}
-            return ToolResult(content=str(exc), structured_content=payload, is_error=True)
+            return _journal_refusal(context, "invalid_args", str(exc), {"error": str(exc)})
         if replay is not None:
             log.info("TOOL REPLAY %-37s %s", tool_name, record.operation_id)
             return _replayed_result(replay, record.operation_id)
+        # 1.8-10: what a mutating call added and deleted, for its journal row
+        # (cad_batch sums its steps' own; backends/change_sets.py).
+        mark = _change_mark(backend, effective)
         token = CURRENT_OPERATION.set(record.operation_id)
         try:
             result = await self._logged(context, call_next, tool_name, start)
@@ -246,15 +379,26 @@ class AuditMiddleware(Middleware):
             raise
         except Exception as exc:
             state, kind = _exception_outcome(backend, record.operation_id, effective, exc)
+            kept = None if retryable_for(kind, state) else exc
             journal.finish(
-                record, state, result=exc, error_kind=kind, document=_identity_of(backend)
+                record,
+                state,
+                result=kept,
+                error_kind=kind,
+                document=_identity_of(backend),
+                changes=_change_summary(backend, effective, mark, None),
             )
             raise
         finally:
             CURRENT_OPERATION.reset(token)
-        state, kind = _result_outcome(effective, result)
+        state, kind = _result_outcome(effective, result, backend, record.operation_id)
         journal.finish(
-            record, state, result=result, error_kind=kind, document=_identity_of(backend)
+            record,
+            state,
+            result=None if _retryable_result(result) else result,
+            error_kind=kind,
+            document=_identity_of(backend),
+            changes=_change_summary(backend, effective, mark, result),
         )
         return result
 
@@ -267,7 +411,16 @@ class AuditMiddleware(Middleware):
             # (see CapabilityRefusalMiddleware), so control flow alone would
             # log it as TOOL OK.
             if getattr(result, "is_error", False):
-                log.warning("TOOL ERR %-40s %6.1fms  (refused)", tool_name, elapsed)
+                structured = getattr(result, "structured_content", None)
+                kind = structured.get("kind") if isinstance(structured, dict) else None
+                message = structured.get("message") if isinstance(structured, dict) else None
+                log.warning(
+                    "TOOL ERR %-40s %6.1fms  (%s) %s",
+                    tool_name,
+                    elapsed,
+                    kind or "refused",
+                    message or "",
+                )
             else:
                 log.info("TOOL OK  %-40s %6.1fms", tool_name, elapsed)
             return result
@@ -294,14 +447,87 @@ _RAN_PAST_THE_CALLER = frozenset(
 )
 
 #: The record state for an error kind. Every kind not listed declined before
-#: doing its work, so it is ``refused``.
+#: doing its work, so it is ``refused``. 1.8-02: ``internal`` (a bug mid-call),
+#: ``command_incomplete`` (a command left at a prompt) and the finalize gates
+#: (the gate ran - and may have saved - then found the drawing wanting) did work.
+#: 1.8-04's kinds are listed by name, the refusals too, so each decision is
+#: visible: a damaged or DWG source is refused before anything is opened, a
+#: save onto a recovered source before anything is written, and a locked
+#: target is left untouched by the atomic protocol (tmp and marker removed) -
+#: ``refused``. A save whose written copy failed its check, or that broke on
+#: the way, was attempted - ``failed``. ``process_exit`` is the journal's own
+#: kind for a row whose server died while it ran.
 _STATE_OF_KIND = {
     "failed": "failed",
     "timed_out": "failed",
+    "internal": "failed",
+    "command_incomplete": "failed",
+    "validation_failed": "failed",
+    "critique_gate_failed": "failed",
+    "failed_acceptance": "failed",
     "quarantined": "quarantined",
     "unknown_commit": "unknown_commit",
     "cancelled": "cancelled",
+    "damaged_drawing": "refused",
+    "recover_unsupported": "refused",
+    "recovered_source_protected": "refused",
+    "save_locked": "refused",
+    "save_verify_failed": "failed",
+    "save_failed": "failed",
+    "process_exit": "unknown_commit",
+    # K1: no route converted the DWG; nothing was opened.
+    "dwg_conversion_failed": "refused",
 }
+
+
+#: The metrics key of a call with no MCP session (a direct call in a test).
+_NO_SESSION = "_no_session"
+
+
+def _session_key(fastmcp_context) -> str:
+    """The connection a call belongs to: fastmcp's session id, stable per session."""
+    try:
+        return str(fastmcp_context.session_id)
+    except Exception:  # no request context: a direct call
+        return _NO_SESSION
+
+
+def _count_call(context, tool: str, start: float, result, exc: BaseException | None) -> None:
+    """Count one top-level call for its connection (1.8-14); never fails the call."""
+    try:
+        elapsed = (time.monotonic() - start) * 1000.0
+        if exc is not None:
+            kind = "cancelled" if isinstance(exc, asyncio.CancelledError) else None
+            kind = kind or classify(exc)["kind"]
+            size = 0
+        else:
+            kind = None
+            if getattr(result, "is_error", False):
+                structured = getattr(result, "structured_content", None)
+                found = structured.get("kind") if isinstance(structured, dict) else None
+                kind = str(found or "refused")
+            size = result_text_bytes(result)
+        session = _session_key(getattr(context, "fastmcp_context", None))
+        SESSION_METRICS.record(session, tool, elapsed, size, kind)
+    except Exception as error:  # metrics are evidence, never a reason to fail a call
+        log.debug("session metrics: %s", error)
+
+
+def _metrics_payload(ctx, backend) -> dict:
+    """``system_status(metrics=True)``: the connection's counters and the COM breakdown."""
+    payload = {"session": SESSION_METRICS.snapshot(_session_key(ctx))}
+    reader = getattr(backend, "run_metrics", None)
+    if callable(reader):
+        payload["com_run"] = reader()
+        payload["com_run_reason"] = None
+    else:
+        payload["com_run"] = None
+        payload["com_run_reason"] = (
+            "headless engine: no STA job queue to break down"
+            if backend is not None
+            else "no backend"
+        )
+    return payload
 
 
 def _lifespan_context_or_none(context) -> dict | None:
@@ -325,11 +551,57 @@ def _request_meta(context):
         return None
 
 
+def _request_meta_of(ctx):
+    """A tool's view of the request's ``_meta`` (1.8-10: ``_meta.label``), or None."""
+    try:
+        return ctx.request_context.meta
+    except Exception:  # no request context: a direct call
+        return None
+
+
 def _effective_tool(tool: str, arguments: dict) -> str:
     """The tool a call really runs: the search proxy's ``call_tool`` names it."""
     if tool == "call_tool" and isinstance(arguments.get("name"), str):
         return arguments["name"]
     return tool
+
+
+def _request_token_ceiling() -> str | None:
+    """``"read"`` for a request authenticated with the read-only token (1.8-17).
+
+    No verifier, no token: stdio and an unauthenticated loopback server skip
+    the lookup entirely.
+    """
+    if _auth is None:
+        return None
+    return http_guard.token_ceiling()
+
+
+def _tool_card(name: str, tool=None) -> dict | None:
+    """The ``@cad_tool`` card of ``name`` (from ``tool`` or the local registry), or
+    None when no such tool is registered. A registered tool without a card
+    answers ``{}`` - the policy judges it ``escape`` (fail closed)."""
+    component = tool
+    if component is None:
+        component = next((t for t in _local_tool_components() if t.name == name), None)
+    if component is None:
+        return None
+    return (getattr(component, "meta", None) or {}).get("cad") or {}
+
+
+def _policy_refusal(name: str, tool=None):
+    """The ``PolicyRefusedError`` the tool policy meets ``name`` with, or None (1.8-17).
+
+    Judged on the registered tool's own cost card, so a tool the policy hid
+    from the catalog is still refused by name (``policy_refused``), never as
+    an unknown tool. A name no tool carries is left to FastMCP's own answer.
+    """
+    if policy.REQUEST_CEILING.get() is None and not policy.restrictive():
+        return None
+    card = _tool_card(name, tool)
+    if card is None:
+        return None
+    return policy.refusal(name, card.get("cost"))
 
 
 def _client_operation_id(tool: str, arguments: dict, meta) -> str | None:
@@ -349,14 +621,113 @@ def _client_operation_id(tool: str, arguments: dict, meta) -> str | None:
     return from_meta if from_meta is not None else from_args
 
 
+#: 1.8-10: the tools whose own ``label`` argument labels their journal row.
+_LABELLED_TOOLS = frozenset({"cad_batch", "checkpoint_create"})
+
+
+def _client_label(tool: str, arguments: dict, meta) -> str | None:
+    """A call's label (1.8-10): ``_meta.label`` on any request, else the
+    ``label`` argument of ``cad_batch`` / ``checkpoint_create`` (also through the
+    search proxy's ``call_tool``). ``ValueError`` when not 1-200 printable
+    characters - the middleware answers it ``invalid_args``."""
+    from backends.operations import validate_label
+
+    from_meta = getattr(meta, "label", None) if meta is not None else None
+    if from_meta is not None:
+        return validate_label(from_meta, source="_meta.label")
+    name, args = tool, arguments
+    if tool == "call_tool" and isinstance(arguments.get("arguments"), dict):
+        name, args = arguments.get("name"), arguments["arguments"]
+    if name in _LABELLED_TOOLS:
+        return validate_label(args.get("label"), source=f"{name}.label")
+    return None
+
+
+#: tool -> is it mutating (not readOnlyHint); the registry walk is not per call.
+_MUTATING_CACHE: dict[str, bool] = {}
+
+
+def _mutating_tool(tool: str) -> bool:
+    known = _MUTATING_CACHE.get(tool)
+    if known is None:
+        known = not _read_only_tool(tool)
+        _MUTATING_CACHE[tool] = known
+    return known
+
+
+def _change_mark(backend, tool: str):
+    """1.8-10: the backend's change mark before a mutating call (None otherwise).
+
+    ``cad_batch`` is marked step by step inside it, so not here. A backend
+    without ``change_mark`` (the live engine) is summarised from the handles
+    its result returns - ``"result"`` is the mark that says so.
+    """
+    if tool == "cad_batch" or backend is None or not _mutating_tool(tool):
+        return None
+    marker = getattr(backend, "change_mark", None)
+    if not callable(marker):
+        return "result"
+    try:
+        return marker()
+    except Exception:  # a summary is evidence, never a reason to fail a call
+        return None
+
+
+def _change_summary(backend, tool: str, mark, result) -> dict | None:
+    """``{added, deleted, counts, complete}`` of a call marked by ``_change_mark``."""
+    from backends.change_sets import summary_from_result
+
+    try:
+        if tool == "cad_batch":
+            payload = getattr(result, "structured_content", None)
+            if isinstance(payload, dict):
+                return payload.get("changes") or payload.get("partial_changes")
+            return None
+        if mark is None:
+            return None
+        if mark == "result":
+            return summary_from_result(result) if result is not None else None
+        return backend.change_summary(mark)
+    except Exception:  # evidence only
+        return None
+
+
 def _identity_of(backend) -> dict | None:
     reader = getattr(backend, "document_identity", None)
     if reader is None:
         return None
     try:
-        return reader()
+        identity = reader()
     except Exception:  # an identity is evidence, never a reason to fail a call
         return None
+    # 1.8-08: the journal row's checkpoint_before / checkpoint_after.
+    latest = getattr(backend, "latest_checkpoint", None)
+    if isinstance(identity, dict) and callable(latest):
+        try:
+            checkpoint = latest()
+        except Exception:  # evidence only
+            checkpoint = None
+        if checkpoint:
+            identity = {**identity, "checkpoint": checkpoint}
+    # 1.8-10: the row's lineage, which drawing_history filters by.
+    lineage = getattr(backend, "active_lineage", None)
+    if isinstance(identity, dict) and callable(lineage):
+        try:
+            found = lineage()
+        except Exception:  # evidence only
+            found = None
+        if found:
+            identity = {**identity, "lineage_id": found}
+    return identity
+
+
+async def _checkpoint_before(backend, tool: str) -> None:
+    """1.8-08: a durable checkpoint before a destructive tool (the live engine
+    exports one; the headless engine's are save / batch anchored). Never a
+    reason to fail the tool: the backend logs a checkpoint it could not take."""
+    taker = getattr(backend, "checkpoint_before", None)
+    if callable(taker):
+        await taker(tool)
 
 
 def _worker_outcome(backend, operation_id: str) -> str | None:
@@ -390,24 +761,36 @@ def _interrupted_state(backend, operation_id: str, tool: str) -> str:
     return "cancelled"
 
 
-def _exception_outcome(
-    backend, operation_id: str, tool: str, exc: BaseException
-) -> tuple[str, str]:
-    timed = _timeout_kind(backend, operation_id, tool)
+def _kind_outcome(backend, operation_id: str | None, tool: str, kind: str) -> tuple[str, str]:
+    """``(record state, error kind)`` for an error of ``kind`` (1.8-02).
+
+    A worker that outran its deadline overrides the kind: ``timed_out``, and a
+    write's record is ``unknown_commit`` - it may have landed.
+    """
+    timed = _timeout_kind(backend, operation_id, tool) if operation_id else None
     if timed == "unknown_commit":
         return "unknown_commit", "timed_out"
     if timed == "timed_out":
         return "failed", "timed_out"
-    kind = _classify_batch_error(exc)["kind"]
     return _STATE_OF_KIND.get(kind, "refused"), kind
 
 
-def _result_outcome(tool: str, result) -> tuple[str, str | None]:
+def _exception_outcome(
+    backend, operation_id: str, tool: str, exc: BaseException
+) -> tuple[str, str]:
+    return _kind_outcome(backend, operation_id, tool, classify(exc)["kind"])
+
+
+def _result_outcome(
+    tool: str, result, backend=None, operation_id: str | None = None
+) -> tuple[str, str | None]:
     structured = getattr(result, "structured_content", None)
     payload = structured if isinstance(structured, dict) else {}
     if getattr(result, "is_error", False):
+        # 1.8-02: every failure now arrives here as an enveloped result, so the
+        # state follows the kind, exactly as it did for a raised exception.
         kind = str(payload.get("kind") or "refused")
-        return ("quarantined" if kind == "quarantined" else "refused"), kind
+        return _kind_outcome(backend, operation_id, tool, kind)
     if tool == "cad_batch" and payload.get("dry_run") is False:
         if payload.get("ok") is True:
             return "committed", None
@@ -427,6 +810,19 @@ def _result_outcome(tool: str, result) -> tuple[str, str | None]:
     return "committed", None
 
 
+def _retryable_result(result) -> bool:
+    """An error envelope that says ``retryable: true`` (1.8-02).
+
+    Its record is kept, but not its answer: nothing was written, so the same
+    request under the same client ``operation_id`` must run again rather than
+    replay a refusal that tells the client to retry.
+    """
+    if not getattr(result, "is_error", False):
+        return False
+    structured = getattr(result, "structured_content", None)
+    return isinstance(structured, dict) and structured.get("retryable") is True
+
+
 def _replayed_result(stored, operation_id: str):
     """The recorded answer of ``operation_id``, marked ``replayed`` - nothing runs again."""
     if isinstance(stored, BaseException):
@@ -438,6 +834,9 @@ def _replayed_result(stored, operation_id: str):
     if not isinstance(structured, dict):
         return stored
     payload = {**structured, "replayed": True, "operation_id": operation_id}
+    if getattr(stored, "is_error", False):
+        # 1.8-02: a recorded error envelope replays with its own sentence.
+        return ToolResult(content=stored.content, structured_content=payload, is_error=True)
     return ToolResult(
         content=json.dumps(payload, ensure_ascii=False, default=str),
         structured_content=payload,
@@ -478,127 +877,177 @@ class CapabilityRefusalMiddleware(Middleware):
     v1.7.0 (B11) added a third kind: ``active_document_changed``, the live
     engine's refusal when AutoCAD's active document is not the bound one. It
     carries ``bound`` and ``active`` instead of a capability or a quarantine.
+
+    1.8-02 makes it the one error envelope: it no longer re-raises anything.
+    Every exception a tool call ends in is typed by ``engineering.errors.classify``
+    - the function ``cad_batch`` types a step with, so both routes give one kind
+    - and returned as ``ToolResult(is_error=True)`` whose structured content is
+    ``{ok: false, kind, category, retryable, hint, tool, backend, operation_id,
+    message, ...the kind's own fields}``. The text content is what the client
+    read before, byte for byte: the full sentence for the 1.7 refusal kinds,
+    and for everything else the text FastMCP's ``ErrorHandlingMiddleware``
+    used to put on the wire (``Internal error: ...``), computed by that same
+    middleware's transform. ``error`` stays on the 1.7 refusal kinds
+    (``_LEGACY_ERROR_KEY``) beside ``message``. ``retryable`` is true only when
+    the operation record is ``refused`` or ``cancelled`` - nothing was written.
     """
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         try:
             return await call_next(context)
         except Exception as exc:
-            # B12: a refusal names the operation it ended.
-            operation_id = CURRENT_OPERATION.get()
-            changed = _document_changed_of(exc)
-            if changed is not None:
-                # B11: not a capability boundary and not a quarantine - the
-                # operator switched AutoCAD's active document; nothing was written.
-                payload = {
-                    **changed,
-                    "tool": context.message.name,
-                    "backend": _backend_name_or_none(context),
-                }
-                if operation_id is not None:
-                    payload["operation_id"] = operation_id
-                return ToolResult(
-                    content=payload["error"], structured_content=payload, is_error=True
-                )
-            capability = _batch_capability_of(exc)
-            quarantine = None if capability else _batch_quarantine_of(exc)
-            stale = None if (capability or quarantine is not None) else _batch_stale_of(exc)
-            if capability is None and quarantine is None and stale is None:
-                raise  # not ours — leave it byte-for-byte as it was
-            message = _refusal_message(exc)
-            payload = {
-                "ok": False,
-                "error": message,
-                "tool": context.message.name,
-                "backend": _backend_name_or_none(context),
-            }
-            if operation_id is not None:
-                payload["operation_id"] = operation_id
-            if capability is not None:
-                payload["kind"] = "unsupported"
-                payload["capability"] = capability
-            elif stale is not None:
-                # Task 12: the preview no longer holds; nothing was changed.
-                payload["kind"] = "stale_revision"
-                for key in ("expected_revision", "actual_revision", "changed"):
-                    payload[key] = stale[key]
-            elif _batch_refusal_kind(exc) == "busy":
-                # A detached read holds the document: not untrusted, busy.
-                payload["kind"] = "busy"
-                payload["detached_read"] = quarantine
-            else:
-                payload["kind"] = "quarantined"
-                payload["quarantine"] = quarantine
-            return ToolResult(
-                content=message,  # prose-only clients still get a full sentence
-                structured_content=payload,
-                is_error=True,
-            )
+            return _error_envelope(context, exc)
+
+
+#: The kinds whose 1.7 envelope carried the sentence as ``error`` and as the
+#: text content; kept so a 1.7 client reading either still finds it.
+_LEGACY_ERROR_KEY = frozenset(
+    {"unsupported", "stale_revision", "busy", "quarantined", "active_document_changed"}
+)
+
+#: Used only for its transform: the text a non-legacy error had on the wire.
+_WIRE_ERRORS = ErrorHandlingMiddleware(logger=log)
+
+
+def _wire_text(context, exc: BaseException) -> str:
+    """The text FastMCP's ErrorHandlingMiddleware put on the wire for ``exc``."""
+    try:
+        transformed = _WIRE_ERRORS._transform_error(exc, context)
+        data = getattr(transformed, "error", None)
+        text = getattr(data, "message", None)
+        return text if isinstance(text, str) and text else str(transformed)
+    except Exception:  # the envelope must never fail over its prose
+        return f"Internal error: {exc}"
+
+
+def _error_envelope(context, exc: BaseException) -> ToolResult:
+    """One tool call's exception as a typed, structured error result (1.8-02)."""
+    # B12: a refusal names the operation it ended.
+    operation_id = CURRENT_OPERATION.get()
+    tool = context.message.name
+    lifespan = _lifespan_context_or_none(context)
+    backend = lifespan.get("backend") if lifespan is not None else None
+    arguments = dict(getattr(context.message, "arguments", None) or {})
+    classified = classify(exc)
+    state, kind = _kind_outcome(
+        backend, operation_id, _effective_tool(tool, arguments), classified["kind"]
+    )
+    spec = describe(kind)
+    # 1.8-04's open / save errors: their own sentence, not the parser's or the
+    # OS's text they were raised from (local import: the module-level list is
+    # a merge hotspot).
+    from engineering.errors import typed_message
+
+    message = typed_message(exc) or refusal_message(exc)
+    payload = {
+        "ok": False,
+        "kind": kind,
+        "category": spec.category,
+        "retryable": retryable_for(kind, state),
+        "hint": spec.hint,
+        "tool": tool,
+        "backend": _backend_name_or_none(context),
+        "message": message,
+    }
+    payload.update({k: v for k, v in classified.items() if k not in ("kind", "message")})
+    if operation_id is not None:
+        payload["operation_id"] = operation_id
+    if kind == "active_document_changed":
+        content = document_changed_of(exc)["error"]
+        payload["error"] = content
+    elif kind in _LEGACY_ERROR_KEY:
+        content = message  # prose-only clients still get a full sentence
+        payload["error"] = message
+    else:
+        content = _wire_text(context, exc)
+    return ToolResult(content=content, structured_content=payload, is_error=True)
+
+
+def _journal_refusal(context, kind: str, text: str, fields: dict) -> ToolResult:
+    """An ``AuditMiddleware`` refusal (B12) in the 1.8-02 envelope.
+
+    ``operation_conflict``, ``requires_reconcile`` and a malformed client id
+    (``invalid_args``) are refused before any record is opened, so nothing ran
+    and nothing was written: the record state ``retryable`` is computed for is
+    ``refused``. The text content is the 1.7 sentence, byte for byte; ``error``
+    stays beside ``message`` for a 1.7 client, and the exception's own fields
+    (``operation_id``, ``reason``, ``record``) are kept.
+    """
+    spec = describe(kind)
+    payload = {
+        "ok": False,
+        "kind": kind,
+        "category": spec.category,
+        "retryable": retryable_for(kind, "refused"),
+        "hint": spec.hint,
+        "tool": context.message.name,
+        "backend": _backend_name_or_none(context),
+        "message": text,
+    }
+    payload.update({k: v for k, v in fields.items() if k not in ("ok", "kind")})
+    return ToolResult(content=text, structured_content=payload, is_error=True)
 
 
 # ---------------------------------------------------------------------------
 # HTTP auth
 # ---------------------------------------------------------------------------
 
-_auth = (
-    StaticTokenVerifier(
-        tokens={
-            config.settings.mcp_auth_token: {
-                "client_id": "mcp-http-client",
-                "scopes": ["mcp:read", "mcp:write"],
-            }
-        }
-    )
-    if config.settings.mcp_auth_token
-    else None
+# 1.8-17: a StaticTokenVerifier subclass comparing with hmac.compare_digest;
+# MCP_AUTH_TOKEN_READONLY issues only mcp:read, which AuditMiddleware turns
+# into the `read` policy ceiling for that request (http_guard.py).
+_auth = http_guard.build_auth(
+    config.settings.mcp_auth_token,
+    getattr(config.settings, "mcp_auth_token_readonly", ""),
 )
 
 # ---------------------------------------------------------------------------
 # FastMCP server
 # ---------------------------------------------------------------------------
 
+
+def _server_instructions(
+    mode: str | None = None, profile: str | None = None, packs: set[str] | None = None
+) -> str:
+    """The ``instructions`` for one surface (1.8-11, ``discovery/instructions.py``).
+
+    ``mode`` / ``profile`` / ``packs`` default to what is applied (or configured);
+    every tool the text names is advertised under them. Before any tool is
+    registered (the FastMCP constructor below) nothing is filtered; the lifespan
+    rebuilds the text through ``_refresh_server_instructions`` once the profile
+    is applied, before any client is initialised.
+    """
+    from discovery.instructions import build_instructions
+
+    mode = mode or ("search" if globals().get("_discovery_transform") is not None else "off")
+    advertised: set[str] | None = None
+    components = globals().get("_local_tool_components")
+    try:
+        registered = {tool.name for tool in components()} if components is not None else set()
+    except Exception as exc:  # a registry layout change must not take the server down
+        log.debug("instructions: registry unavailable, nothing filtered: %s", exc)
+        registered = set()
+    if registered:
+        applied = _active_tool_profile or {}
+        profile = profile or applied.get("profile") or "full"
+        if packs is None:
+            # the packs the last profile apply resolved (and warned about), else
+            # a fresh resolve
+            enabled = (applied.get("tool_packs") or {}).get("enabled")
+            packs = set(enabled) if enabled is not None else _enabled_packs()[0]
+        advertised = _profile_enabled_names(profile, registered, packs)
+    return build_instructions(mode, advertised, config.settings.discovery_pinned)
+
+
+def _refresh_server_instructions() -> str:
+    """Rebuild ``mcp.instructions`` for the surface now applied; returns the text."""
+    mcp.instructions = _server_instructions()
+    return mcp.instructions
+
+
 mcp = FastMCP(
     name="AutoCAD MCP Pro",
     auth=_auth,
-    instructions="""
-AutoCAD MCP Pro provides complete AutoCAD automation through a large tool surface.
-
-DUAL ENGINE:
-  - COM backend: Live AutoCAD control (requires AutoCAD running on Windows)
-  - ezdxf backend: Headless DXF file operations (no AutoCAD needed)
-
-WORKFLOW:
-  1. drawing_open / drawing_new  → open or create a drawing
-  2. layer_create               → set up layers
-  3. entity_create_*            → draw geometry
-  4. analysis_entity_stats      → inspect drawing
-  5. view_screenshot            → see current state
-  6. drawing_save               → save your work
-
-ENGINEERING WORKFLOW (parts requiring real production drawings):
-  1. drawing_new           → auto-bootstraps engineering layers + linetypes
-  2. titleblock_apply_iso_a3 → standard ISO 7200 border + title (NEVER hand-draw the title)
-  3. gear_draw_helical_front_view / gear_draw_spur_front_view
-                           → parametric gear front view (NEVER hand-draw teeth or invent the title)
-  4. gear_draw_section_aa  → parametric cross-section
-  5. dimension_*           → real DIMENSION entities (NEVER use text+leader fakes)
-  6. drawing_finalize      → 8-step validator + save + screenshot;
-                             cannot complete without this; raises if invalid.
-
-CRITICAL: For engineering drawings, NEVER manually draw gear teeth, keyways,
-or section hatches with primitive line/circle calls. Use the gear_*, keyway_*,
-and titleblock_* tools — they are deterministic and produce production-quality
-output. The title text is whatever you pass to titleblock_apply_iso_a3 — do
-not invent variants like "HELICAL SPUR GEAR".
-
-HANDLES: Every entity has a unique handle (hex string). Use it for
-entity_get, entity_move, entity_delete, entity_set_properties, etc.
-
-TRANSACTIONS: Use transaction_begin / transaction_commit / transaction_rollback
-to group operations with undo support.
-
-Set AUTOCAD_MCP_BACKEND=com|ezdxf|auto environment variable to force a backend.
-""",
+    instructions=_server_instructions("off"),
     lifespan=autocad_lifespan,
 )
 
@@ -616,9 +1065,11 @@ mcp.add_middleware(CapabilityRefusalMiddleware())
 # ---------------------------------------------------------------------------
 # Tool discovery mode (DISCOVERY_MODE)
 # ---------------------------------------------------------------------------
-# "off"    the whole catalog is advertised (default, backwards compatible)
-# "search" list_tools returns a search tool + a call_tool proxy + describe_tool
-#          (one tool's full schema) instead, and the catalog is reached through
+# "off"    the whole catalog is advertised (the 1.7.0 surface), plus describe_tool
+#          whenever a listed description ends in "Details: describe_tool." (W3)
+# "search" (default since 1.8.0) list_tools returns the DISCOVERY_PINNED tools,
+#          a search tool, a call_tool proxy and describe_tool (one or several
+#          tools' full schemas) instead, and the catalog is reached through
 #          discovery/transform.py — which indexes each tool's AutoCAD command
 #          aliases as well as its description, so BPOLY/QSELECT/MATCHPROP
 #          resolve at all.
@@ -629,6 +1080,7 @@ mcp.add_middleware(CapabilityRefusalMiddleware())
 DISCOVERY_MODES = ("off", "search")
 
 _discovery_transform = None
+_details_transform = None
 
 
 def _tool_pack(name: str) -> str:
@@ -644,12 +1096,13 @@ def _tool_pack(name: str) -> str:
 
 
 def _apply_discovery_mode(mode: str | None = None) -> str:
-    """Attach or detach the tool-search transform. Returns the mode applied.
+    """Attach the transform of one discovery mode. Returns the mode applied.
 
-    Idempotent: re-applying removes the previous transform first, so a mode
-    switch never stacks two search interfaces on one server.
+    ``search`` attaches the tool-search transform, ``off`` the one that adds
+    ``describe_tool`` beside the whole catalog. Idempotent: re-applying removes
+    the previous transform first, so a mode switch never stacks two of them.
     """
-    global _discovery_transform
+    global _discovery_transform, _details_transform
     selected = (mode or config.settings.discovery_mode or "off").lower().strip()
     if selected not in DISCOVERY_MODES:
         log.warning(
@@ -658,27 +1111,129 @@ def _apply_discovery_mode(mode: str | None = None) -> str:
             ", ".join(DISCOVERY_MODES),
         )
         selected = "off"
-    if _discovery_transform is not None:
+    for attached in (_discovery_transform, _details_transform):
+        if attached is None:
+            continue
         try:
-            mcp._transforms.remove(_discovery_transform)
+            mcp._transforms.remove(attached)
         except (AttributeError, ValueError) as exc:  # pragma: no cover - layout change
             log.debug("Could not detach the discovery transform: %s", exc)
-        _discovery_transform = None
+    _discovery_transform = None
+    _details_transform = None
+    if selected == "off":
+        # W3: a long description is listed as its leading paragraphs and
+        # "Details: describe_tool." on every surface, so off mode lists the
+        # whole catalog plus describe_tool (discovery.transform.DetailsTransform)
+        # and the pointer leads somewhere. Kept apart from _discovery_transform,
+        # whose presence is what "search mode" means to the rest of the server.
+        from discovery.transform import DetailsTransform
+
+        _details_transform = DetailsTransform(pack_of=_tool_pack)
+        mcp.add_transform(_details_transform)
     if selected == "search":
-        # Imported lazily so "off" never pays for it, matching how the backend
-        # modules are kept out of import time.
+        # Imported here, as in "off", matching how the backend modules are kept
+        # out of import time.
         from discovery.transform import CadSearchTransform
 
-        _discovery_transform = CadSearchTransform(pack_of=_tool_pack)
+        # 1.8-11: DISCOVERY_PINNED stays listed beside the synthetic tools (as a
+        # shortened card; describe_tool has the rest). A pin the profile or packs
+        # hide is not listed; a name nothing registers is warned about by
+        # _warn_unknown_pins (here once tools exist, and at every profile apply).
+        pinned = list(config.settings.discovery_pinned)
+        _discovery_transform = CadSearchTransform(pack_of=_tool_pack, always_visible=pinned)
+        _warn_unknown_pins()
         mcp.add_transform(_discovery_transform)
         log.info(
             "Tool discovery: search transform attached "
-            "(clients see search_tools/call_tool/describe_tool)"
+            "(clients see search_tools/call_tool/describe_tool, pinned: %s)",
+            ", ".join(pinned) or "none",
         )
+    _refresh_server_instructions()
     return selected
 
 
+def _warn_unknown_pins() -> list[str]:
+    """Warn about DISCOVERY_PINNED names no tool registers; returns them.
+
+    Silent before any tool is registered (the import-time apply above runs
+    first), so the lifespan's profile apply is where a typo is reported.
+    """
+    if _discovery_transform is None:
+        return []
+    components = globals().get("_local_tool_components")
+    try:
+        registered = {tool.name for tool in components()} if components is not None else set()
+    except Exception as exc:  # a registry layout change must not take the server down
+        log.debug("DISCOVERY_PINNED: registry unavailable, nothing checked: %s", exc)
+        return []
+    if not registered:
+        return []
+    unknown = [name for name in config.settings.discovery_pinned if name not in registered]
+    if unknown:
+        log.warning("DISCOVERY_PINNED names no registered tool: %s", ", ".join(unknown))
+    return unknown
+
+
 _apply_discovery_mode()
+
+
+def _install_tool_definition_cache() -> bool:
+    """A call of a tool the catalog does not list resolves that tool, not the catalog.
+
+    The low-level MCP server keeps the definition of every *listed* tool
+    (``_tool_cache``) for the schema checks of a call, and on a miss it runs the
+    whole ``tools/list`` handler again. Under ``DISCOVERY_MODE=search`` every
+    tool but the pinned ones is such a miss, so every direct call of a hidden
+    tool listed the catalog first. MEASURED 2026-11-05
+    (``benchmarks/perf_compare.py --base v1.7.0 --aa --rounds 20``, release
+    tree 19ada05): ``server_create_lines_2k`` - 2,000 direct
+    ``entity_create_line`` calls through an in-memory client - 8.5 x its
+    v1.7.0 time, 0.96 x with ``DISCOVERY_MODE=off``; the profile showed six
+    listings a call. Here a miss resolves the one tool by name
+    (``FastMCP.get_tool``: the provider chain and every transform, no listing)
+    and keeps its definition, so the check runs as it does for a listed tool;
+    a name no tool has, or one the server disabled, takes the stock path (one
+    listing, the SDK's own warning). The client's own listing - ``mcp``'s
+    session lists again for a tool it has not seen - is the client's and stays.
+
+    ``_mcp_server``, ``_tool_cache`` and ``_get_cached_tool_definition`` are
+    private to ``mcp`` 1.x / fastmcp 3.4; ``tests/test_discovery_perf.py`` holds
+    them, so an upgrade that moves them fails there, and here the cache is
+    simply not installed (False, logged): a hidden tool's call then lists the
+    catalog as before, which is slower, never wrong.
+    """
+    low = getattr(mcp, "_mcp_server", None)
+    stock = getattr(low, "_get_cached_tool_definition", None)
+    cache = getattr(low, "_tool_cache", None)
+    resolve = getattr(mcp, "get_tool", None)
+    if low is None or not callable(stock) or not isinstance(cache, dict) or not callable(resolve):
+        log.warning(
+            "tool definition cache not installed (the MCP server layout changed): a call of "
+            "a tool the catalog does not list lists the catalog first"
+        )
+        return False
+
+    async def cached_definition(tool_name: str):
+        found = cache.get(tool_name)
+        if found is not None:
+            return found
+        try:
+            tool = await resolve(tool_name)
+        except Exception as exc:  # NotFoundError or a transform's error: the stock path
+            log.debug("tool definition of %r not resolved by name: %s", tool_name, exc)
+            tool = None
+        if tool is None:
+            return await stock(tool_name)
+        definition = tool.to_mcp_tool(name=tool.name)
+        cache[tool_name] = definition
+        return definition
+
+    cached_definition._acadmcp_by_name = True  # type: ignore[attr-defined]
+    low._get_cached_tool_definition = cached_definition
+    return True
+
+
+_install_tool_definition_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -719,16 +1274,11 @@ def _is_dwg_path(path: str) -> bool:
 
 # T0.2 — the read-side twin of the backend's DWG write refusal. ezdxf detects
 # format by content, so a DXF saved under a .dwg name (what pre-1.5.0
-# drawing_save produced) opens fine and gets reported as an opened DWG, while a
-# genuine DWG dies with ezdxf's "is not a DXF file" — which blames the file
-# instead of the backend. Refuse both, in the backend's own vocabulary.
-_DWG_READ_REFUSAL = (
-    "drawing_open: backend '{backend}' has no DWG support (capability 'dwg' is "
-    "unsupported), so '{path}' is refused rather than opened as something else: "
-    "a DXF saved under a .dwg name would be parsed and reported back as a DWG. "
-    "Open the .dxf instead, or switch to the live COM backend "
-    "(AUTOCAD_MCP_BACKEND=com, needs Windows + AutoCAD) to read real DWG."
-)
+# drawing_save produced) would open fine and be reported as an opened DWG, while
+# a genuine DWG dies with ezdxf's "is not a DXF file" — which blames the file
+# instead of the backend. K1 (1.8.0): a .dwg is never handed to the DXF parser;
+# the headless engine converts it (capability `dwg_read`, backends/dwg_read.py)
+# or refuses with that capability, naming both converters.
 
 
 def _dc(obj) -> dict:
@@ -1131,15 +1681,23 @@ def cad_tool(*, summary: str, cost: str):
     ``_tool_groups()`` — whose frozen 20-tag priority list feeds system_about.
     It also leaves the registration itself literally intact for that gate.
 
+    It is also where the wire description is set (W3, 1.8.0): a description
+    over ``discovery.descriptions.WIRE_DESCRIPTION_MAX`` characters is listed
+    as its leading whole paragraphs plus ``Details: describe_tool.``, and the
+    full text is kept by ``discovery.descriptions`` for ``describe_tool``.
+
     Writes a single ``cad`` key into the tool's MCP ``meta`` channel:
 
       ``summary``   one compact line, for a search hit's preview
       ``cost``      one of :data:`CAD_TOOL_COSTS`
-      ``acad``      AutoCAD command names, from ``discovery.aliases``
-      ``synonyms``  natural-language phrasings, from ``discovery.aliases``
 
-    The alias corpus is imported, never restated here: one edit site, and the
-    coverage gate over all registered tools already lives with the corpus.
+    1.8-14: the alias lists (``acad`` AutoCAD command names, ``synonyms``)
+    no longer ride on every tools/list entry. They stay in
+    ``discovery.aliases`` - the search ranker, ``describe_tool`` and the
+    inventory generator read them there through ``aliases_for`` - so a full
+    catalog stops paying for vocabulary only a search uses. The coverage gate
+    over all registered tools still lives with the corpus; this decorator only
+    warns about a tool the corpus does not know.
     """
     if cost not in CAD_TOOL_COSTS:
         raise ValueError(f"cad_tool cost must be one of {CAD_TOOL_COSTS}, got {cost!r}")
@@ -1158,17 +1716,15 @@ def cad_tool(*, summary: str, cost: str):
                 f"@cad_tool({name!r}): tool is not registered. cad_tool must be written "
                 "directly above the mcp.tool decorator, never below it or on a bare function."
             )
-        record = aliases_for(name)
-        if record is None:
+        if aliases_for(name) is None:
             log.warning("No discovery aliases for tool %r; searches will miss it", name)
         meta = dict(component.meta or {})
-        meta["cad"] = {
-            "summary": summary,
-            "cost": cost,
-            "acad": list(record.acad) if record else [],
-            "synonyms": list(record.synonyms) if record else [],
-        }
+        meta["cad"] = {"summary": summary, "cost": cost}
         component.meta = meta
+        # W3 (1.8.0): a description over WIRE_DESCRIPTION_MAX is listed as its
+        # leading whole paragraphs + "Details: describe_tool."; the full text
+        # stays in discovery.descriptions (never meta, which is on the wire).
+        record_wire_description(component)
         return target
 
     return decorate
@@ -1180,7 +1736,7 @@ def cad_tool(*, summary: str, cost: str):
 # Some MCP clients degrade (or hard-cap) when a server exposes 100+ tools.
 # TOOL_PROFILE selects how much of the surface is advertised:
 #   full — everything (default, backwards compatible)
-#   lean — a curated 66-tool drafting/inspection core (LEAN_TOOL_NAMES)
+#   lean — a curated 67-tool drafting/inspection core (LEAN_TOOL_NAMES)
 # Disabled tools stay registered (system_about still reports the full
 # inventory) but are hidden from MCP list_tools and rejected if called.
 
@@ -1307,6 +1863,11 @@ LEAN_TOOL_NAMES = frozenset(
         # core-pack tool, so TOOL_PACKS=core keeps it; lean is 66 (56 with
         # TOOL_PACKS=core).
         "drawing_verify_requirements",
+        # Set-based edits (1.8-12) - the verb a tight-cap client otherwise
+        # spends one call per entity on. layer_rename / layer_merge stay full:
+        # this one moves a layer's entities and layer_delete drops the layer.
+        # A core-pack tool; lean is 67 (57 with TOOL_PACKS=core).
+        "entity_modify_where",
     }
 )
 
@@ -1333,6 +1894,7 @@ PACK_TOOL_NAMES: dict[str, frozenset[str]] = {
             "pid_line_list",
             "pid_equipment_list",
             "pid_from_spec",
+            "pid_project",
         }
     ),
     # SECTION 20 — the 22 environment tools (spec §7, §8.2).
@@ -1374,6 +1936,7 @@ PACK_TOOL_NAMES: dict[str, frozenset[str]] = {
             "mech_hole_pattern",
             "mech_part_from_spec",
             "mech_part_inspect",
+            "mech_part_revise",
             "std_part_list",
             "std_part_insert",
             "std_feature_draw",
@@ -1493,10 +2056,19 @@ async def _apply_tool_profile(profile: str | None = None) -> dict:
                 ", ".join(TOOL_PROFILES),
             )
         selected = "full"
-    registered = {tool.name for tool in await _registered_tools() if getattr(tool, "name", None)}
+    components = {
+        tool.name: tool for tool in await _registered_tools() if getattr(tool, "name", None)
+    }
+    registered = set(components)
     # Resolved once per apply: twice warned twice per unknown entry (W4-T18-04).
     packs, ignored = _enabled_packs()
     enabled = _profile_enabled_names(selected, registered, packs)
+    # 1.8-17: the tool policy shrinks the catalog too - a tool READ_ONLY, the
+    # allow/deny lists or MAX_TOOL_COST refuse is not advertised (and is still
+    # refused by name, policy_refused, if called).
+    policy.warn_unmatched(registered)
+    policy_hidden = sorted(n for n in enabled if _policy_refusal(n, components[n]) is not None)
+    enabled -= set(policy_hidden)
     disabled = sorted(registered - enabled)
     # Replace the previous profile's visibility, never stack on it. fastmcp 3's
     # enable()/disable() append a Visibility transform per call and a tool lookup
@@ -1522,6 +2094,8 @@ async def _apply_tool_profile(profile: str | None = None) -> dict:
         "disabled_count": len(disabled),
         "disabled_tools": disabled,
     }
+    if policy_hidden:
+        _active_tool_profile["policy_hidden_count"] = len(policy_hidden)
     _active_tool_profile["tool_packs"] = {
         "enabled": sorted(packs),
         "available": list(TOOL_PACK_NAMES),
@@ -1537,6 +2111,9 @@ async def _apply_tool_profile(profile: str | None = None) -> dict:
         len(enabled),
         len(disabled),
     )
+    # 1.8-11: the instructions name only tools this surface advertises.
+    _refresh_server_instructions()
+    _warn_unknown_pins()
     return _active_tool_profile
 
 
@@ -1652,11 +2229,19 @@ async def drawing_new(
             await ctx.warning(f"Engineering bootstrap failed: {exc}")
             result["bootstrap"] = {"ok": False, "error": str(exc)}
             result["status"] = "degraded"
+        # 1.8-08: S0 is the drawing this tool hands back, not the blank one the
+        # engine created before the bootstrap (an undo to it would strip layers).
+        anchor = getattr(backend, "checkpoint_anchor_new", None)
+        if callable(anchor):
+            try:
+                await anchor()
+            except Exception as exc:  # a safety net never fails drawing_new
+                log.warning("drawing_new: S0 not re-anchored after the bootstrap: %s", exc)
     return result
 
 
 @cad_tool(
-    summary="Load an existing DXF from disk (DWG only on the live AutoCAD backend).",
+    summary="Load an existing DXF or DWG from disk (headless DWG via a converter).",
     cost="mutate",
 )
 @mcp.tool(
@@ -1666,27 +2251,67 @@ async def drawing_new(
 async def drawing_open(
     path: Annotated[
         str,
-        "Full path to the .dxf file. .dwg needs a backend that can read it "
-        "(the live COM backend); the headless ezdxf backend refuses it.",
+        "Full path to the .dxf or .dwg. Live COM reads DWG natively; headless "
+        "converts it (ODA, then accoreconsole) or refuses `dwg_read`.",
     ],
+    recover: Annotated[
+        bool,
+        "Read a damaged DXF with ezdxf's recover reader: reports recovered "
+        "{fixes, errors, messages, entities_read}; the result will not save over "
+        "the damaged file without drawing_save(overwrite_source=True).",
+    ] = False,
     ctx: Context = None,
 ) -> dict:
     """Open an existing DXF drawing file (DWG too, on the live COM backend).
 
-    T0.2: a .dwg path is refused up front when the active backend has no `dwg`
-    capability. ezdxf sniffs content rather than extensions, so it would parse a
-    mislabelled DXF-in-a-.dwg and this tool would answer with a document that
-    does not exist in that format.
+    Headless, a .dwg is converted to DXF (ODA File Converter, then
+    accoreconsole); the result carries `dwg_read: {route, seconds, log}`. No
+    converter: refused `dwg_read`; a failed conversion: `dwg_conversion_failed`
+    with each route's log.
+
+    A file that does not parse is refused (`damaged_drawing`) and the open
+    document is kept; the refusal names `recover=True`. The result carries the
+    file's `lineage`: an unchanged file last saved by this server continues its
+    `document_id` and `revision` across restarts; a file changed outside it
+    reports `external_change: true` (one revision more, journalled as
+    `external_edit`). `save_recovery` lists a save of this path a dead process
+    left half done, resolved before the read.
     """
     validated = validate_path(path, allow_write=False)
     backend = _backend(ctx)
-    if _is_dwg_path(str(validated)) and not _backend_supports(backend, "dwg"):
-        raise ToolError(_DWG_READ_REFUSAL.format(backend=backend.name, path=validated))
+    if _is_dwg_path(str(validated)) and not _backend_supports(backend, "dwg_read"):
+        from backends.dwg_read import refusal as _dwg_read_refusal
+
+        raise _dwg_read_refusal(str(validated), backend.name)
     await ctx.info(f"Opening drawing: {validated}")
     await ctx.report_progress(0, 100)
-    result = await backend.drawing_open(str(validated))
+    if recover:
+        result = await backend.drawing_open(str(validated), recover=True)
+    else:
+        result = await backend.drawing_open(str(validated))
     await ctx.report_progress(100, 100)
+    if isinstance(result, dict) and result.get("external_change"):
+        _journal_external_edit(ctx, backend, result)
     return result
+
+
+def _journal_external_edit(ctx: Context, backend, result: dict) -> None:
+    """One ``external_edit`` row: the file changed outside this server (1.8-04)."""
+    try:
+        journal = _operations_journal(ctx.lifespan_context)
+        identity = _identity_of(backend)
+        record, _replay = journal.begin(
+            "external_edit",
+            {
+                "path": result.get("path"),
+                "previous_sha256": result.get("previous_sha256"),
+                "sha256": result.get("sha256"),
+            },
+            document=identity,
+        )
+        journal.finish(record, "committed", document=identity)
+    except Exception as exc:  # the journal is evidence, never a reason to fail an open
+        log.warning("external_edit not journalled: %s", exc)
 
 
 @cad_tool(summary="Write the drawing back to its file, or to a path you give.", cost="mutate")
@@ -1696,13 +2321,25 @@ async def drawing_open(
 )
 async def drawing_save(
     path: Annotated[str | None, "Optional save path; uses current path if omitted"] = None,
+    overwrite_source: Annotated[
+        bool,
+        "Allow saving a drawing opened with recover=True over its damaged source file.",
+    ] = False,
     ctx: Context = None,
 ) -> dict:
-    """Save the current drawing. Optionally specify a new path."""
+    """Save the current drawing. Optionally specify a new path.
+
+    Headless, the write is atomic: a temporary file beside the target, checked,
+    then renamed over it - a killed save never leaves a half-written drawing.
+    A document opened with recover=True is refused onto its damaged source
+    (`recovered_source_protected`) unless overwrite_source=True.
+    """
     if path is not None:
-        validated = validate_path(path, allow_write=True)
+        validated = validate_path(path, allow_write=True, kinds=KINDS_DRAWING)
         path = str(validated)
     await ctx.info("Saving drawing")
+    if overwrite_source:
+        return await _backend(ctx).drawing_save(path, overwrite_source=True)
     return await _backend(ctx).drawing_save(path)
 
 
@@ -1729,7 +2366,7 @@ async def drawing_save_as(
     match the name (N2) — e.g. 'part.dxf' writes DXF, not DWG. `format` overrides
     only when the path has no recognised extension.
     """
-    validated = validate_path(path, allow_write=True)
+    validated = validate_path(path, allow_write=True, kinds=KINDS_DRAWING)
     from pathlib import Path as _P
 
     ext = _P(str(validated)).suffix.lstrip(".").lower()
@@ -1755,7 +2392,7 @@ async def drawing_export_dxf(
     and the DXF version written. Refused: a name that is not .dxf (a .dwg headlessly
     with capability `dwg`).
     """
-    validated = validate_path(path, allow_write=True)
+    validated = validate_path(path, allow_write=True, kinds=KINDS_DXF)
     await ctx.info(f"Exporting DXF: {validated}")
     return await _backend(ctx).drawing_export_dxf(str(validated))
 
@@ -1775,7 +2412,7 @@ async def drawing_export_pdf(
     ctx: Context = None,
 ) -> dict:
     """Export the current drawing (or a paper-space layout) to PDF."""
-    validated = validate_path(path, allow_write=True)
+    validated = validate_path(path, allow_write=True, kinds=KINDS_PDF)
     await ctx.info(f"Exporting PDF: {validated}")
     await ctx.report_progress(0, 100)
     result = await _backend(ctx).drawing_export_pdf(str(validated), layout=layout)
@@ -1792,9 +2429,14 @@ async def drawing_export_pdf(
     tags={"drawing", "cleanup"},
 )
 async def drawing_purge(ctx: Context = None) -> dict:
-    """Purge all unused objects (layers, blocks, linetypes, styles) from the drawing."""
+    """Purge all unused objects (layers, blocks, linetypes, styles) from the drawing.
+
+    Live AutoCAD stores a durable checkpoint first (checkpoint_list).
+    """
     await ctx.info("Purging drawing")
-    return await _backend(ctx).drawing_purge()
+    backend = _backend(ctx)
+    await _checkpoint_before(backend, "drawing_purge")
+    return await backend.drawing_purge()
 
 
 @cad_tool(summary="Scan the drawing for structural errors and repair what it finds.", cost="mutate")
@@ -1842,14 +2484,22 @@ async def drawing_close(
 async def drawing_undo(ctx: Context = None) -> dict:
     """Undo the last drawing operation.
 
-    On the live COM backend this is AutoCAD's own undo. The headless backend has
-    no journal, so a step is a full DXF snapshot and history is **off by
-    default** — set `EZDXF_UNDO_DEPTH` to the number of steps you want. Measured
-    cost of switching it on: 37x on entity creation (0.18 -> 6.65 ms per call).
-    For a single checkpoint around a risky sequence, `transaction_begin` /
-    `transaction_rollback` is far cheaper.
+    On the live COM backend this is AutoCAD's own undo. Headless (1.8.0), undo
+    steps back to the newest durable checkpoint below the current revision -
+    taken at every save, open, new drawing, rollback-mode cad_batch /
+    transaction and checkpoint_create - so it works after a server restart too,
+    and reports `granularity` ("save", "batch" or "label") and `checkpoint`.
+    For per-call steps set `EZDXF_UNDO_DEPTH` (a full DXF snapshot per call -
+    measured 37x on entity creation, 0.18 -> 6.65 ms); those are used first,
+    then the checkpoints. Without a state folder (JOURNAL_DURABLE=off) and
+    without EZDXF_UNDO_DEPTH it is refused with capability `undo_history`.
 
     Drawing something after an undo discards the redo branch, as in AutoCAD.
+
+    `verified` says whether the drawing observably changed: always true for a
+    headless snapshot restore; live, true when the entity count over every
+    layout or the document's edit counter moved (`evidence` has both), false
+    for "no change seen". An undo left at a prompt is `command_incomplete`.
     """
     return await _backend(ctx).drawing_undo()
 
@@ -1862,10 +2512,12 @@ async def drawing_undo(ctx: Context = None) -> dict:
 async def drawing_redo(ctx: Context = None) -> dict:
     """Reapply the operation you just undid.
 
-    Same history as `drawing_undo`, so the headless backend needs
-    `EZDXF_UNDO_DEPTH` set. Anything drawn after an undo discards the redo
+    Same history as `drawing_undo`: headless, a checkpoint undo is redone from
+    the state it replaced (kept as a checkpoint), within the session. Anything
+    drawn after an undo discards the redo
     branch — otherwise redo would restore a state that never existed, with
     geometry you had removed reappearing beside geometry you drew afterwards.
+    Reports `verified` the same way `drawing_undo` does.
     """
     return await _backend(ctx).drawing_redo()
 
@@ -1953,14 +2605,20 @@ async def entity_create_polyline(
     closed: Annotated[bool, "Whether to close the polyline"] = False,
     layer: Annotated[str | None, "Layer name"] = None,
     color: Annotated[int | None, "ACI color code"] = None,
+    bulges: Annotated[
+        list[float] | None,
+        "Optional arc bulge per vertex (tan(sweep/4) of the segment leaving that vertex, "
+        "CCW positive; 1 = semicircle, 0 = straight). One per point.",
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Create a lightweight 2D polyline through the given points.
 
     Example: points=[[0,0],[100,0],[100,100],[0,100]], closed=true → rectangle
+    Example: points=[[0,0],[40,0]], bulges=[1, 0] → a semicircular arc edge
     """
     await ctx.debug(f"Creating polyline with {len(points)} points, closed={closed}")
-    result = await _backend(ctx).entity_create_polyline(points, closed, layer, color)
+    result = await _backend(ctx).entity_create_polyline(points, closed, layer, color, bulges=bulges)
     return _dc(result)
 
 
@@ -2567,7 +3225,7 @@ async def dimension_diameter(
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 4: Entity Modification (18 tools) ───────────────────────────────
+# ── SECTION 4: Entity Modification (19 tools) ───────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -2876,7 +3534,7 @@ async def entity_set_properties(
     linetype: Annotated[
         str | None, "New linetype name (e.g. 'DASHED', 'CENTER', 'ByLayer')"
     ] = None,
-    lineweight: Annotated[int | None, "Lineweight in 0.01mm units (-3=ByLayer, -2=ByBlock)"] = None,
+    lineweight: Annotated[Lineweight | None, LINEWEIGHT_HELP] = None,
     visible: Annotated[bool | None, "Set entity visibility"] = None,
     ctx: Context = None,
 ) -> dict:
@@ -2900,15 +3558,20 @@ async def entity_edit_text(
     text: Annotated[str | None, "New text content (unchanged if omitted)"] = None,
     height: Annotated[float | None, "New text height (unchanged if omitted)"] = None,
     rotation: Annotated[float | None, "New rotation in degrees (unchanged if omitted)"] = None,
+    x: Annotated[float | None, "New insertion X, WCS (unchanged if omitted)"] = None,
+    y: Annotated[float | None, "New insertion Y, WCS (unchanged if omitted)"] = None,
     ctx: Context = None,
 ) -> dict:
-    """Edit an existing text label in place — change its content, height, or rotation.
+    """Edit an existing text label in place — change its content, height, rotation or position.
 
-    Use this to rename/relabel without deleting and recreating (which would lose
-    the handle). Works on both TEXT and MTEXT.
+    Use this to rename/relabel/move without deleting and recreating (which would
+    lose the handle and its XDATA). Works on both TEXT and MTEXT. ``x``/``y``
+    move the label so its reported ``insertion`` lands there; an aligned TEXT's
+    alignment point moves with it. A TEXT in a plane tilted out of WCS XY is
+    refused (capability ``ocs_tilted_plane``) — use ``entity_move``.
     """
     await ctx.debug(f"Editing text entity {handle}")
-    result = await _backend(ctx).entity_edit_text(handle, text, height, rotation)
+    result = await _backend(ctx).entity_edit_text(handle, text, height, rotation, x=x, y=y)
     return _dc(result)
 
 
@@ -3063,6 +3726,7 @@ async def text_find_replace(
         rows = list(result.get("entities") or [])
         preview = await make_preview(backend, handles=[row["handle"] for row in rows], planned=rows)
         return {**result, "preview": preview.to_dict()}
+    await _checkpoint_before(backend, "text_find_replace")
     if expected_revision is None and preconditions is None:
         return await backend.text_find_replace(find, replace, layer or None, match_case, False)
     return await _guarded_text_find_replace(
@@ -3089,12 +3753,32 @@ async def entity_edit_geometry(
     y2: Annotated[float | None, "New end Y (LINE)"] = None,
     start_angle: Annotated[float | None, "New start angle in degrees (ARC)"] = None,
     end_angle: Annotated[float | None, "New end angle in degrees (ARC)"] = None,
+    points: Annotated[
+        list[list[float]] | None,
+        "New vertices [[x, y], ...] in WCS (LWPOLYLINE); the count may change",
+    ] = None,
+    bulges: Annotated[
+        list[float] | None,
+        "Arc bulge per vertex (LWPOLYLINE; CCW positive, 0 = straight). Omitted: kept when "
+        "the vertex count is unchanged, straight otherwise",
+    ] = None,
+    x: Annotated[float | None, "New insertion X, WCS (TEXT/MTEXT)"] = None,
+    y: Annotated[float | None, "New insertion Y, WCS (TEXT/MTEXT)"] = None,
     ctx: Context = None,
 ) -> dict:
     """Edit the defining geometry of an existing entity in place (no delete/recreate).
 
-    CIRCLE: cx/cy/radius · LINE: x1/y1/x2/y2 · ARC: cx/cy/radius/start_angle/end_angle.
-    Any argument left out is unchanged; the handle is preserved.
+    CIRCLE: cx/cy/radius · LINE: x1/y1/x2/y2 · ARC: cx/cy/radius/start_angle/end_angle ·
+    LWPOLYLINE: points/bulges · TEXT/MTEXT: x/y.
+    Any argument left out is unchanged; the handle, layer and XDATA are preserved.
+    An argument the entity's type does not take is refused by name, never ignored.
+    A linear or aligned DIMENSION takes x1/y1/x2/y2 - its two measured points - and
+    is redrawn, so its number follows them (1.8.0); any other dimension type is refused.
+
+    On the live engine, if AutoCAD will not take a vertex list of a different
+    length in place, the polyline is recreated with its layer, colour, linetype,
+    lineweight and XDATA and the result says so in ``properties.replaced``
+    ``[{old, new}]`` — use the new handle from then on.
     """
     await ctx.debug(f"Editing geometry of entity {handle}")
     result = await _backend(ctx).entity_edit_geometry(
@@ -3108,8 +3792,94 @@ async def entity_edit_geometry(
         y2,
         start_angle,
         end_angle,
+        points=points,
+        bulges=bulges,
+        x=x,
+        y=y,
     )
     return _dc(result)
+
+
+@cad_tool(
+    summary="Restyle every entity a filter matches (layer, colour, linetype, lineweight) in one call.",
+    cost="destructive",
+)
+@mcp.tool(
+    annotations={"title": "Modify Entities Where", "readOnlyHint": False, "destructiveHint": True},
+    tags={"entity", "modify"},
+)
+async def entity_modify_where(
+    where: Annotated[
+        dict,
+        Field(
+            description=(
+                "Filter, at least one key: layer (name or list; * and ? wildcards), type "
+                "(DXF type or list), color (ACI 0-256, 256 = ByLayer), linetype, lineweight "
+                "('ByLayer', 25, -3), region [x0, y0, x1, y1] (box meets it), block (INSERT "
+                "block name or list)."
+            )
+        ),
+    ],
+    set: Annotated[
+        dict,
+        Field(
+            description=(
+                "What to write, at least one key: layer (created when missing), color "
+                "(0-256), linetype, lineweight ('ByLayer' = -1, never -3), visible."
+            )
+        ),
+    ],
+    space: Annotated[
+        str,
+        "model, paper (every paper layout) or all. Block definitions are never searched.",
+    ] = "model",
+    dry_run: Annotated[
+        bool, "Report the count, the first 20 handles and a `preview`; change nothing."
+    ] = False,
+    expect_count: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "Apply only if `where` still matches exactly this many entities (a dry run's "
+                "`count`); otherwise refused stale_revision and nothing is changed."
+            ),
+        ),
+    ] = None,
+    ctx: Context = None,
+) -> dict:
+    """AutoCAD's QSELECT + CHPROP: one call for a whole set, not one row per entity.
+
+    Example - every override on the old layers back to ByLayer, on the new layer::
+
+        entity_modify_where(where={"layer": ["WALL*", "Walls"]},
+                            set={"layer": "A-WALL", "color": 256, "lineweight": "ByLayer"})
+
+    Entities on a locked layer are not written (AutoCAD's rule) and are reported in
+    `skipped_locked`, never counted as matched. `changed` counts only entities that
+    really changed: re-setting a value to itself is not a change. dry_run=True adds
+    `preview` (the document revision, plus the region fingerprint when `where` has a
+    region - of the current layout); send its `count` back as `expect_count`, or the
+    preview to `cad_batch(expected_revision=, preconditions=)`. Refused by name before
+    anything is written: an unknown or malformed `where` / `set` key (invalid_args),
+    a `set.layer` no layer may carry, an `expect_count` the drawing no longer matches
+    (stale_revision).
+    """
+    backend = _backend(ctx)
+    if dry_run:
+        from backends.set_edits import parse_where
+        from engineering.changes.preview import make_preview
+
+        result = await backend.entity_select_where(where, set, space)
+        region = parse_where(where).region
+        preview = (await make_preview(backend, region=region)).to_dict()
+        result["preview"] = preview
+        if region is not None:
+            result["region_fingerprint"] = preview["preconditions"][-1]["fingerprint"]
+        return result
+    await ctx.info(f"Modifying entities where {where} ({space})")
+    return await backend.entity_modify_where(where, set, space, expect_count)
 
 
 # ---------------------------------------------------------------------------
@@ -3209,8 +3979,11 @@ async def entity_get(
     or spline edge. A DIMENSION also reports `dimension`: `dimtype`, the five
     `defpoints`, its own `measurement` (before DIMLFAC), `text_override`,
     `dimstyle`, `dimlfac` and `angle`. On the live engine those two are read
-    from the drawing's DXF export (one export per call; `detail_source` says
-    so), and a member of a block definition reports `detail_unavailable`. An
+    from a DXF export of the whole drawing (`detail_source` says so), which
+    costs about as much as drawing_understand; it is reused for
+    COM_SNAPSHOT_TTL seconds (default 5) while the document's revision and
+    operator-edit count stand still, so N reads of an unchanged drawing cost
+    one export. A member of a block definition reports `detail_unavailable`. An
     entity in a plane tilted out of WCS XY reports `plane_normal` (or
     `tilted`) and omits what xy cannot express. Refused: a handle the drawing
     does not hold.
@@ -3300,20 +4073,107 @@ async def entity_delete_many(
     handles: Annotated[list[str], "List of entity handles to delete"],
     ctx: Context = None,
 ) -> dict:
-    """Delete multiple entities in one call. Returns count of deleted entities."""
+    """Delete multiple entities in one call. Returns count of deleted entities.
+
+    All or none (unknown_handle, rolled_back).
+    """
+    # 1.8-09 in full: every handle is checked first, in one read, and a missing
+    # one refuses the call with each index in `missing` - nothing deleted. The
+    # deletes run inside a transaction; a failure rolls it back (headless: the
+    # snapshot; live: an UNDO back to the mark, `verified` by reading the
+    # handles again) and answers ok: false, errors, deleted: 0. A handle listed
+    # twice is deleted once (`duplicates_ignored`). The docstring stays short:
+    # it is what the discovery index ranks.
+    from engineering.changes.precheck import normalise, require_handles
+
     await ctx.info(f"Deleting {len(handles)} entities")
     b = _backend(ctx)
+    # 1.8-09: a duplicate would fail its second delete and roll back the
+    # whole call; it is the same entity, so it is deleted once.
+    unique: list[str] = []
+    keys: set = set()
+    for h in handles:
+        key = normalise(h)
+        if key is not None and key in keys:
+            continue
+        keys.add(key)
+        unique.append(h)
+    duplicates = len(handles) - len(unique)
+    before = await require_handles(
+        b,
+        [{"index": i, "handle": h} for i, h in enumerate(handles)],
+        subject=f"entity_delete_many refused all {len(handles)} handle(s) - nothing was deleted",
+        deleted=0,
+    )
+    total = len(unique)
+    if not total:
+        return {"ok": True, "deleted": 0, "errors": []}
+    # The transaction is the all-or-nothing; on the live engine its begin also
+    # takes the 1.8-08 checkpoint, so a second export is taken only without it.
+    with anyio.CancelScope(shield=True):
+        opened = await b.transaction_begin()
+    in_transaction = isinstance(opened, dict) and bool(opened.get("ok"))
+    if not (in_transaction and opened.get("checkpoint")):
+        await _checkpoint_before(b, "entity_delete_many")  # 1.8-08: live AutoCAD only
     deleted = 0
     errors = []
-    for i, h in enumerate(handles):
-        await ctx.report_progress(i, len(handles))
-        try:
-            await b.entity_delete(h)
-            deleted += 1
-        except Exception as exc:
-            errors.append({"handle": h, "error": str(exc)})
-    await ctx.report_progress(len(handles), len(handles))
-    return {"ok": True, "deleted": deleted, "errors": errors}
+    try:
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        # 1.8-23: one backend call - the headless loop, ONE STA job live.
+        outcome = await b.entity_delete_many(
+            unique, progress=ctx.report_progress, stop_on_error=in_transaction
+        )
+        deleted, errors = outcome["deleted"], outcome["errors"]
+    except BaseException:
+        # A cancellation (or anything else) mid-loop: the deletes that ran are
+        # undone before the exception goes on, as cad_batch does (B01).
+        if in_transaction:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await b.transaction_rollback()
+                except Exception as rollback_exc:  # never raised over the cause
+                    log.error(
+                        "entity_delete_many: rollback after an abort failed: %s", rollback_exc
+                    )
+        raise
+    await ctx.report_progress(total, total)
+    result: dict = {"ok": not errors, "deleted": deleted, "errors": errors}
+    if duplicates:
+        result["duplicates_ignored"] = duplicates
+    if not in_transaction:
+        reason = (opened or {}).get("error") if isinstance(opened, dict) else None
+        result["transaction"] = False
+        if errors:
+            result["rolled_back"] = False
+            result["note"] = (
+                f"No transaction could be opened ({reason or 'declined'}), so the "
+                f"{deleted} delete(s) that ran stay applied."
+            )
+        return result
+    with anyio.CancelScope(shield=True):
+        if errors:
+            outcome = await b.transaction_rollback()
+            rolled_back = not isinstance(outcome, dict) or bool(outcome.get("ok", True))
+            result["rolled_back"] = rolled_back
+            if rolled_back:
+                result["deleted"] = 0
+                # The handles read before the first delete, read again - the
+                # same evidence as cad_batch's: live exact and only once AutoCAD
+                # is idle (CMDACTIVE 0), headless presence. Unreadable or busy
+                # is `verified: None`, never a claim, and never raised over a
+                # rollback that landed.
+                guarantee, _note = _batch_rollback_guarantee(b)
+                verified, evidence = await _batch_rollback_evidence(b, guarantee, True, before)
+                if "handles_checked" not in evidence:
+                    verified = None
+                result["verified"] = verified
+                result.update(evidence)
+                if "cmdactive" in evidence and evidence["cmdactive"] != 0:
+                    result["note"] = _batch_not_idle_note(evidence["cmdactive"])
+        else:
+            await b.transaction_commit()
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    return result
 
 
 @cad_tool(
@@ -3410,7 +4270,7 @@ async def entity_set_xdata(
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 6: Layer Management (14 tools) ──────────────────────────────────
+# ── SECTION 6: Layer Management (16 tools) ──────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -3449,9 +4309,7 @@ async def layer_create(
     name: Annotated[str, "New layer name"],
     color: Annotated[int, "ACI color code (1=Red, 2=Yellow, 3=Green, 4=Cyan, 5=Blue, 7=White)"] = 7,
     linetype: Annotated[str, "Linetype name"] = "Continuous",
-    lineweight: Annotated[
-        int, "Lineweight (-3=ByLayer, 0=0.00mm, 13=0.13mm, 25=0.25mm, 50=0.50mm)"
-    ] = -3,
+    lineweight: Annotated[Lineweight, LINEWEIGHT_HELP + LINEWEIGHT_LAYER_NOTE] = -3,
     ctx: Context = None,
 ) -> dict:
     """Create a new layer with specified properties."""
@@ -3497,7 +4355,7 @@ async def layer_modify(
     name: Annotated[str, "Layer name to modify"],
     color: Annotated[int | None, "New ACI color code"] = None,
     linetype: Annotated[str | None, "New linetype name"] = None,
-    lineweight: Annotated[int | None, "New lineweight value"] = None,
+    lineweight: Annotated[Lineweight | None, LINEWEIGHT_HELP + LINEWEIGHT_LAYER_NOTE] = None,
     ctx: Context = None,
 ) -> dict:
     """Modify an existing layer's color, linetype, and/or lineweight."""
@@ -3584,6 +4442,61 @@ async def layer_isolate(
             await b.layer_hide(lyr.name)
             hidden.append(lyr.name)
     return {"ok": True, "isolated": name, "hidden_count": len(hidden), "hidden_layers": hidden}
+
+
+@cad_tool(summary="Rename a layer; every entity on it follows.", cost="mutate")
+@mcp.tool(
+    annotations={"title": "Rename Layer", "readOnlyHint": False, "destructiveHint": False},
+    tags={"layer"},
+)
+async def layer_rename(
+    old: Annotated[str, "The layer's current name."],
+    new: Annotated[str, "Its new name; no layer may carry it yet."],
+    ctx: Context = None,
+) -> dict:
+    """AutoCAD's RENAME for a layer: the table entry and every reference to it.
+
+    Headless, every entity's layer in model space, every paper layout and every
+    block definition is rewritten (`entities`, `by_space`, `blocks_touched`), with
+    viewport frozen lists and the current layer; live, AutoCAD references a layer by
+    object id, so `AcadLayer.Name` renames it everywhere and no entity is rewritten
+    (`entities: null`). A layer state saved earlier keeps the old name. Refused by
+    name, before anything changes: `0`, `DEFPOINTS`, an xref-dependent layer, a
+    missing `old`, an existing `new` (use layer_merge), a case-only change.
+    """
+    await ctx.info(f"Renaming layer {old!r} to {new!r}")
+    return await _backend(ctx).layer_rename(old, new)
+
+
+@cad_tool(
+    summary="Merge layers into one: move their entities, then delete them.", cost="destructive"
+)
+@mcp.tool(
+    annotations={"title": "Merge Layers", "readOnlyHint": False, "destructiveHint": True},
+    tags={"layer"},
+)
+async def layer_merge(
+    sources: Annotated[list[str], "Layers to merge away."],
+    target: Annotated[str, "Existing layer that receives their entities."],
+    delete_sources: Annotated[bool, "Delete the source layers afterwards."] = True,
+    ctx: Context = None,
+) -> dict:
+    """AutoCAD's LAYMRG: every entity on `sources` moves to `target`, then the
+    sources are deleted.
+
+    Reassigns in model space, every paper layout and every block definition
+    (attributes included); `by_space` counts per layout, `blocks_touched` names the
+    edited definitions - and `note` says so, because an edited definition changes
+    every INSERT of that block. The current layer moves to `target` when it was a
+    source; viewport freezes of a source are dropped with it. Live, a locked source
+    or target is unlocked for the move and the target relocked; a source AutoCAD
+    will not delete is listed in `layers_not_deleted` with its reason. Refused by
+    name, before anything changes: a missing source or target (layer_create the
+    target first), `0` / `DEFPOINTS` / an xref-dependent layer as a source, the
+    target among the sources.
+    """
+    await ctx.warning(f"Merging layers {sources} into {target!r}")
+    return await _backend(ctx).layer_merge(sources, target, delete_sources)
 
 
 @cad_tool(summary="List the dash patterns currently loaded in the drawing.", cost="read")
@@ -4232,32 +5145,62 @@ async def analysis_layer_stats(ctx: Context = None) -> dict:
 
 # ── cad_batch: the ordered multi-tool executor ──────────────────────────────
 
-#: What ``on_error`` accepts. ``stop`` is the default because it is the only
-#: mode whose guarantee is identical on both backends (see
-#: :func:`_batch_rollback_guarantee`).
-BATCH_ON_ERROR_MODES = ("stop", "continue", "rollback")
+#: What ``on_error`` accepts. ``auto`` is the default since 1.8.0 (plan
+#: 1.8-09, a breaking change from 1.7's ``stop``): a batch with at least one
+#: mutating step runs as ``rollback`` - a snapshot headless, a verified
+#: best-effort UNDO live - and a read-only batch as ``stop``, opening no
+#: checkpoint. ``stop`` still keeps whatever ran (the 1.7 behaviour, by name).
+BATCH_ON_ERROR_MODES = ("stop", "continue", "rollback", "auto")
 
-#: Every ``error.kind`` a step row can carry. Closed on purpose: a client that
-#: branches on the taxonomy needs it to be enumerable.
-BATCH_ERROR_KINDS = (
-    "denied",  # on cad_batch's deny set; never executed
-    "malformed_step",  # not a {tool, args, bind} object
-    "unknown_tool",  # not registered, or hidden by TOOL_PROFILE / TOOL_PACKS / ENABLE_3D
-    "invalid_args",  # rejected by the tool's own JSON Schema
-    "unresolved_ref",  # a $reference that no earlier step successfully bound
-    "unsupported",  # this backend cannot do it (carries `capability`)
-    "refused",  # the tool declined on purpose (path/command validation, ...)
-    "failed",  # attempted and broke
-    "quarantined",  # the document is quarantined after an abandoned call (R32)
-    "busy",  # a detached read holds the document (W1 review follow-up)
-    "stale_revision",  # the document moved since its preview (Task 12)
-    "active_document_changed",  # live engine: the operator switched documents (B11)
-    "scan_incomplete",  # a QA or verification read could not read everything (B02)
-    "unknown_commit",  # a write that outran its deadline: it may have landed (B12)
-    "timed_out",  # a read that outran its deadline
-    "cancelled",  # the request was cancelled
-    "operation_conflict",  # an operation id reused for another request (B12)
+#: Steps after which a literal handle is not pre-checked against the document
+#: as it is when the batch starts: they open, switch to or restore a document
+#: (or bring back an earlier state of it), so a later literal handle may name
+#: an entity of that document instead. Such a handle is still checked at run
+#: time by the step itself (``not_found``).
+_BATCH_PRECHECK_BARRIERS = frozenset(
+    {
+        "drawing_new",
+        "drawing_open",
+        "drawing_close",
+        "document_activate",
+        "document_close",
+        "checkpoint_restore",
+        "drawing_undo",
+        "drawing_redo",
+        "transaction_rollback",
+    }
 )
+
+#: Steps that hand later steps another document. A checkpoint is one
+#: document's, so it cannot undo them: on_error="auto" runs such a batch as
+#: stop (an explicit "rollback" is still honoured as before).
+_BATCH_DOCUMENT_SWITCHES = frozenset(
+    {
+        "drawing_new",
+        "drawing_open",
+        "drawing_close",
+        "document_activate",
+        "document_close",
+        "checkpoint_restore",
+    }
+)
+
+#: Steps that drive a transaction themselves. on_error="auto" runs a batch with
+#: one of them as stop, the 1.7 default: the live engine does not nest - a
+#: second ``transaction_begin`` inside auto's checkpoint is declined ("A
+#: transaction is already active"), which would refuse and roll back a batch
+#: 1.7 ran - and a step that commits or rolls back would close auto's own
+#: checkpoint under it. An explicit "rollback" is still honoured as before.
+_BATCH_TRANSACTION_STEPS = frozenset(
+    {"transaction_begin", "transaction_commit", "transaction_rollback"}
+)
+
+#: Every ``error.kind`` a step row (and, since 1.8-02, every error envelope)
+#: can carry. Closed on purpose: a client that branches on the taxonomy needs
+#: it to be enumerable. The table - each kind's category, retryable default
+#: and hint - is ``engineering/errors.py``; the 1.7.0 kinds come first, in
+#: their 1.7.0 order (``BATCH_KINDS_1_7``).
+BATCH_ERROR_KINDS = ERROR_KINDS
 
 #: What a rollback is actually worth, per backend transaction implementation.
 BATCH_ROLLBACK_GUARANTEES = ("snapshot", "best_effort_undo", "unverified", "none")
@@ -4337,245 +5280,57 @@ def _batch_read_only_tools() -> frozenset[str]:
 
 # ── error typing ────────────────────────────────────────────────────────────
 #
-# `ctx.fastmcp.call_tool` re-raises FastMCP's own exceptions untouched but wraps
-# everything else as `ToolError(f"Error calling tool {name!r}: {e}") from e`. The
-# `from e` is what makes a typed taxonomy possible: the real exception is still
-# on the `__cause__` chain, so nothing here ever has to read message text. It
-# must not, either — "this backend cannot write DWG" and a RuntimeError that
-# happens to say the same words are different facts, and only the type knows.
+# Lifted into engineering/errors.py by 1.8-02, so the refusal middleware (a
+# direct call) and cad_batch (a step) type an exception with one function. The
+# underscore names stay as aliases for the code and tests that use them.
 
-_BATCH_CAUSE_CHAIN_LIMIT = 8
+_batch_cause_chain = cause_chain
+_batch_capability_of = capability_of
+_batch_quarantine_of = quarantine_of
+_document_changed_of = document_changed_of
+_batch_refusal_kind = refusal_kind
+_batch_stale_of = stale_of
+_refusal_message = refusal_message
+_compact_batch_message = compact_message
+_batch_message = short_message
 
-_capability_error_types: tuple[type, ...] | None = None
+
+#: The raw escape hatches and the string argument their own denylist checks.
+_ESCAPE_HATCH_SANITIZERS = {
+    "system_run_command": ("command", sanitize_command),
+    "system_run_lisp": ("expression", sanitize_lisp),
+}
 
 
-def _capability_refusal_types() -> tuple[type, ...]:
-    """Backend exception classes meaning "this engine cannot do that".
+async def _escape_hatch_refusal(name, args: dict) -> CommandRefusedError | None:
+    """The ``CommandRefusedError`` a direct call of ``name`` with ``args`` would
+    raise, alternatives filled, or None (1.8-02).
 
-    Imported lazily, exactly as the backends themselves are: server.py must
-    still import on a box where a backend's dependencies are missing.
+    ``cad_batch`` denies the escape hatches whatever the string; this only lets
+    a step whose string the denylist refuses carry the direct route's kind. It
+    never runs anything, and any other outcome (an allowed or empty string) is
+    None, so the step is still ``denied``.
     """
-    global _capability_error_types
-    if _capability_error_types is None:
-        found: list[type] = []
-        try:
-            from backends.ezdxf_backend import UnsupportedCapabilityError
-
-            found.append(UnsupportedCapabilityError)
-        except Exception as exc:  # pragma: no cover - ezdxf is a core dependency
-            log.debug("capability refusal type unavailable: %s", exc)
-        _capability_error_types = tuple(found)
-    return _capability_error_types
-
-
-def _batch_cause_chain(exc: BaseException) -> list[BaseException]:
-    """``exc`` and its ``__cause__`` ancestors, outermost first, bounded."""
-    chain: list[BaseException] = []
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and len(chain) < _BATCH_CAUSE_CHAIN_LIMIT:
-        if id(current) in seen:
-            break
-        seen.add(id(current))
-        chain.append(current)
-        current = current.__cause__
-    return chain
-
-
-def _batch_capability_of(exc: BaseException) -> str | None:
-    """The backend capability ``exc`` refuses, or None.
-
-    Recognised by type, and — because a backend may ship its own refusal class —
-    also by the contract every such refusal implements: a non-empty
-    ``capability`` string plus the ``to_dict()`` that carries the
-    ``{ok, error, capability}`` payload. Structural, not textual.
-    """
-    types = _capability_refusal_types()
-    for error in _batch_cause_chain(exc):
-        if types and isinstance(error, types):
-            return str(getattr(error, "capability", "") or "unknown")
-        capability = getattr(error, "capability", None)
-        if isinstance(capability, str) and capability and callable(getattr(error, "to_dict", None)):
-            return capability
-    return None
-
-
-_quarantine_error_type: type | None = None
-
-
-def _quarantine_refusal_type() -> type | None:
-    """``DocumentQuarantineError``, imported lazily like the capability types.
-
-    It lives in ``backends.quarantine``, which deliberately imports no ezdxf, so
-    this resolves even on a box where a backend's dependencies are missing.
-    """
-    global _quarantine_error_type
-    if _quarantine_error_type is None:
-        from backends.quarantine import DocumentQuarantineError
-
-        _quarantine_error_type = DocumentQuarantineError
-    return _quarantine_error_type
-
-
-def _batch_quarantine_of(exc: BaseException) -> dict | None:
-    """The abandoned-call record ``exc`` refuses on behalf of, or None.
-
-    Recognised by type, not structurally: ``DocumentQuarantineError``
-    deliberately has no ``capability`` attribute, because
-    ``_batch_capability_of`` would then report it to the client as
-    ``kind: "unsupported"`` — telling them the ezdxf engine cannot draw a circle
-    when the engine is fine and the document is not.
-    """
-    try:
-        quarantine_type = _quarantine_refusal_type()
-    except Exception as exc_import:  # pragma: no cover - core module
-        log.debug("quarantine refusal type unavailable: %s", exc_import)
+    spec = _ESCAPE_HATCH_SANITIZERS.get(name) if isinstance(name, str) else None
+    if spec is None:
         return None
-    for error in _batch_cause_chain(exc):
-        if isinstance(error, quarantine_type):
-            return getattr(error, "quarantine", None) or {}
-    return None
-
-
-def _document_changed_of(exc: BaseException) -> dict | None:
-    """The ``ActiveDocumentChangedError`` payload on ``exc``'s cause chain, or None (B11).
-
-    Recognised by type; the error lives in ``backends.document_guard``, which
-    imports nothing, so this resolves on any box.
-    """
-    from backends.document_guard import ActiveDocumentChangedError
-
-    for error in _batch_cause_chain(exc):
-        if isinstance(error, ActiveDocumentChangedError):
-            return error.to_dict()
-    return None
-
-
-def _batch_refusal_kind(exc: BaseException) -> str:
-    """``"busy"`` for a detached read's ``DocumentBusyError``, else ``"quarantined"``.
-
-    ``DocumentBusyError`` subclasses ``DocumentQuarantineError`` so every QA
-    reader lets it propagate; its ``kind`` keeps a busy document from being
-    reported to the client as an untrusted one.
-    """
+    key, sanitizer = spec
+    value = args.get(key)
+    if not isinstance(value, str) or not value.strip():
+        return None
     try:
-        quarantine_type = _quarantine_refusal_type()
-    except Exception:  # pragma: no cover - core module
-        return "quarantined"
-    for error in _batch_cause_chain(exc):
-        if isinstance(error, quarantine_type):
-            return str(getattr(error, "kind", "quarantined"))
-    return "quarantined"
-
-
-def _batch_stale_of(exc: BaseException) -> dict | None:
-    """The ``StaleRevisionError.to_dict()`` refusal ``exc`` carries, or None.
-
-    By type, like the quarantine: a preview whose precondition no longer holds
-    is neither an engine boundary nor a failure to act - the caller re-runs the
-    dry run and applies its new preview (spec section 5, Task 12).
-    """
-    from engineering.changes.preview import StaleRevisionError
-
-    for error in _batch_cause_chain(exc):
-        if isinstance(error, StaleRevisionError):
-            return error.to_dict()
+        sanitizer(value)
+    except CommandRefusedError as exc:
+        exc.alternatives = await _command_alternatives(exc.alternative_verbs)
+        return exc
+    except Exception:  # anything else is the denial's business, not a policy kind
+        return None
     return None
-
-
-def _refusal_message(exc: BaseException) -> str:
-    """The most specific message on the cause chain, in full.
-
-    Deliberately not ``_batch_message``: that truncates to
-    ``_BATCH_MESSAGE_CHARS`` for a compact step row, and a refusal that gets cut
-    off mid-word ("...or switc") loses the escape hatch it was pointing at.
-    """
-    for error in reversed(_batch_cause_chain(exc)):
-        text = " ".join(str(error).split())
-        if text:
-            return text
-    return type(exc).__name__
-
-
-def _compact_batch_message(text: str) -> str:
-    """One short line, for a step row that sits alongside dozens of others."""
-    text = " ".join(text.split())
-    if len(text) > _BATCH_MESSAGE_CHARS:
-        text = text[: _BATCH_MESSAGE_CHARS - 3].rstrip() + "..."
-    return text
-
-
-def _batch_message(exc: BaseException) -> str:
-    """The most specific message on the chain, collapsed onto one short line."""
-    chain = _batch_cause_chain(exc)
-    text = ""
-    for error in reversed(chain):
-        text = str(error).strip()
-        if text:
-            break
-    return _compact_batch_message(text) or type(chain[0]).__name__
 
 
 def _classify_batch_error(exc: BaseException) -> dict:
     """Turn an exception from a nested tool call into a typed step error."""
-    from fastmcp.exceptions import NotFoundError
-    from fastmcp.exceptions import ValidationError as FastMCPValidationError
-    from pydantic import ValidationError as PydanticValidationError
-
-    changed = _document_changed_of(exc)
-    if changed is not None:
-        # B11: its own kind - the step was refused before anything was written,
-        # and every later step is refused the same way until the operator
-        # switches back or document_activate binds the other document.
-        return {
-            "kind": "active_document_changed",
-            "bound": changed["bound"],
-            "active": changed["active"],
-            "message": _batch_message(exc),
-        }
-    capability = _batch_capability_of(exc)
-    if capability:
-        return {
-            "kind": "unsupported",
-            "capability": capability,
-            "message": _batch_message(exc),
-        }
-    quarantine = _batch_quarantine_of(exc)
-    if quarantine is not None:
-        # R32: its own kind. Filing it under "unsupported" would tell the batch
-        # reader the engine lacks a feature; filing it under "failed" would hide
-        # that every remaining step will refuse for the same reason.
-        if _batch_refusal_kind(exc) == "busy":
-            return {
-                "kind": "busy",
-                "detached_read": quarantine,
-                "message": _batch_message(exc),
-            }
-        return {
-            "kind": "quarantined",
-            "quarantine": quarantine,
-            "message": _batch_message(exc),
-        }
-    stale = _batch_stale_of(exc)
-    if stale is not None:
-        return {
-            "kind": "stale_revision",
-            "expected_revision": stale["expected_revision"],
-            "actual_revision": stale["actual_revision"],
-            "changed": stale["changed"],
-            "message": _batch_message(exc),
-        }
-    chain = _batch_cause_chain(exc)
-    if any(isinstance(error, NotFoundError) for error in chain):
-        return {"kind": "unknown_tool", "message": _batch_message(exc)}
-    if any(isinstance(error, (FastMCPValidationError, PydanticValidationError)) for error in chain):
-        return {"kind": "invalid_args", "message": _batch_message(exc)}
-    if isinstance(chain[-1], ToolError):
-        # call_tool re-raises a FastMCPError untouched, so an *unwrapped*
-        # ToolError is the tool itself declining on purpose: a rejected path, a
-        # sanitized command, an unavailable backend.
-        return {"kind": "refused", "message": _batch_message(exc)}
-    return {"kind": "failed", "message": _batch_message(exc)}
+    return classify(exc)
 
 
 # ── $references ─────────────────────────────────────────────────────────────
@@ -4702,6 +5457,55 @@ def _batch_literal_handles(args: dict) -> list[str]:
             if isinstance(item, str) and item.strip() and not item.startswith(_BATCH_REF_SIGIL):
                 found.append(item.strip().upper())
     return found
+
+
+def _batch_handle_refs(plans: list[dict]) -> list[dict]:
+    """``{i, tool, handle}`` for every literal handle the pre-check reads (1.8-09).
+
+    Valid steps only, up to and including the first step that changes which
+    document - or which state of it - later steps work on
+    (:data:`_BATCH_PRECHECK_BARRIERS`).
+    """
+    refs: list[dict] = []
+    for row in plans:
+        if row.get("status") != "valid":
+            continue
+        for handle in _batch_literal_handles(row["_args"]):
+            refs.append({"i": row["i"], "tool": row["tool"], "handle": handle})
+        if row["tool"] in _BATCH_PRECHECK_BARRIERS:
+            break
+    return refs
+
+
+def _batch_mark_unknown_handles(plans: list[dict], refs: list[dict], fingerprints: dict) -> int:
+    """A dry run's pre-check: mark each step naming a missing handle invalid.
+
+    ``fingerprints`` is the preview's own read (one read serves both). Returns
+    how many steps were marked.
+    """
+    from engineering.changes.preview import MISSING
+
+    by_step: dict[int, list[str]] = {}
+    for ref in refs:
+        if fingerprints.get(ref["handle"], MISSING) == MISSING:
+            by_step.setdefault(ref["i"], [])
+            if ref["handle"] not in by_step[ref["i"]]:
+                by_step[ref["i"]].append(ref["handle"])
+    for index, handles in by_step.items():
+        row = plans[index]
+        row["status"] = "invalid"
+        row["error"] = annotate(
+            {
+                "kind": "unknown_handle",
+                "handles": handles,
+                "message": (
+                    f"step {index} ({row['tool']}) names {handles} - no such entity in the "
+                    "document; a real run refuses the whole batch with nothing run."
+                ),
+            },
+            "refused",
+        )
+    return len(by_step)
 
 
 # ── schema validation (dry_run, and the pre-flight of every real run) ───────
@@ -4962,6 +5766,69 @@ async def _batch_fingerprint(backend) -> dict | None:
     }
 
 
+async def _batch_undo_idle(backend) -> int | None:
+    """CMDACTIVE after a live rollback (1.8-09), or None when it cannot be read.
+
+    ``transaction_rollback`` sends ``_UNDO _B`` through ``_safe_send_command``,
+    which waits for the command to finish; the before/after evidence is read
+    only once AutoCAD is idle, or it would judge an undo still in flight.
+    """
+    try:
+        return int(await backend.system_get_variable("CMDACTIVE"))
+    except Exception as exc:  # evidence only
+        log.debug("CMDACTIVE unreadable after the rollback: %s", exc)
+        return None
+
+
+def _batch_not_idle_note(cmdactive: int | None) -> str:
+    """Why a live rollback carries ``verified: None`` (busy or unreadable seat)."""
+    if cmdactive is None:
+        return (
+            "ROLLBACK NOT VERIFIED - CMDACTIVE could not be read after the UNDO, so "
+            "AutoCAD was not known to be idle and the evidence was not read."
+        )
+    return (
+        f"ROLLBACK NOT VERIFIED - AutoCAD was not idle after the UNDO "
+        f"(CMDACTIVE={cmdactive}), so the evidence was not read."
+    )
+
+
+async def _batch_rollback_evidence(
+    backend, guarantee: str, verified: bool | None, handles_before: dict
+) -> tuple[bool | None, dict]:
+    """Strengthen a rollback's ``verified`` with the pre-check's handle fingerprints.
+
+    1.8-09: the literal handles read before step 1 are read again. Live
+    (``best_effort_undo``) the comparison is exact and runs only while
+    CMDACTIVE is 0; headless (``snapshot``) it is presence only (see
+    engineering/changes/precheck.py). Returns the new ``verified`` and the
+    extra atomicity keys. A CMDACTIVE that cannot be read (``cmdactive:
+    None``) is not idleness: like a busy seat it answers ``verified: None``.
+    """
+    from engineering.changes.precheck import changed_since
+
+    extra: dict = {}
+    if guarantee == "best_effort_undo":
+        idle = await _batch_undo_idle(backend)
+        extra["cmdactive"] = idle
+        if idle != 0:  # busy, or unreadable (None): never judged, never claimed
+            return None, extra
+    if not handles_before:
+        return verified, extra
+    try:
+        changed = await changed_since(
+            backend, handles_before, exact=guarantee == "best_effort_undo"
+        )
+    except Exception as exc:  # evidence only; the count/extents check stands
+        log.debug("handle evidence unreadable after the rollback: %s", exc)
+        return verified, extra
+    extra["handles_checked"] = len(handles_before)
+    if changed:
+        extra["handles_changed"] = changed
+        return False, extra
+    return verified, extra
+
+
 # ── result compaction ───────────────────────────────────────────────────────
 
 
@@ -5040,13 +5907,13 @@ async def cad_batch(
         str,
         Field(
             description=(
-                "stop (default): halt at the first failure, keep what already ran. "
-                "continue: run every step. rollback: open a checkpoint first and undo "
-                "on failure - read the returned `atomicity` block for what that is "
-                "worth on this backend."
+                "auto (default) = all or nothing: rollback when a step mutates, stop when "
+                "every step reads. 'stop' halts at the first failure and keeps what ran; "
+                "'continue' runs every step; 'rollback' opens a checkpoint and undoes on "
+                "failure (the returned `atomicity` block says what that is worth here)."
             )
         ),
-    ] = "stop",
+    ] = "auto",
     dry_run: Annotated[
         bool,
         "Validate every step against its tool's real JSON Schema and execute nothing.",
@@ -5089,6 +5956,10 @@ async def cad_batch(
             )
         ),
     ] = None,
+    label: Annotated[
+        str | None,
+        Field(description="Labels the batch's history rows, e.g. 'round 2' (1-200 chars)."),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Execute an ordered list of tool calls in ONE round trip.
@@ -5110,16 +5981,21 @@ async def cad_batch(
 
     VALIDATION runs first, always: an unknown tool, a schema-invalid argument or
     a reference no earlier step binds refuses the whole batch before anything
-    executes. `on_error` governs run-time failures only. dry_run=True returns
-    that validation report and executes nothing.
+    executes. So does a LITERAL handle (in a handle parameter) that names no
+    entity: one fingerprint read checks them all, and a missing one refuses
+    the batch with kind unknown_handle, naming each step index and handle -
+    executed 0. A literal handle after a step that opens, switches or restores
+    a document (drawing_open, drawing_undo, ...) is checked when its step runs.
+    `on_error` governs run-time failures only. dry_run=True returns that
+    validation report and executes nothing.
 
     ERRORS are typed, never text: each failed step carries error.kind - one of
     unsupported (with the backend `capability`), invalid_args, refused, failed,
     unknown_tool, unresolved_ref, denied, malformed_step, quarantined, busy,
     active_document_changed (live engine: the operator switched documents),
     stale_revision, scan_incomplete, timed_out, unknown_commit (a write that
-    outran its deadline while its worker ran), cancelled, operation_conflict -
-    and its own `operation_id`.
+    outran its deadline while its worker ran), cancelled, operation_conflict,
+    unknown_handle - and its own `operation_id`.
 
     PREVIEW AND APPLY. dry_run=True also returns `preview`: the document id and
     content revision, the exact fingerprint of every LITERAL handle in a handle
@@ -5133,24 +6009,37 @@ async def cad_batch(
     included).
 
     OPERATIONS: the batch and each step are operations with their own ids
-    (system_status lists the recent ones). Pass `operation_id` (or the
+    (drawing_history lists them). Pass `operation_id` (or the
     request's `_meta.operation_id`) to make a retry safe: the same id with the
-    same steps replays the recorded result instead of drawing twice. The
-    journal is in memory: a server restart forgets it (durable in 1.8.0, B13).
+    same steps replays the recorded result instead of drawing twice, also
+    after a restart (the journal is durable since 1.8.0).
 
-    ATOMICITY is reported, not assumed. Read the `atomicity` block: on the
-    headless backend rollback restores a full document snapshot; on live AutoCAD
-    it sends an UNDO whose landing AutoCAD never confirms. The default
-    on_error="stop" claims nothing and is exact on both. A checkpoint a step
-    opens with transaction_begin is closed with the batch's (`unwound`).
+    ATOMICITY is reported, not assumed. The default on_error="auto" (since
+    1.8.0; 1.7 defaulted to "stop") makes a batch with at least one mutating
+    step all or nothing: on the headless backend a run-time failure restores a
+    full document snapshot; on live AutoCAD it sends an UNDO, judged by the
+    before/after fingerprints once AutoCAD is idle (CMDACTIVE 0). A read-only
+    batch opens no checkpoint, and neither does one with a transaction_begin /
+    transaction_commit / transaction_rollback step: it runs as "stop" (live
+    AutoCAD does not nest a transaction). Read the `atomicity` block: `mode` is what ran,
+    `default_applied` (auto only) whether auto's checkpoint was opened,
+    `verified` whether the rollback was evidenced. Pass on_error="stop" to
+    keep the steps that ran before a failure. Under an explicit
+    on_error="rollback", a checkpoint a step opens with transaction_begin is
+    closed with the batch's (`unwound`).
+
+    CHANGES: `changes` {added, deleted, counts, complete} sums the steps; a
+    failed batch reports `partial_changes`.
 
     NOT CALLABLE from a batch: the raw command/LISP escape hatches, and
-    cad_batch itself. Call those directly.
+    cad_batch itself. Call those directly. A step the server's tool policy
+    refuses (READ_ONLY, TOOL_ALLOWLIST / TOOL_DENYLIST, MAX_TOOL_COST) refuses
+    the whole batch before any step runs, kind policy_refused.
 
     For a few hundred entities of the same kind, entity_batch_create is denser
     still (no per-step tool name) - and it can be one step of a cad_batch.
     """
-    mode = (on_error or "stop").lower().strip()
+    mode = (on_error or "auto").lower().strip()
     if mode not in BATCH_ON_ERROR_MODES:
         raise ToolError(
             f"cad_batch: on_error must be one of {BATCH_ON_ERROR_MODES}, got {on_error!r}."
@@ -5162,6 +6051,14 @@ async def cad_batch(
             f"cad_batch: {len(steps)} steps exceeds the {MAX_BATCH_STEPS}-step ceiling. "
             "Steps run sequentially inside one uncancellable call - split the work."
         )
+    # 1.8-10: the label every step's row carries - the same one the batch's own
+    # row got in the middleware (_meta.label first); refused before anything ran.
+    try:
+        step_label = _client_label("cad_batch", {"label": label}, _request_meta_of(ctx))
+    except ValueError as exc:
+        from engineering.errors import InvalidArgsError
+
+        raise InvalidArgsError(f"invalid_args: {exc}") from exc
 
     denied = _batch_denied_tools()
     read_only = _batch_read_only_tools()
@@ -5174,7 +6071,7 @@ async def cad_batch(
 
         def _invalid(kind: str, message: str, row: dict = row, index: int = index) -> None:
             row["status"] = "invalid"
-            row["error"] = {"kind": kind, "message": message}
+            row["error"] = annotate({"kind": kind, "message": message}, "refused")
             problems.append(f"step {index}: {message}")
 
         if not isinstance(step, dict):
@@ -5198,6 +6095,14 @@ async def cad_batch(
                 f"step {index} has unexpected key(s) {unknown_keys}; a step is "
                 "{'tool', 'args', 'bind'}",
             )
+        elif (refusal := await _escape_hatch_refusal(name, args)) is not None:
+            # 1.8-02: a command or LISP string the denylist refuses is the same
+            # policy_refused (verbs, symbols, alternatives) a direct call gets,
+            # so both routes name one kind; `denied` below is only for a string
+            # a direct call would run.
+            row["status"] = "invalid"
+            row["error"] = annotate(classify(refusal), "refused")
+            problems.append(f"step {index}: {row['error']['message']}")
         elif name in denied:
             _invalid(
                 "denied",
@@ -5205,6 +6110,13 @@ async def cad_batch(
                 "the raw escape hatches (or another batch executor). Call it directly, "
                 "where its own gate applies.",
             )
+        elif (policy_refused := _policy_refusal(name)) is not None:
+            # 1.8-17: steps skip the middleware (run_middleware=False), so the
+            # tool policy is checked here, for every step, before any runs.
+            row["status"] = "invalid"
+            row["error"] = annotate(classify(policy_refused), "refused")
+            row["_policy"] = policy_refused
+            problems.append(f"step {index}: {row['error']['message']}")
         else:
             tool = await ctx.fastmcp.get_tool(name)
             card = (getattr(tool, "meta", None) or {}).get("cad") or {}
@@ -5263,9 +6175,36 @@ async def cad_batch(
                             bound_names.add(bind)
         plans.append(row)
 
+    # 1.8-09: on_error="auto" (the default) is all or nothing when the batch
+    # can write - rollback - and opens no checkpoint when it cannot - stop.
+    requested = mode
+    auto_note = ""
+    if mode == "auto":
+        tools = [row["tool"] for row in plans if row["status"] == "valid"]
+        mutating = any(tool not in read_only for tool in tools)
+        switches = sorted({tool for tool in tools if tool in _BATCH_DOCUMENT_SWITCHES})
+        own = sorted({tool for tool in tools if tool in _BATCH_TRANSACTION_STEPS})
+        mode = "rollback" if mutating and not switches and not own else "stop"
+        if switches:
+            auto_note = (
+                f"on_error='auto' with {switches}: a checkpoint is one document's and "
+                "cannot undo a switch to another, so no checkpoint was opened; it halts "
+                "at the first failure. "
+            )
+        elif own:
+            auto_note = (
+                f"on_error='auto' with {own}: the batch drives its own transaction, so "
+                "auto opened none around it (live AutoCAD does not nest one) and it "
+                "halts at the first failure, as in 1.7. "
+            )
+        elif not mutating:
+            auto_note = (
+                "on_error='auto' on a read-only batch: no checkpoint opened; it halts at "
+                "the first failure. "
+            )
+
     if dry_run:
-        invalid = sum(1 for row in plans if row["status"] == "invalid")
-        guarantee, note = ("none", _BATCH_NO_CLAIM_NOTE.format(mode=mode))
+        guarantee, note = ("none", auto_note + _BATCH_NO_CLAIM_NOTE.format(mode=mode))
         if mode == "rollback":
             guarantee, note = _batch_rollback_guarantee(_backend(ctx))
             note = f"Planned only - a dry run opens no checkpoint. {note}"
@@ -5277,19 +6216,30 @@ async def cad_batch(
             handles=sorted({h for row in valid for h in _batch_literal_handles(row["_args"])}),
             planned=[{"i": row["i"], "tool": row["tool"], "args": row["_args"]} for row in valid],
         )
+        preview_dict = preview.to_dict()
+        # 1.8-09: the preview's fingerprint read is the pre-check's read too.
+        _batch_mark_unknown_handles(
+            plans,
+            _batch_handle_refs(plans),
+            {row["handle"]: row["fingerprint"] for row in preview_dict["preconditions"]},
+        )
+        invalid = sum(1 for row in plans if row["status"] == "invalid")
+        dry_atomicity = _batch_atomicity(mode=mode, guarantee=guarantee, note=note)
+        if requested == "auto":
+            dry_atomicity["default_applied"] = mode == "rollback"
         return {
             "ok": invalid == 0,
             "dry_run": True,
             "operation_id": CURRENT_OPERATION.get() or operation_id,
-            "on_error": mode,
+            "on_error": requested,
             "steps": len(steps),
             "executed": 0,
             "valid": len(plans) - invalid,
             "invalid": invalid,
             "bindings": sorted(bound_names),
             "results": [{k: v for k, v in row.items() if not k.startswith("_")} for row in plans],
-            "atomicity": _batch_atomicity(mode=mode, guarantee=guarantee, note=note),
-            "preview": preview.to_dict(),
+            "atomicity": dry_atomicity,
+            "preview": preview_dict,
             "note": (
                 "Validated against each tool's real JSON Schema; nothing was executed. "
                 "A '$reference' validates as a wildcard because its type is only known "
@@ -5297,6 +6247,20 @@ async def cad_batch(
             ),
         }
 
+    first_policy = next((row["_policy"] for row in plans if "_policy" in row), None)
+    if first_policy is not None:
+        # The batch's own envelope is the policy refusal of its first refused
+        # step (kind policy_refused, its policy / tool / allowed_cost), naming
+        # every problem; nothing ran.
+        raise policy.PolicyRefusedError(
+            f"cad_batch refused all {len(steps)} steps - nothing was executed. "
+            + "; ".join(problems[:5])
+            + ("" if len(problems) <= 5 else f" (+{len(problems) - 5} more)"),
+            policy=first_policy.policy,
+            tool=first_policy.tool,
+            allowed_cost=first_policy.allowed_cost,
+            cost=first_policy.cost,
+        ) from None
     if problems:
         raise ToolError(
             f"cad_batch refused all {len(steps)} steps - nothing was executed. "
@@ -5305,6 +6269,21 @@ async def cad_batch(
         )
 
     backend = _backend(ctx)
+    # 1.8-09: every literal handle, in one read, before anything runs (and
+    # before any checkpoint opens, so a refusal leaves nothing to close). The
+    # fingerprints are a rollback's "before" evidence too.
+    handles_before: dict = {}
+    handle_refs = _batch_handle_refs(plans)
+    if handle_refs:
+        from engineering.changes.precheck import require_handles
+
+        handles_before = await require_handles(
+            backend,
+            handle_refs,
+            subject=f"cad_batch refused all {len(steps)} steps - nothing was executed",
+            executed=0,
+            steps=len(steps),
+        )
     journal = _operations_journal(ctx.lifespan_context)
     # The middleware set the batch's own operation (a client's id included).
     batch_id = CURRENT_OPERATION.get() or operation_id
@@ -5318,14 +6297,23 @@ async def cad_batch(
             backend, expected_revision=expected_revision, preconditions=preconditions
         )
         watch = await RevisionWatch.begin(backend)
-    guarantee, note = "none", _BATCH_NO_CLAIM_NOTE.format(mode=mode)
+    guarantee, note = "none", auto_note + _BATCH_NO_CLAIM_NOTE.format(mode=mode)
     transaction = False
     before = None
     base_depth = None
     if mode == "rollback":
         guarantee, note = _batch_rollback_guarantee(backend)
-        if guarantee == "none":
+        if guarantee == "none" and requested == "auto":
+            # A default must not refuse what 1.7 ran: no transactions here, so
+            # auto runs as stop and says so.
+            mode = "stop"
+            note = (
+                f"on_error='auto' fell back to stop: this backend has no transactions. "
+                f"{_BATCH_NO_CLAIM_NOTE.format(mode=mode)}"
+            )
+        elif guarantee == "none":
             raise ToolError(f"cad_batch: on_error='rollback' is unavailable here. {note}")
+    if mode == "rollback":
         before = await _batch_fingerprint(backend)
         base_depth = _read_transaction_depth(backend)
         # B01: the begin runs shielded. Cancelled mid-await, its worker would
@@ -5335,19 +6323,40 @@ async def cad_batch(
         # blocks every later batch. Shielded, the outcome is always known: a
         # cancellation that arrived meanwhile is delivered by the checkpoint
         # at the top of the try below, whose handler rolls the begin back.
-        with anyio.CancelScope(shield=True):
-            opened = await backend.transaction_begin()
-        if not (isinstance(opened, dict) and opened.get("ok")):
+        try:
+            with anyio.CancelScope(shield=True):
+                opened = await backend.transaction_begin()
+        except Exception as exc:
+            # 1.8-09: auto's own checkpoint failing (no document open yet, a
+            # busy or quarantined document, an export that broke) must not
+            # refuse a batch 1.7 ran: it runs as stop and each step reports
+            # its own refusal, as in 1.7. An explicit rollback still raises.
+            if requested != "auto":
+                raise
+            opened = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        begun = isinstance(opened, dict) and bool(opened.get("ok"))
+        if not begun:
             # Nothing to close; a cancellation that arrived during the begin
             # must still end the request as one (answering it normally makes
             # the SDK answer it twice).
             await anyio.lowlevel.checkpoint_if_cancelled()
             reason = (opened or {}).get("error", "transaction_begin declined")
+        if not begun and requested == "auto":
+            # 1.8-09: auto's checkpoint was declined (live: a transaction the
+            # caller opened, or AutoCAD at a prompt - CMDACTIVE). The default
+            # does not refuse what 1.7 ran: it runs as stop, with no claim.
+            mode, guarantee = "stop", "none"
+            before = None
+            note = (
+                f"on_error='auto' could not open its checkpoint ({reason}), so it ran as "
+                f"stop. {_BATCH_NO_CLAIM_NOTE.format(mode=mode)}"
+            )
+        elif not begun:
             return {
                 "ok": False,
                 "dry_run": False,
                 "operation_id": batch_id,
-                "on_error": mode,
+                "on_error": requested,
                 "steps": len(steps),
                 "executed": 0,
                 "succeeded": 0,
@@ -5368,12 +6377,16 @@ async def cad_batch(
                     ),
                 ),
             }
-        transaction = True
+        else:
+            transaction = True
 
     bindings: dict[str, Any] = {}
     results: list[dict] = []
     succeeded = failed = executed = 0
     total = len(plans)
+    # 1.8-10: each mutating step's change summary is kept, summed into
+    # `changes` / `partial_changes`.
+    step_changes: list = []
 
     try:
         # Inside the try: from here on an open checkpoint is closed by the
@@ -5395,17 +6408,20 @@ async def cad_batch(
             except BatchReferenceError as exc:
                 failed += 1
                 row["status"] = "error"
-                row["error"] = {"kind": "unresolved_ref", "message": _batch_message(exc)}
+                row["error"] = annotate(
+                    {"kind": "unresolved_ref", "message": _batch_message(exc)}, "refused"
+                )
                 log.warning("BATCH %d/%d %-38s unresolved_ref", position + 1, total, name)
                 results.append(row)
                 continue
             # B12: a step is an operation of its own. Steps skip the middleware,
             # so the id is minted here and set for the step's backend calls,
             # whose call_outcomes rows then carry it.
-            step, _ = journal.begin(name, args, document=_identity_of(backend))
+            step, _ = journal.begin(name, args, document=_identity_of(backend), label=step_label)
             step_token = CURRENT_OPERATION.set(step.operation_id)
             if watch is not None:
                 await watch.before(f"step {plan['i']} ({name})")
+            step_mark = _change_mark(backend, name)
             try:
                 # run_middleware=False: the cad_batch call itself is already through
                 # the audit/timing chain, and skipping it keeps the error one wrap
@@ -5432,11 +6448,18 @@ async def cad_batch(
                     row["error"]["kind"] = timed
                 row["error"]["operation_id"] = step.operation_id
                 kind = row["error"]["kind"]
+                step_state = _STATE_OF_KIND.get(kind, "refused")
+                # 1.8-02: the direct envelope's category / retryable / hint.
+                annotate(row["error"], step_state)
+                changed = _change_summary(backend, name, step_mark, None)
+                if step_mark is not None:
+                    step_changes.append(changed)
                 journal.finish(
                     step,
-                    _STATE_OF_KIND.get(kind, "refused"),
+                    step_state,
                     error_kind=kind,
                     document=_identity_of(backend),
+                    changes=changed,
                 )
                 log.warning("BATCH %d/%d %-38s %s", position + 1, total, name, kind)
                 results.append(row)
@@ -5477,11 +6500,16 @@ async def cad_batch(
                     ),
                     "operation_id": step.operation_id,
                 }
+                annotate(row["error"], "refused")
+                changed = _change_summary(backend, name, step_mark, None)
+                if step_mark is not None:
+                    step_changes.append(changed)
                 journal.finish(
                     step,
                     "refused",
                     error_kind=row["error"]["kind"],
                     document=_identity_of(backend),
+                    changes=changed,
                 )
                 log.warning("BATCH %d/%d %-38s %s", position + 1, total, name, row["error"]["kind"])
                 results.append(row)
@@ -5491,7 +6519,10 @@ async def cad_batch(
                     break
                 continue
             succeeded += 1
-            journal.finish(step, "committed", document=_identity_of(backend))
+            changed = _change_summary(backend, name, step_mark, outcome)
+            if step_mark is not None:
+                step_changes.append(changed)
+            journal.finish(step, "committed", document=_identity_of(backend), changes=changed)
             if plan["_bind"]:
                 bindings[plan["_bind"]] = structured
                 row["bind"] = plan["_bind"]
@@ -5557,6 +6588,7 @@ async def cad_batch(
     declined = None
     unwound = 0
     depth_left = None
+    evidence: dict = {}
     if transaction:
         # B01: the commit or rollback that closes the checkpoint runs shielded;
         # a cancellation arriving now must not leave it half-closed.
@@ -5575,6 +6607,12 @@ async def cad_batch(
                 )
                 after = await _batch_fingerprint(backend)
                 verified = None if (before is None or after is None) else before == after
+                if rolled_back:
+                    # 1.8-09: the pre-check's handle fingerprints, read again
+                    # (live: only once AutoCAD is idle).
+                    verified, evidence = await _batch_rollback_evidence(
+                        backend, guarantee, verified, handles_before
+                    )
             else:
                 committed, declined, unwound, depth_left = await _close_batch_checkpoint(
                     backend, backend.transaction_commit, base_depth
@@ -5593,13 +6631,18 @@ async def cad_batch(
         atomicity.update(
             {"committed": committed, "verified": verified, "before": before, "after": after}
         )
+        atomicity.update(evidence)
         if unwound:
             atomicity["unwound"] = unwound
+    if requested == "auto":
+        # 1.8-09: whether auto's checkpoint was opened (false: a read-only
+        # batch, or a backend that could not open one - `note` says which).
+        atomicity["default_applied"] = transaction
     payload = {
         "ok": ok,
         "dry_run": False,
         "operation_id": batch_id,
-        "on_error": mode,
+        "on_error": requested,
         "steps": total,
         "executed": executed,
         "succeeded": succeeded,
@@ -5611,6 +6654,18 @@ async def cad_batch(
     }
     if watch is not None:
         payload["revision"] = watch.report()
+    from backends.change_sets import empty_changes, merge_changes
+
+    summed = merge_changes(step_changes)
+    if summed is not None:
+        if rolled_back:
+            # What ran was undone; partial_changes says what the rollback undid.
+            payload["changes"] = empty_changes(complete=verified is True, rolled_back=True)
+            payload["partial_changes"] = summed
+        elif failed:
+            payload["partial_changes"] = summed
+        else:
+            payload["changes"] = summed
     if declined:
         payload["atomicity"]["note"] = (
             f"BACKEND DECLINED THE {'ROLLBACK' if failed else 'COMMIT'} ({declined}). "
@@ -5619,10 +6674,14 @@ async def cad_batch(
             f"the steps that succeeded are still in the document. {note}"
         )
     elif rolled_back and verified is False:
+        changed = evidence.get("handles_changed")
+        what = f"; handles {changed} differ" if changed else ""
         payload["atomicity"]["note"] = (
             "ROLLBACK NOT VERIFIED - the document fingerprint differs from the one "
-            f"taken before step 1. {note}"
+            f"taken before step 1{what}. {note}"
         )
+    elif rolled_back and "cmdactive" in evidence and evidence["cmdactive"] != 0:
+        payload["atomicity"]["note"] = _batch_not_idle_note(evidence["cmdactive"]) + f" {note}"
     elif base_depth is not None and depth_left is not None and depth_left > base_depth:
         payload["atomicity"]["note"] = (
             f"CHECKPOINT LEFT OPEN - transaction_depth is {depth_left} after closing "
@@ -5646,7 +6705,8 @@ async def cad_batch(
 async def entity_batch_create(
     entities: Annotated[
         list[dict],
-        "List of entity definitions. Each dict must have 'type' and type-specific params. Types: line, circle, arc, polyline, rectangle, text, point",
+        "List of entity definitions. Each dict must have 'type' and type-specific params. Types: line, circle, arc, polyline, rectangle, text, point. "
+        "Any definition may add 'lineweight' (hundredths of a mm, or 'ByLayer' = -1, 'ByBlock' = -2, 'Default' = -3 - not ByLayer)",
     ],
     ctx: Context = None,
 ) -> dict:
@@ -5660,42 +6720,13 @@ async def entity_batch_create(
     differ, must be ordered, or must feed each other.
     """
     b = _backend(ctx)
-    results = []
-    errors = []
     total = len(entities)
     await ctx.info(f"Batch creating {total} entities")
-
-    create_map = {
-        "line": b.entity_create_line,
-        "circle": b.entity_create_circle,
-        "arc": b.entity_create_arc,
-        "polyline": b.entity_create_polyline,
-        "text": b.entity_create_text,
-        "mtext": b.entity_create_mtext,
-        "point": b.entity_create_point,
-        "hatch": b.entity_create_hatch,
-        "spline": b.entity_create_spline,
-        "ellipse": b.entity_create_ellipse,
-    }
-
-    for i, ent_def in enumerate(entities):
-        await ctx.report_progress(i, total)
-        ent_type = ent_def.pop("type", None)
-        if not ent_type:
-            errors.append({"index": i, "error": "Missing 'type' key"})
-            continue
-        creator = create_map.get(ent_type.lower())
-        if not creator:
-            errors.append({"index": i, "error": f"Unknown type: {ent_type}"})
-            continue
-        try:
-            info = await creator(**ent_def)
-            results.append(_dc(info))
-        except Exception as exc:
-            errors.append({"index": i, "type": ent_type, "error": str(exc)})
-
+    # 1.8-23: one backend call - the contract's loop over entity_create_*
+    # headlessly, ONE STA job with one display refresh live.
+    result = await b.entity_batch_create(entities, progress=ctx.report_progress)
     await ctx.report_progress(total, total)
-    return {"created": len(results), "errors": errors, "entities": results}
+    return result
 
 
 @cad_tool(
@@ -5709,7 +6740,8 @@ async def entity_batch_create(
 async def entity_batch_modify(
     operations: Annotated[
         list[dict],
-        "List of operations. Each dict: {handle, action, ...params}. Actions: move(dx,dy), rotate(base_x,base_y,angle_deg), scale(base_x,base_y,factor), delete, set_properties(layer,color,...)",
+        "List of operations. Each dict: {handle, action, ...params}. Actions: move(dx,dy), rotate(base_x,base_y,angle_deg), scale(base_x,base_y,factor), delete, set_properties(layer,color,linetype,lineweight,visible). "
+        "lineweight: hundredths of a mm, or 'ByLayer' = -1, 'ByBlock' = -2, 'Default' = -3 - not ByLayer",
     ],
     ctx: Context = None,
 ) -> dict:
@@ -5719,8 +6751,26 @@ async def entity_batch_modify(
 
     Covers move/rotate/scale/delete/set_properties only. For anything else, for
     ordering, or to feed one step's result into the next, use cad_batch.
+
+    Every handle is checked first, in one read: one that names no entity
+    refuses the whole call with kind unknown_handle (`missing` lists each
+    index and handle) and nothing is modified.
     """
+    from engineering.changes.precheck import require_handles
+
     b = _backend(ctx)
+    # 1.8-09: the pre-check; an operation without a handle is still reported
+    # per row below, as before.
+    await require_handles(
+        b,
+        [
+            {"index": i, "handle": op.get("handle")}
+            for i, op in enumerate(operations)
+            if isinstance(op, dict) and op.get("handle")
+        ],
+        subject=f"entity_batch_modify refused all {len(operations)} operation(s) - nothing was modified",
+        modified=0,
+    )
     results = []
     errors = []
     total = len(operations)
@@ -5885,6 +6935,18 @@ async def validation_check(
     checks: Annotated[
         list[str], "List of checks: empty_layers, zero_length, duplicate_entities"
     ] = None,
+    summary: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Return {total, by_focus, by_severity, issues[:limit]} with compact "
+            "rows (5 unless limit says otherwise); by_focus counts per check.",
+        ),
+    ] = False,
+    limit: Annotated[
+        int | None,
+        Field(default=None, ge=0, description="Keep this many issues; the counts stay complete."),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Run quality checks on the current drawing.
@@ -5893,6 +6955,9 @@ async def validation_check(
     - empty_layers: Find layers with no entities
     - zero_length: Find zero-length lines
     - duplicate_entities: Find entities at the same position
+
+    With summary=True or a limit the result also carries total, by_focus (per check)
+    and by_severity over every issue, and `issues` keeps only the first `limit`.
     """
     if checks is None:
         checks = ["empty_layers", "zero_length"]
@@ -5936,6 +7001,11 @@ async def validation_check(
                         }
                     )
 
+    if summary or limit is not None:
+        from engineering.qa_coverage import summarize
+
+        compact = summarize(issues, summary=summary, limit=limit, key="check")
+        return {"ok": len(issues) == 0, **compact, "checks_run": checks}
     return {
         "ok": len(issues) == 0,
         "total_issues": len(issues),
@@ -5986,12 +7056,36 @@ async def view_screenshot(
         "Label each entity with its handle, so what you see maps to what you "
         "can modify. Headless backend only.",
     ] = False,
+    region: Annotated[
+        list[float] | None,
+        "Optional window [x0, y0, x1, y1] in drawing units (WCS): only that part "
+        "is drawn, at a stated scale. Fewer tokens than a full sheet for a detail.",
+    ] = None,
+    max_px: Annotated[
+        int,
+        Field(description="Long side of the image in pixels (64-4096).", ge=64, le=4096),
+    ] = 1568,
     ctx: Context = None,
 ):
     """Capture a screenshot of the current drawing view.
 
     COM backend: captures live AutoCAD window at current view.
     ezdxf backend: renders via matplotlib to PNG.
+
+    With `region=[x0, y0, x1, y1]` only that window is drawn, on both engines:
+    headless it is the current space, live it is the bound document's
+    `Document.Export` snapshot drawn by the same renderer
+    (`source: "export_snapshot"`, seconds on a large drawing). Without a region
+    the headless engine frames the extents and the live one captures the
+    AutoCAD window (`source: "window"`). Beside the image comes a report:
+    `applied`, `framing`, `px` (read from the PNG), `region` (the window drawn —
+    the requested one widened by under a pixel so x and y share one scale),
+    `px_per_unit` (drawing point (x, y) is pixel ((x - x0)·ppu, (y1 - y)·ppu));
+    a window capture reports `region`/`px_per_unit` null, plus `dpi` (the
+    window's DPI), `dpi_awareness`, `capture` (the bitmap in physical pixels,
+    before `max_px`) and `window_minimized` - the server makes itself DPI-aware,
+    so the whole window is captured at any display scaling. A zero-width region or
+    a `max_px` outside 64-4096 is refused by name.
 
     With `overlay_handles`, each entity is labelled with its handle at its own
     centre — every modify tool takes a handle, and without the labels there is
@@ -6000,26 +7094,49 @@ async def view_screenshot(
     labelled. Live AutoCAD captures its own window, so there is no render to
     label there; it refuses with `capability: "handle_overlay"`.
 
-    Returns an Image content block with the PNG data.
+    Returns an Image content block with the PNG data, then the report as JSON.
     """
-    from fastmcp.utilities.types import Image
-
     await ctx.info("Capturing drawing screenshot")
     await ctx.report_progress(0, 100)
 
-    b = _backend(ctx)
-    png_bytes = await b.view_screenshot(overlay_handles=overlay_handles)
-
+    report = await _view_render(
+        _backend(ctx), region=region, max_px=max_px, overlay_handles=overlay_handles
+    )
     await ctx.report_progress(100, 100)
+    return _view_image_result(
+        report,
+        "Screenshot not available. "
+        "For COM backend: ensure AutoCAD window is visible. "
+        "For ezdxf backend: install matplotlib (pip install matplotlib).",
+    )
 
-    if png_bytes is None:
-        raise ToolError(
-            "Screenshot not available. "
-            "For COM backend: ensure AutoCAD window is visible. "
-            "For ezdxf backend: install matplotlib (pip install matplotlib)."
-        )
 
-    return Image(data=png_bytes, format="png")
+async def _view_render(b, *, region, max_px: int, overlay_handles: bool = False) -> dict:
+    """``b.view_render``, a bad region or size turned into a ToolError naming it."""
+    try:
+        return await b.view_render(region=region, max_px=max_px, overlay_handles=overlay_handles)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _view_image_result(report: dict, unavailable: str) -> ToolResult:
+    """The PNG as an image block, then the render report as JSON (1.8-07)."""
+    from fastmcp.utilities.types import Image
+    from mcp.types import TextContent
+
+    report = dict(report)
+    png = report.pop("png", None)
+    if png is None:
+        detail = report.get("error")
+        raise ToolError(f"{unavailable} ({detail})" if detail else unavailable)
+    payload = {"ok": True, **report}
+    return ToolResult(
+        content=[
+            Image(data=png, format="png").to_image_content(),
+            TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, default=str)),
+        ],
+        structured_content=payload,
+    )
 
 
 @cad_tool(
@@ -6035,35 +7152,53 @@ async def view_zoom_and_screenshot(
     y1: Annotated[float | None, "Optional: zoom to window corner Y1"] = None,
     x2: Annotated[float | None, "Optional: zoom to window corner X2"] = None,
     y2: Annotated[float | None, "Optional: zoom to window corner Y2"] = None,
+    max_px: Annotated[
+        int,
+        Field(description="Long side of the image in pixels (64-4096).", ge=64, le=4096),
+    ] = 1568,
     ctx: Context = None,
 ):
     """Zoom to extents (or window if coordinates given), then capture a screenshot.
 
     The most useful tool for visually inspecting drawing state.
-    """
-    from fastmcp.utilities.types import Image
 
+    The window is really applied on both engines: headless it is drawn as that
+    window (it used to be ignored), live AutoCAD zooms to it and the picture is
+    the bound document's export drawn at a stated scale
+    (`source: "export_snapshot"`). Without a window: extents (headless render;
+    live ZoomExtents + window capture). The report beside the image is the one
+    `view_screenshot` gives — `applied`, `px`, `region`, `px_per_unit`, and on a
+    live window capture `dpi`, `capture`, `window_minimized`. Give all
+    four corners or none: a partial window is refused, never silently widened
+    to the extents.
+    """
     await ctx.info("Zooming and capturing screenshot")
     b = _backend(ctx)
 
+    corners = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+    missing = [name for name, value in corners.items() if value is None]
+    if missing and len(missing) < len(corners):
+        raise ToolError(
+            f"view_zoom_and_screenshot: a window needs all four corners; missing "
+            f"{', '.join(missing)} (or give none for the extents)"
+        )
+
     await ctx.report_progress(10, 100)
-    if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
+    if not missing:
         await b.view_zoom_window(x1, y1, x2, y2)
+        region = [x1, y1, x2, y2]
     else:
         await b.view_zoom_extents()
+        region = None
 
     await ctx.report_progress(50, 100)
-    png_bytes = await b.view_screenshot()
+    report = await _view_render(b, region=region, max_px=max_px)
     await ctx.report_progress(100, 100)
-
-    if png_bytes is None:
-        raise ToolError("Screenshot unavailable. Check backend capabilities.")
-
-    return Image(data=png_bytes, format="png")
+    return _view_image_result(report, "Screenshot unavailable. Check backend capabilities.")
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 10: Transactions (3 tools) ──────────────────────────────────────
+# ── SECTION 10: Transactions (7 tools) ──────────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -6123,9 +7258,167 @@ async def transaction_rollback(ctx: Context = None) -> dict:
     return await _backend(ctx).transaction_rollback()
 
 
+# 1.8-08: durable checkpoints (backends/checkpoints.py). Registered beside the
+# transactions: the same "go back to a known state" family, filed in that group.
+
+
+@cad_tool(summary="Keep a named restore point of the drawing that survives a restart.", cost="safe")
+@mcp.tool(
+    annotations={"title": "Create Checkpoint", "readOnlyHint": False, "destructiveHint": False},
+    tags={"transaction"},
+)
+async def checkpoint_create(
+    label: Annotated[
+        str | None,
+        "A name to find it by later (checkpoint_restore and drawing_diff accept it).",
+    ] = None,
+    ctx: Context = None,
+) -> dict:
+    """Store the drawing as it is now as a durable checkpoint, optionally labelled.
+
+    Checkpoints live in the state folder (ACADMCP_STATE_DIR), gzip-compressed,
+    and survive a server restart: drawing_undo steps back to them and
+    checkpoint_restore brings one back. Saves, the open, a new drawing and every
+    rollback-mode cad_batch / transaction boundary take one by themselves; this
+    adds one where you want a named point (`granularity: "label"`). The drawing
+    is not changed. Returns `{cp, seq, tool, rev, kb, label}`.
+
+    Refused: `checkpoints` (unsupported) when there is no state folder
+    (JOURNAL_DURABLE=off, or a refused ACADMCP_STATE_DIR). Live: the document is
+    exported with Document.Export.
+    """
+    return await _backend(ctx).checkpoint_create(label)
+
+
+@cad_tool(summary="List the drawing's durable checkpoints, newest first.", cost="read")
+@mcp.tool(
+    annotations={"title": "List Checkpoints", "readOnlyHint": True},
+    tags={"transaction"},
+)
+async def checkpoint_list(
+    limit: Annotated[int, Field(description="How many, newest first (1-200).", ge=1, le=200)] = 10,
+    ctx: Context = None,
+) -> dict:
+    """The active drawing's checkpoints, newest first, across restarts.
+
+    Each row is `{cp, seq, tool, rev, kb, label, evicted}`: `rev` is the content
+    revision it holds (compare with system_status / drawing_info), `tool` what
+    took it (drawing_save, drawing_open, drawing_new, transaction_commit,
+    checkpoint_create, ...). A row the CHECKPOINT_KEEP / CHECKPOINT_BUDGET_MB /
+    CHECKPOINT_MAX_DOC_MB budget evicted stays listed with `evicted: true`; its
+    bytes are gone and restoring it is refused `checkpoint_evicted`.
+
+    Refused: `checkpoints` (unsupported) when there is no state folder.
+    """
+    return await _backend(ctx).checkpoint_list(limit)
+
+
+@cad_tool(
+    summary="Bring a checkpoint back: in place (undoable) or as a new document.",
+    cost="destructive",
+)
+@mcp.tool(
+    annotations={"title": "Restore Checkpoint", "readOnlyHint": False, "destructiveHint": True},
+    tags={"transaction"},
+)
+async def checkpoint_restore(
+    checkpoint: Annotated[
+        str,
+        "Which one: its id ('cp-3'), its seq ('3') or its label (the newest with that label).",
+    ],
+    expected_revision: Annotated[
+        int | None,
+        "Restore only if the drawing is still at this revision; otherwise refused "
+        "stale_revision with nothing changed.",
+    ] = None,
+    mode: Annotated[
+        str,
+        "in_place: replace the active drawing's contents (drawing_undo undoes it); "
+        "new_document: open the checkpoint as <stem>-cp<seq> and make it active.",
+    ] = "in_place",
+    ctx: Context = None,
+) -> dict:
+    """Restore a durable checkpoint (see checkpoint_list).
+
+    `in_place` first stores the current drawing as a checkpoint
+    (`checkpoint_before`), so the restore is itself undoable: drawing_undo
+    returns to it. The result names `restored` and the new `revision`.
+    `new_document` leaves the active drawing alone and opens the checkpoint as
+    its own document, which becomes the bound/active one.
+
+    Refused by kind: `checkpoint_not_found` (no such id, seq or label - the
+    message names the newest ones), `checkpoint_evicted` (the budget dropped its
+    bytes), `stale_revision` (expected_revision no longer holds), and on live
+    AutoCAD `mode="in_place"` with capability `checkpoint_restore_in_place`
+    (ActiveX cannot replace an open drawing's database - use new_document).
+    """
+    backend = _backend(ctx)
+    if expected_revision is not None:
+        from engineering.changes.preview import check_preconditions
+
+        await check_preconditions(backend, expected_revision=expected_revision)
+    return await backend.checkpoint_restore(checkpoint, mode=mode)
+
+
+@cad_tool(
+    summary="What was done to this drawing, and with which values - across restarts.",
+    cost="read",
+)
+@mcp.tool(
+    annotations={"title": "Drawing History", "readOnlyHint": True},
+    tags={"transaction"},
+)
+async def drawing_history(
+    limit: Annotated[int, Field(ge=1, le=100)] = 10,
+    since_seq: int | None = None,
+    tool: str | None = None,
+    query: Annotated[str | None, "Text in tool, label, arguments or feature ids."] = None,
+    handle: str | None = None,
+    label: str | None = None,
+    detail: Annotated[
+        Literal["row", "args", "changes"],
+        "args: + stored arguments; changes: + change summary, checkpoint diff (3 rows).",
+    ] = "row",
+    ctx: Context = None,
+) -> dict:
+    """The active drawing's mutating calls, newest first, from the durable
+    journal - across restarts (reopen the file first).
+
+    Rows: {seq, op, tool, state, rev, cp, label, t}. A value from an earlier
+    round: label its call (_meta.label, cad_batch(label=)), then
+    drawing_history(label=..., detail="args"); unlabelled, detail="changes"
+    diffs the checkpoints around it (feature values, dimension measurements).
+    Refused: an unknown label (invalid_args, naming the labels); no document.
+    """
+    from engineering.history import history
+
+    return await history(
+        ctx.lifespan_context.get("backend"),
+        _operations_journal(ctx.lifespan_context),
+        limit=limit,
+        since_seq=since_seq,
+        tool=tool,
+        query=query,
+        handle=handle,
+        label=label,
+        detail=detail,
+        read_only=lambda name: not _mutating_tool(name),
+    )
+
+
 # ---------------------------------------------------------------------------
 # ── SECTION 11: System (8 tools) ────────────────────────────────────────────
 # ---------------------------------------------------------------------------
+
+
+def _operations_view(journal, detail: str):
+    """``system_status.operations`` (1.8-10): the summary, or the 1.7 list."""
+    if detail == "operations":
+        return journal.recent()
+    reader = getattr(journal, "summary", None)
+    if not callable(reader):
+        return {"count": len(journal), "last": None, "unknown_commit": 0}
+    return reader(exclude=CURRENT_OPERATION.get())
 
 
 @cad_tool(
@@ -6136,20 +7429,49 @@ async def transaction_rollback(ctx: Context = None) -> dict:
     annotations={"title": "Server Status", "readOnlyHint": True},
     tags={"system"},
 )
-async def system_status(ctx: Context = None) -> dict:
+async def system_status(
+    metrics: Annotated[
+        bool,
+        "Add `metrics`: this connection's calls, by_tool, result_bytes, errors_by_kind, "
+        "p50/p95 ms (live: the per-job queue/guard/work/refresh/counter ms too).",
+    ] = False,
+    detail: Annotated[
+        Literal["summary", "operations"],
+        "operations: the 1.7 list of the last 20 records (this release only).",
+    ] = "summary",
+    ctx: Context = None,
+) -> dict:
     """Get full status of the AutoCAD MCP Pro server and backend connection.
 
     Returns backend name, connection status, capabilities, document info, and
     the document's `document_id` and content `revision` (headless: the active
     registry entry; live: the bound document, plus `bound_document` and
-    `active_document_changed`). Live, the revision counts this server's own
-    writes; edits the operator makes in AutoCAD are not counted.
+    `active_document_changed`). Live, the revision counts this server's writes
+    and the operator's object edits between two calls (an AutoLISP reactor;
+    `operator_edits` says whether it runs); without Visual LISP, this server's
+    writes only. Live, `snapshot_reuse` is `{ttl_s, exports, reused}`: the
+    COM_SNAPSHOT_TTL in force, and how many DIMENSION / HATCH detail reads
+    took a fresh export or reused one.
 
-    `operations` lists the last 20 operation records, newest last: one per
-    tool call (and per cad_batch step), with `operation_id`, `tool`,
-    `request_hash`, `state` (committed / partial / failed / refused /
-    quarantined / cancelled / unknown_commit / running), the document id and
-    the revision before and after. Held in memory; a restart forgets them.
+    `operations` is `{count, last: {op, tool, state, rev}, unknown_commit}`;
+    drawing_history lists the calls.
+
+    `state_store` describes the durable journal (B13): `mode` (`durable`, or
+    `off` with JOURNAL_DURABLE=off), `path` (<ACADMCP_STATE_DIR>/journal.sqlite3),
+    `bytes`, `documents`, `operations`, `checkpoints`, `write_failures` and
+    `degraded` (false, or `{kind, reason}` when the file is unusable or
+    refused and records are kept in memory only - no call fails because of it).
+    A client id replays across restarts; a call still running when its server
+    died answers `requires_reconcile` with `error_kind: "process_exit"`.
+
+    `save_recovery` (only when there was one) lists the saves a dead process
+    left half done that this server resolved at startup: `completed`,
+    `finished` (the verified file put in place), `rolled_back` (the previous
+    file kept) per target.
+
+    `metrics` (only with metrics=True) counts this connection's earlier calls
+    (`session`: calls, by_tool, result_bytes, errors_by_kind, p50_ms, p95_ms)
+    and, live, `com_run`: each COM job's queue/guard/work/refresh/counter ms.
     """
     b = ctx.lifespan_context.get("backend")
     journal = _operations_journal(ctx.lifespan_context)
@@ -6168,7 +7490,13 @@ async def system_status(ctx: Context = None) -> dict:
         }
         if tool_count is not None:
             out["tool_count"] = tool_count
-        out["operations"] = journal.recent()
+        out["operations"] = _operations_view(journal, detail)
+        out["state_store"] = state_store_status(journal)
+        if ctx.lifespan_context.get("save_recovery"):
+            out["save_recovery"] = ctx.lifespan_context["save_recovery"]
+        if metrics:
+            out["metrics"] = _metrics_payload(ctx, None)
+        out["policy"] = policy.describe()
         return out
     status = await b.system_status()
     status["server"] = "AutoCAD MCP Pro"
@@ -6179,7 +7507,14 @@ async def system_status(ctx: Context = None) -> dict:
         status["unsafe_mode_warning"] = (
             "DANGEROUS_COMMANDS_ENABLED=true — command/LISP sanitization disabled."
         )
-    status["operations"] = journal.recent()
+    status["operations"] = _operations_view(journal, detail)
+    status["state_store"] = state_store_status(journal)
+    if ctx.lifespan_context.get("save_recovery"):
+        status["save_recovery"] = ctx.lifespan_context["save_recovery"]
+    if metrics:
+        status["metrics"] = _metrics_payload(ctx, b)
+    # 1.8-17: the tool policy in force (READ_ONLY, allow/deny lists, MAX_TOOL_COST).
+    status["policy"] = policy.describe()
     return status
 
 
@@ -6332,10 +7667,59 @@ async def system_run_command(
     accepts hundreds of commands and any loaded ARX/LISP adds more. Prefer the
     typed tools (entity_delete, drawing_save_as, block_insert, drawing_purge):
     they validate their arguments, which a free-text command string cannot.
+
+    A refused command is error kind `policy_refused` with `verbs` and
+    `alternatives` ([{tool, summary}], the typed tools for those verbs that the
+    active profile advertises); an allowed one that a typed tool also does
+    carries `typed_alternative` in the same shape.
+
+    The call waits for the command to finish (CMDACTIVE, `COMMAND_DEADLINE_S`,
+    default 8 s) and returns `{completed: true, created: [{handle, type, space}]
+    (first 50), created_count, last_prompt, target_space}`; a new entity
+    outside the target space (model space unless `layout_set_current` chose a
+    sheet) adds `warning: "created_outside_target_space"`. A command still at a
+    prompt is cancelled with ESC x3 and fails with kind `command_incomplete`
+    carrying AutoCAD's own `last_prompt`.
     """
-    sanitize_command(command)
+    try:
+        sanitize_command(command)
+    except CommandRefusedError as exc:
+        exc.alternatives = await _command_alternatives(exc.verbs)
+        raise
     await ctx.warning(f"Running command: {command}")
-    return await _backend(ctx).system_run_command(command)
+    result = await _backend(ctx).system_run_command(command)
+    typed = await _command_alternatives(command_verbs(command))
+    if typed and isinstance(result, dict):
+        result = {**result, "typed_alternative": typed}
+    return result
+
+
+async def _command_alternatives(verbs) -> list[dict]:
+    """``[{tool, summary}]``: the typed tools for ``verbs`` this server advertises now.
+
+    ``discovery.aliases.tools_for_command`` over every verb, then only the
+    tools the active TOOL_PROFILE / TOOL_PACKS / ENABLE_3D leave callable
+    (``mcp.get_tool`` answers None for a hidden one) and never an escape hatch.
+    Evidence for a refusal, so it never raises.
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+    try:
+        for verb in verbs:
+            for name in tools_for_command(verb):
+                if name in seen:
+                    continue
+                seen.add(name)
+                tool = await mcp.get_tool(name)
+                if tool is None:
+                    continue
+                card = (getattr(tool, "meta", None) or {}).get("cad") or {}
+                if card.get("cost") == "escape":
+                    continue
+                found.append({"tool": name, "summary": str(card.get("summary") or "")})
+    except Exception as exc:  # an alternative list is never worth failing a refusal over
+        log.debug("typed alternatives for %s: %s", verbs, exc)
+    return found
 
 
 @cad_tool(summary="Evaluate an AutoLISP expression inside AutoCAD (COM only).", cost="escape")
@@ -6344,19 +7728,44 @@ async def system_run_command(
     tags={"system"},
 )
 async def system_run_lisp(
-    expression: Annotated[str, 'AutoLISP expression to evaluate (e.g. \'(command "ZOOM" "E")\')'],
+    expression: Annotated[
+        str,
+        "AutoLISP expression to evaluate "
+        "(e.g. '(vla-get-Area (vlax-ename->vla-object (handent \"2A\")))')",
+    ],
     ctx: Context = None,
 ) -> dict:
     """Execute an AutoLISP expression (COM backend only).
 
-    Example: '(setvar \"DIMSCALE\" 1.0)'
+    Example: '(vla-get-Area (vlax-ename->vla-object (handent "2A")))'
 
-    A symbol denylist refuses the known code-execution and file-I/O channels;
-    text inside double quotes is treated as data, so drawing notes are not
-    mistaken for code. It is a guardrail, NOT a security boundary — AutoLISP has
-    more write channels than any denylist enumerates. Prefer the typed tools.
+    LISP_POLICY=read (default) reads the expression and runs what passes the
+    read tier: arithmetic and geometry (angle, distance, polar, inters, trans),
+    lists and control (car/cdr, cons, list, mapcar, foreach, if, cond, progn,
+    lambda, setq), strings (strcat, substr, rtos, vl-string-*) and database
+    reads (entget, entnext, entlast, handent, tblsearch, getvar, dictsearch,
+    ssget with a literal "_X"/"_W"/"_C"/"_CP" mode, vlax-ename->vla-object,
+    vla-get-*, vlax-get-property, vlax-curve-get*). Never run, under any tier:
+    getpoint and the other interactive get*/entsel/ssget forms (they hold
+    AutoCAD's only COM thread), load/autoload/arxload, startapp, dos_*,
+    vl-file-*, read, a non-literal eval/apply, vlax-create-object,
+    vla-SendCommand, vlr-*, defun, c:*, and unreadable or unbalanced text.
+    Anything else (command, entmod, setvar, vla-put-* ...) goes to the 1.7
+    symbol denylist unchanged; LISP_POLICY=denylist is 1.7's behaviour. A
+    guardrail, NOT a security boundary. Prefer the typed tools.
+
+    A refused expression is error kind `policy_refused` with policy
+    `lisp_allowlist` (`lisp_denylist` under LISP_POLICY=denylist), `symbol`,
+    `line`, `column`, `tier_needed` (`write`, `none`, `unclassified`; `read`
+    when only LISP_POLICY=denylist refused it),
+    `reason`, `symbols`, `verbs` (the commands its `(command "...")` forms
+    name) and `alternatives` ([{tool, summary}], the typed tools for them).
     """
-    sanitize_lisp(expression)
+    try:
+        sanitize_lisp(expression)
+    except CommandRefusedError as exc:
+        exc.alternatives = await _command_alternatives(exc.alternative_verbs)
+        raise
     await ctx.warning(f"Running LISP: {expression[:80]}")
     return await _backend(ctx).system_run_lisp(expression)
 
@@ -6403,6 +7812,18 @@ async def system_about(ctx: Context = None) -> dict:
     # R20: omit total_tools when unknown rather than reporting a fake -1.
     if tool_count is not None:
         out["total_tools"] = tool_count
+    # 1.8-17: the tool policy and the HTTP guard's settings (no token is shown).
+    registered = [t.name for t in _local_tool_components()]
+    out["policy"] = {
+        **policy.describe(registered),
+        "http": {
+            "allowed_origins": list(getattr(config.settings, "http_allowed_origins", ()) or ()),
+            "allowed_hosts": list(getattr(config.settings, "http_allowed_hosts", ()) or ()),
+            "max_body_bytes": getattr(config.settings, "max_http_body_bytes", None),
+            "auth": _auth is not None,
+            "readonly_token": bool(getattr(config.settings, "mcp_auth_token_readonly", "")),
+        },
+    }
     return out
 
 
@@ -6666,6 +8087,10 @@ async def titleblock_apply_iso_a3(
     )
 
 
+#: ``detail`` of drawing_finalize / drawing_deliver: how much a failed gate returns.
+GATE_DETAILS = ("summary", "full")
+
+
 @cad_tool(
     summary="Finish the drawing: validate, critique, save, screenshot and score it.",
     cost="destructive",
@@ -6700,8 +8125,10 @@ async def drawing_finalize(
         Field(
             default=False,
             description="If true, ANY critique issue (including warnings) fails the gate — the full "
-            "premium discipline. Default false: only critique 'error' issues (e.g. leftover "
-            "construction geometry) fail; warnings are surfaced in the payload.",
+            "premium discipline — and so does every lane the critique could not check "
+            "(qa_coverage.not_checked; domain_absent excepted). Default false: only critique "
+            "'error' issues (e.g. leftover construction geometry) fail; warnings and "
+            "qa_coverage are surfaced in the payload.",
         ),
     ] = False,
     requirements: Annotated[
@@ -6713,21 +8140,33 @@ async def drawing_finalize(
             "gate (failed_acceptance), whatever the drafting score.",
         ),
     ] = None,
+    detail: Annotated[
+        str,
+        Field(
+            default="summary",
+            description="On a failed gate: 'summary' returns the first 10 blocking rows with "
+            "up to 5 handles each; 'full' every row, every handle and the whole report.",
+        ),
+    ] = "summary",
     ctx: Context = None,
 ) -> dict:
     """Premium completion gate: runs BOTH the 8-step validator AND the premium critique focuses
+    (each named below), then saves to disk, exports a screenshot, and returns the DWG path.
+
+    The premium critique focuses
     (iso128, layer_color, dim_overlap, untrimmed_corner, duplicate_entities, construction_left,
-    gdt, plus the P&ID focuses pid_dangling_line, pid_duplicate_tag,
-    pid_incompatible_connection, pid_untagged_instrument, pid_illegal_tag,
-    pid_unconnected_equipment — silent on a sheet with no P&ID symbols, plus the
+    property_override, dimension_truth, gdt, plus the P&ID focuses pid_dangling_line,
+    pid_duplicate_tag, pid_incompatible_connection, pid_untagged_instrument, pid_illegal_tag,
+    pid_unconnected_equipment, pid_line_through_symbol — silent on a sheet with no P&ID symbols,
+    plus the
     mechanical focuses mech_missing_centreline, mech_unhatched_section,
     mech_view_misaligned, mech_duplicate_dimension, mech_thread_unrepresented,
     mech_bom_balloon_mismatch — silent on a sheet with no mechanical part, plus the
     architectural focuses arch_room_unlabelled, arch_wall_gap, arch_opening_clash —
     silent on a sheet with no ACADMCP_ARCH record, plus the topology focuses
     topo_dangling_endpoint, topo_near_miss, topo_interior_crossing — on network
-    layers no P&ID or architectural focus reads, silent on every sheet this server draws),
-    then saves to disk, exports a screenshot, and returns the DWG path.
+    layers no P&ID or architectural focus reads, silent on every sheet this server draws)
+    all run before the save.
 
     The validator and the critique share one read of the drawing - every entity of
     every space, model and paper, with no cap (one DXF export on the live engine). A
@@ -6736,8 +8175,18 @@ async def drawing_finalize(
     detail.code `scan_incomplete`, so the gate fails. A check that raises is an `error`
     issue with detail.code `check_failed`, never a clean result.
 
-    Raises ToolError if any validator 'error' finding is present, or if critique reports an
-    'error' (or, with strict_critique=True, any critique issue). Critique warnings are surfaced
+    The payload's `qa_coverage` says what the critique did not check: {complete, records,
+    spaces, reason, not_checked: [{focus, layout, reason, lane}], domain_absent: [focus]}
+    (reasons: autocad://critique/focuses) - e.g. a paper layout without a model viewport is
+    `no_viewport_scale`, the live engine's dimension-legibility lane
+    `engine_live_document_template`.
+
+    Fails (error kind validation_failed / critique_gate_failed / failed_acceptance) if any
+    validator 'error' finding is present, or if critique reports an 'error' (or, with
+    strict_critique=True, any critique issue or any not_checked lane but domain_absent,
+    each a blocking row with code `not_checked`); the error carries what the gate computed -
+    score, blocking [{code, severity, handles, message}], blocking_count, qa_coverage - and
+    detail="full" adds every row and the whole report. Critique warnings are surfaced
     under payload['critique'] without failing the gate by default. A quarantined document
     is refused.
 
@@ -6754,7 +8203,12 @@ async def drawing_finalize(
     not parse are refused before anything is saved (invalid_args).
     """
     from engineering import DrawingValidator
+    from engineering.errors import InvalidArgsError
 
+    if detail not in GATE_DETAILS:
+        raise InvalidArgsError(
+            f"invalid_args: detail must be one of {GATE_DETAILS}, got {detail!r}"
+        )
     rs = None
     if requirements is not None:
         from engineering.verification.requirements import parse_requirements
@@ -6767,14 +8221,14 @@ async def drawing_finalize(
     backend = _backend(ctx)
 
     if save_path:
-        validated = validate_path(save_path, allow_write=True)
+        validated = validate_path(save_path, allow_write=True, kinds=KINDS_DRAWING)
         from pathlib import Path as _P
 
         _fmt = _P(str(validated)).suffix.lstrip(".").lower() or "dxf"
         await backend.drawing_save_as(str(validated), fmt=_fmt)
 
     if screenshot_path:
-        validated_shot = validate_path(screenshot_path, allow_write=True)
+        validated_shot = validate_path(screenshot_path, allow_write=True, kinds=KINDS_IMAGE)
         try:
             shot = await backend.view_screenshot()
             if shot:
@@ -6798,6 +8252,11 @@ async def drawing_finalize(
         crit_summary[issue.severity] = crit_summary.get(issue.severity, 0) + 1
     payload["critique"] = [issue.to_dict() for issue in critique_issues]
     payload["critique_summary"] = crit_summary
+    # 1.8-16: what the critique did NOT check (blocking rows + domain_absent names).
+    from engineering.qa_coverage import LEDGER_KEY, blocking_rows, qa_coverage_of
+
+    payload["qa_coverage"] = qa_coverage_of(qa_shared)
+    unchecked = blocking_rows(qa_shared.get(LEDGER_KEY)) if strict_critique else []
 
     # I4 — a single regression-trackable scalar over the union of the structural
     # validator and the premium critique (MUSE/CadBench grade an Invalidity Ratio,
@@ -6850,37 +8309,69 @@ async def drawing_finalize(
             if issue.severity == "warning":
                 await ctx.warning(f"critique[{issue.focus}]: {issue.message}")
 
-    if not result.ok:
-        raise ToolError(
-            f"drawing_finalize: validation failed with {result.summary['error']} error(s). "
-            f"First: {result.findings[0].code}: {result.findings[0].message}"
-        )
-
+    validator_blocking = [f for f in result.findings if f.severity == "error"]
     gate_failures = [
         i
         for i in critique_issues
         if i.severity == "error" or (strict_critique and i.severity != "info")
     ]
-    if gate_failures:
-        first = gate_failures[0]
-        raise ToolError(
-            f"drawing_finalize: critique gate failed with {len(gate_failures)} blocking issue(s). "
-            f"First: {first.focus}: {first.message}"
-        )
+    blocking: list[str] = []
     if rs is not None:
         report = payload["geometry_acceptance"]
         blocking = list(report["blocking"])
         reverified = payload["artifact_integrity"]["reverified"]
         if reverified is not None and not reverified["accepted"]:
             blocking.extend(f"saved file: {item}" for item in reverified["blocking"])
-        if blocking:
-            raise ToolError(
-                "drawing_finalize: failed_acceptance - "
-                + "; ".join(blocking[:5])
-                + f" ({report['counts']['pass']} of {report['counts']['required']} "
-                "requirement(s) pass on the drawing; drawing_verify_requirements returns the "
-                "full report)"
-            )
+
+    def _gate(kind: str, message: str) -> GateFailure:
+        # 1.8-02: what the gate computed travels with the refusal (every
+        # blocking reason, whichever gate failed first), so a failed finalize
+        # needs no second QA read; detail="full" adds the whole report.
+        gate = gate_failure_payload(
+            kind,
+            score=payload["score"],
+            findings=validator_blocking,
+            issues=gate_failures,
+            requirements=blocking,
+            qa_coverage=payload["qa_coverage"],
+            detail=detail,
+            not_checked=unchecked,
+        )
+        if detail == "full":
+            gate["report"] = payload
+        return GateFailure(message, gate)
+
+    if not result.ok:
+        raise _gate(
+            "validation_failed",
+            f"drawing_finalize: validation failed with {result.summary['error']} error(s). "
+            f"First: {result.findings[0].code}: {result.findings[0].message}",
+        )
+
+    if gate_failures:
+        first = gate_failures[0]
+        raise _gate(
+            "critique_gate_failed",
+            f"drawing_finalize: critique gate failed with {len(gate_failures)} blocking issue(s). "
+            f"First: {first.focus}: {first.message}",
+        )
+    if unchecked:
+        lane = unchecked[0]
+        raise _gate(
+            "critique_gate_failed",
+            f"drawing_finalize: critique gate failed: strict_critique and {len(unchecked)} "
+            f"lane(s) not checked. First: {lane.focus} on {lane.layout}: {lane.reason}",
+        )
+    if blocking:
+        report = payload["geometry_acceptance"]
+        raise _gate(
+            "failed_acceptance",
+            "drawing_finalize: failed_acceptance - "
+            + "; ".join(blocking[:5])
+            + f" ({report['counts']['pass']} of {report['counts']['required']} "
+            "requirement(s) pass on the drawing; drawing_verify_requirements returns the "
+            "full report)",
+        )
     return payload
 
 
@@ -6910,7 +8401,11 @@ async def drawing_deliver(
     ] = 95.0,
     strict_critique: Annotated[
         bool,
-        Field(default=True, description="Block delivery on every non-info critique issue."),
+        Field(
+            default=True,
+            description="Block delivery on every non-info critique issue and on every lane "
+            "the critique did not check (qa_coverage.not_checked; domain_absent excepted).",
+        ),
     ] = True,
     expected: Annotated[
         dict | None,
@@ -6925,6 +8420,14 @@ async def drawing_deliver(
             "whatever the drafting score.",
         ),
     ] = None,
+    detail: Annotated[
+        str,
+        Field(
+            default="summary",
+            description="On a failed status, gate_failure carries the first 10 blocking rows "
+            "with up to 5 handles each ('summary') or every row and handle ('full').",
+        ),
+    ] = "summary",
     ctx: Context = None,
 ) -> dict:
     """Create a hashed, validated delivery bundle and verify DXF save/reopen parity.
@@ -6950,9 +8453,19 @@ async def drawing_deliver(
     with its geometry makes the status ``failed_acceptance`` whatever the score
     (``failed_export`` and ``failed_validation`` are reported first). Refused before
     any work: requirements that do not parse (invalid_args).
+
+    A ``failed_validation`` / ``failed_acceptance`` result carries ``gate_failure``,
+    drawing_finalize's gate payload (kind, score, blocking rows with handles,
+    blocking_count, qa_coverage). Every result and the manifest carry ``qa_coverage``:
+    the lanes the critique did not check, as drawing_finalize reports them.
     """
     from engineering import deliver_drawing
+    from engineering.errors import InvalidArgsError
 
+    if detail not in GATE_DETAILS:
+        raise InvalidArgsError(
+            f"invalid_args: detail must be one of {GATE_DETAILS}, got {detail!r}"
+        )
     rs = None
     if requirements is not None:
         from engineering.verification.requirements import parse_requirements
@@ -6961,7 +8474,7 @@ async def drawing_deliver(
             rs = parse_requirements(requirements)
         except (KeyError, TypeError, ValueError) as exc:
             raise ToolError(f"invalid_args: requirements: {exc}") from exc
-    destination = validate_path(output_dir, allow_write=True)
+    destination = validate_path(output_dir, allow_write=True, kinds=DIRECTORY)
     result = await deliver_drawing(
         _backend(ctx),
         destination,
@@ -6970,6 +8483,7 @@ async def drawing_deliver(
         strict_critique=strict_critique,
         expected=expected,
         requirements=rs,
+        detail=detail,
     )
     return result.to_dict()
 
@@ -7141,38 +8655,84 @@ async def drawing_critique(
         list[str] | None,
         Field(
             default=None,
-            description="Subset of: iso128, layer_color, dim_overlap, untrimmed_corner, "
-            "duplicate_entities, construction_left, gdt, the P&ID focuses "
-            "pid_dangling_line, pid_duplicate_tag, pid_incompatible_connection, "
-            "pid_untagged_instrument, pid_illegal_tag, pid_unconnected_equipment "
-            "(silent on a drawing with no P&ID symbols), and the mechanical focuses "
-            "mech_missing_centreline, mech_unhatched_section, mech_view_misaligned, "
-            "mech_duplicate_dimension, mech_thread_unrepresented, "
-            "mech_bom_balloon_mismatch (silent on a drawing with no mechanical part), and "
-            "the architectural focuses arch_room_unlabelled, arch_wall_gap, "
-            "arch_opening_clash (silent on a drawing with no ACADMCP_ARCH record), and "
-            "the topology focuses topo_dangling_endpoint, topo_near_miss, "
-            "topo_interior_crossing (network layers no P&ID or architectural focus reads). "
-            "None = run all.",
+            description="Focus names to run, a closed set (iso128, layer_color, "
+            "construction_left, pid_*, mech_*, arch_*, topo_*, ...; every name and what it "
+            "reports: resource autocad://critique/focuses). None = run all.",
+        ),
+    ] = None,
+    report: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Return {issues, coverage: {layouts, complete}}: per layout what was "
+            "checked and what was not, and why.",
+        ),
+    ] = False,
+    summary: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Return {total, by_focus, by_severity, issues[:limit]} with compact "
+            "rows (5 unless limit says otherwise); total always counts every issue.",
+        ),
+    ] = False,
+    limit: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description="Keep this many issues in the {total, by_focus, by_severity, issues} "
+            "form; the counts stay complete. None with summary=False = the bare list.",
         ),
     ] = None,
     ctx: Context = None,
-) -> list[dict]:
+) -> list[dict] | dict:
     """Run premium-quality checks. Returns zero issues for a clean drawing.
 
-    Standard production gate: must return [] before `drawing_finalize`.
+    Standard production gate: must return [] before `drawing_finalize`. The default
+    result is the bare list of issues; `report`, `summary` or `limit` return a dict
+    instead (a summary is a page, never the clean answer: read `total`).
 
     The entity checks (construction_left, untrimmed_corner, duplicate_entities,
-    dim_overlap) read every entity of every space - model and every paper layout -
-    and compare pairs only within one space. Refusals and failures are issues, never
+    dim_overlap, property_override) read every entity of every space - model and every
+    paper layout - and compare pairs only within one space. property_override reports
+    one issue per layer and code (lineweight_not_bylayer - an explicit non-ISO 128 value
+    is an error; color_not_bylayer; linetype_not_bylayer) on the engineering layers and
+    the applied layer set, title block and block members exempt, other layers at info;
+    lineweight -3 is Default, not ByLayer. dimension_truth binds every DIMENSION to its
+    geometry and reports, per dimension, dim_override_disagrees (NTS: info),
+    dim_dimlfac_scaled, dim_render_stale (*D block text is not what the style formats;
+    drawing_refine redraws it), dim_group42_stale, dim_double_prefix, dim_value_hidden
+    and dim_unbound (info: not checked, never a pass). Refusals and failures are issues, never
     silence: a check that raises returns an `error` issue of its focus with
     detail.code `check_failed`; a read that could not cover the drawing (more than
     MAX_QA_ENTITIES entities, default 2,000,000; or a live export whose per-layout
     counts differ from AutoCAD's) returns detail.code `scan_incomplete`. Neither code
     is a focus name. A quarantined document is refused.
+
+    Coverage: every check writes `checked` or `not_checked` rows; with report=True a
+    lane that did not run is named with its reason (no_viewport_scale for a paper layout
+    with no model viewport, engine_live_document_template for the live engine's
+    dimension-legibility lane, domain_absent for a focus whose domain the drawing lacks).
     """
-    issues = await _backend(ctx).drawing_critique(focus)
-    return [_dc(i) for i in issues]
+    from engineering.qa_coverage import LEDGER_KEY, CoverageLedger, summarize
+    from engineering.qa_scan import QA_SNAPSHOT_KEY
+
+    shared: dict = {}
+    issues = await _backend(ctx).drawing_critique(focus, shared=shared)
+    rows = [_dc(i) for i in issues]
+    if not (report or summary or limit is not None):
+        return rows
+    out = (
+        summarize(rows, summary=summary, limit=limit)
+        if summary or limit is not None
+        else {"issues": rows}
+    )
+    if report:
+        ledger = shared.get(LEDGER_KEY) or CoverageLedger()
+        snap = (shared.get(QA_SNAPSHOT_KEY) or (None, None))[0]
+        out["coverage"] = ledger.report(snap.layouts if snap is not None else ())
+    return out
 
 
 @cad_tool(
@@ -7386,31 +8946,66 @@ async def drawing_apply_iso_layers(
 
 
 @cad_tool(
-    summary="Dimension a set of entities at once, as a chain, baseline or ordinate run.",
+    summary="Dimension a part in one call: edges, hole diameters, arc radii, overall size.",
     cost="mutate",
 )
 @mcp.tool(
     annotations={
-        "title": "Dimension: Auto (chain / baseline / ordinate)",
+        "title": "Dimension: Auto (a whole part, one call)",
         "destructiveHint": False,
     },
     tags={"premium", "dimension"},
 )
 async def dimension_auto(
-    handles: Annotated[list[str], "List of entity handles to dimension"],
+    handles: Annotated[list[str] | None, Field(default=None, description="Entity handles")] = None,
+    selector: Annotated[
+        dict | None,
+        Field(
+            default=None, description="entity_select_smart predicate, e.g. {'layer': 'GEOMETRY'}"
+        ),
+    ] = None,
     style: Annotated[
-        str, Field(default="chain", description="chain | baseline | ordinate")
+        str, Field(default="chain", description="LINE run: chain | baseline | ordinate")
     ] = "chain",
     offset: Annotated[
         float, Field(default=10.0, gt=0, description="Dimension-line offset from the geometry (mm)")
     ] = 10.0,
+    layer: Annotated[
+        str | None, Field(default=None, description="Default: the layer set's DIM")
+    ] = None,
+    include: Annotated[
+        list[str] | None,
+        Field(default=None, description="linear, diameter, radius, overall (default: all)"),
+    ] = None,
+    group_equal: Annotated[
+        bool, Field(default=False, description="Equal circles: one '6× Ø11'")
+    ] = False,
+    skip_existing: Annotated[bool, Field(default=True)] = True,
+    dry_run: Annotated[bool, Field(default=False, description="Plan only")] = False,
     ctx: Context = None,
-) -> list[dict]:
-    """Generate ISO 129 dimensions across the listed entities in the chosen style.
-    V1 supports LINE entities only.
+) -> dict:
+    """Dimension a part in one call: LINE runs, LWPOLYLINE edges per side, CIRCLE
+    diameters, ARC radii, overall size; text outside the part. A rerun skips
+    what is dimensioned.
+
+    Returns {created, skipped_existing, omitted: [{handle, type, reason}],
+    dim_overlap}; ELLIPSE, SPLINE etc. are omitted, never dropped.
+
+    Refused by name: neither or both of handles / selector, an unknown selector
+    key, style or include kind.
     """
-    result = await _backend(ctx).dimension_auto(handles, style, offset)
-    return [_dc(e) for e in result]
+    result = await _backend(ctx).dimension_auto(
+        handles,
+        style,
+        offset,
+        layer,
+        selector=selector,
+        include=include,
+        group_equal=group_equal,
+        skip_existing=skip_existing,
+        dry_run=dry_run,
+    )
+    return result.to_dict()
 
 
 @cad_tool(
@@ -7585,7 +9180,14 @@ async def layout_set_current(
     name: Annotated[str, "Layout tab to activate ('Model' or a paper-space layout)."],
     ctx: Context = None,
 ) -> dict:
-    """Activate a layout tab."""
+    """Activate a layout tab and make it where new geometry goes.
+
+    Every document starts in model space (drawing_new, drawing_open and
+    document_activate reset it); only this tool moves the target. On a live
+    AutoCAD a tab the operator clicks afterwards does not move it - drawing on
+    a sheet takes this call, as headlessly. An entity created outside model
+    space reports `space` in its properties.
+    """
     return await _backend(ctx).layout_set_current(name)
 
 
@@ -7918,7 +9520,7 @@ async def solid_boolean(
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 17: P&ID (9 tools) ──────────────────────────────────────────────
+# ── SECTION 17: P&ID (10 tools) ─────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -8042,7 +9644,9 @@ async def pid_line_draw(
         str,
         "process_major | process_minor | utility | pneumatic | electric | hydraulic | capillary | data",
     ] = "process_major",
-    route: Annotated[str | list, "auto (orthogonal) | direct | [[x, y], ...] waypoints"] = "auto",
+    route: Annotated[
+        str | list, "auto (orthogonal) | avoid (around symbols) | direct | [[x, y], ...] waypoints"
+    ] = "auto",
     stub: Annotated[
         float,
         Field(default=5.0, ge=0, description="Minimum straight run leaving each port (mm)"),
@@ -8062,6 +9666,13 @@ async def pid_line_draw(
     arrow: Annotated[
         bool | None, "Flow arrow at the end; default per class (process yes, signal no)"
     ] = None,
+    clearance: Annotated[
+        float, Field(default=2.0, ge=0, description="avoid: gap kept from symbols (mm)")
+    ] = 2.0,
+    keep_out: Annotated[
+        list[list[float]] | None, "Extra [xmin, ymin, xmax, ymax] boxes to keep clear"
+    ] = None,
+    on_blocked: Annotated[str, "avoid without a route: refuse | cross"] = "refuse",
     ctx: Context = None,
 ) -> dict:
     """Connect two ports with one LWPOLYLINE on the class's layer.
@@ -8078,6 +9689,9 @@ async def pid_line_draw(
     `line_number` is still written and labelled. With waypoints, a bubble's
     exit leaves towards the first waypoint (and the entry arrives from the
     last one); `crossings` follows existing arcs, not their chords.
+    `avoid` keeps `clearance` from every other symbol and `keep_out` box;
+    none possible: kind no_route naming the tags (or `on_blocked="cross"`).
+    Every route reports `obstacle_hits` and `label_hits` [{handle, tag}].
     """
     from engineering.pid.drawlines import draw_line
 
@@ -8097,6 +9711,9 @@ async def pid_line_draw(
         number_format,
         label,
         arrow,
+        clearance=clearance,
+        keep_out=keep_out,
+        on_blocked=on_blocked,
     )
 
 
@@ -8345,10 +9962,13 @@ async def pid_from_spec(
     `transaction_begin` set, so it never waits at an AutoCAD prompt; should
     that rollback itself fail, the failure is logged, the cancellation is what
     the client sees, and the drawing must be checked before a retry).
+
     A non-finite coordinate, rotation, scale or stub is refused
     by path before anything is placed. The response carries the graph read
     back from the drawing and the P&ID critique issues, so the caller sees
-    dangling ends or duplicate tags in the same round trip. `dry_run` returns
+    dangling ends or duplicate tags in the same round trip.
+
+    `dry_run` returns
     the planned vertices and crossings without touching the drawing; crossings
     are counted, on both runs, against the spec's own lines and the P&ID lines
     already on the current layout (`crossings_scope`). The dry run also returns
@@ -8359,6 +9979,9 @@ async def pid_from_spec(
     revision) changed; a region precondition taken from another spec is
     refused by path. A guarded run reports `revision` ({checked, after,
     interleaved}).
+
+    `sheet.routing`: `auto` (default) or `avoid` (lines go round symbols;
+    no_route by path). Both runs report `obstacle_hits`.
     """
     from engineering.pid.spec import run_spec
 
@@ -8398,6 +10021,36 @@ async def pid_tag_parse(
     from engineering.pid.tags import parse_tag
 
     return parse_tag(tag, kind, equipment_prefixes)
+
+
+@cad_tool(
+    summary="Check a multi-sheet P&ID: off-page links, cross-sheet tags, line numbers; or index it.",
+    cost="safe",
+)
+@mcp.tool(
+    annotations={"title": "P&ID: Project", "readOnlyHint": False, "destructiveHint": False},
+    tags={"pid", "query"},
+)
+async def pid_project(
+    action: Annotated[str, "check | index"] = "check",
+    sheets: Annotated[list[str] | None, "Sheet files (.dxf; .dwg live only)"] = None,
+    manifest: Annotated[dict | None, "{project, sheets: [{path, number, title}]}"] = None,
+    write: Annotated[str | None, "Write the result: .json, .csv or .xlsx"] = None,
+    include_current: Annotated[bool, "Also read the active document"] = True,
+    ctx: Context = None,
+) -> dict:
+    """Read every sheet of a P&ID project with the pid_graph reader; nothing is modified.
+
+    check: `links` per LINK id (matched / orphan / direction_mismatch /
+    duplicate, each connector with sheet + handle), cross-sheet
+    `duplicate_tags` (connectors never count), `line_continuity` of every
+    matched pair. index: instrument index, line list and equipment list
+    with a `sheet` column. Refused by name: over 50 sheets, a missing file,
+    a .dwg headless (`dwg`), .xlsx without openpyxl (`xlsx_write`).
+    """
+    from engineering.pid.project import run_project
+
+    return await run_project(_backend(ctx), action, sheets, manifest, write, include_current)
 
 
 # ---------------------------------------------------------------------------
@@ -8493,15 +10146,22 @@ async def dimstyle_create(
 async def dimstyle_modify(
     name: Annotated[str, "Existing dimension style name"],
     overrides: Annotated[dict, "DIM* variables to change, e.g. {DIMDEC: 3, DIMTXT: 3.5}"],
+    rerender: Annotated[
+        bool, "Redraw the dimensions using the style (False: the 1.7 behaviour, left stale)"
+    ] = True,
+    force: Annotated[bool, "Let the redraw re-place a text its author positioned"] = False,
     ctx: Context = None,
 ) -> dict:
     """Change variables on an existing dimension style.
 
     `changed` names only the variables that actually moved — re-setting a
     value to itself is not a change. `dimensions_using_style` lists the
-    dimensions already drawn with it; headlessly `rerender_required: true`
-    says they still show the old style until redrawn (AutoCAD re-renders on
-    the next regen). Refuses a missing style, an empty `overrides`, a key
+    dimensions already drawn with it, and since 1.8.0 they are redrawn
+    (`rerendered`; live: Update() on each, confirmed by reading the *D text
+    back - one that did not change is in `stale`). A text its author placed
+    keeps its position (`text_kept`) unless `force`. `rerender_required: true`
+    means a dimension still shows the old style: `rerender=False`, or a live
+    redraw the read-back did not confirm. Refuses a missing style, an empty `overrides`, a key
     outside the whitelist, a value outside its range, a DIMTXSTY that does
     not exist, a user arrowhead block the drawing does not define — all
     before any write. On the live engine, editing a non-current style makes
@@ -8510,7 +10170,7 @@ async def dimstyle_modify(
     discarded, which is AutoCAD's own DIMSTYLE rule).
     """
     await ctx.info(f"Modifying dimension style {name!r}")
-    return await _backend(ctx).dimstyle_modify(name, overrides)
+    return await _backend(ctx).dimstyle_modify(name, overrides, rerender=rerender, force=force)
 
 
 @cad_tool(summary="Make a dimension style current so new dimensions use it.", cost="safe")
@@ -8742,8 +10402,17 @@ async def page_setup_list(
 )
 async def page_setup_apply(
     layout: Annotated[str, "Paper-space layout to set up (never 'Model')."],
-    paper: Annotated[str, "ISO_A0…ISO_A4 or ANSI_A…ANSI_E (short forms A3, ansi_b accepted)."],
-    orientation: Annotated[str, "landscape | portrait"] = "landscape",
+    paper: Annotated[
+        str,
+        "ISO_A0…ISO_A4 or ANSI_A…ANSI_E (short forms A3, ansi_b accepted), or a canonical "
+        "media name in AutoCAD's spelling, e.g. ISO_full_bleed_A3_(420.00_x_297.00_MM), "
+        "written unchanged.",
+    ],
+    orientation: Annotated[
+        str | None,
+        "landscape | portrait. Omit: landscape for a catalogue paper, taken from the "
+        "numbers of a canonical media name (a contradicting value is refused).",
+    ] = None,
     plot_style: Annotated[
         str, "Plot style table, e.g. monochrome.ctb, acad.ctb, Grayscale.ctb (plot_style_list)."
     ] = "monochrome.ctb",
@@ -8757,6 +10426,11 @@ async def page_setup_apply(
         "[top, bottom, left, right] in mm. Headless only: AutoCAD takes margins from the .pc3.",
     ] = None,
     center: Annotated[bool, "Centre the plot on the paper."] = True,
+    bleed: Annotated[
+        str,
+        "none | full_bleed | expand: the device's ISO_full_bleed_<size> / ISO_expand_<size> "
+        "media for a catalogue paper. Refused with a canonical media name in paper.",
+    ] = "none",
     ctx: Context = None,
 ) -> dict:
     """AutoCAD's PAGESETUP as one call, on both engines.
@@ -8767,11 +10441,28 @@ async def page_setup_apply(
     written and reported `plot_style_known: false` (a missing ctb only matters
     at plot time). Viewports on the sheet are never touched.
 
-    Refused before anything is written: an unknown paper, orientation, scale
-    or plot_area, an empty device or plot_style, margins that leave no
-    printable area, `Model`, an unknown layout. On the live engine `margins_mm`
-    is refused (the .pc3 owns them) and a media the device does not offer is
-    refused with the device's names for the same paper.
+    Full-bleed and expanded media (issue #18): `paper` also takes any
+    canonical media name the device offers, e.g.
+    `ISO_full_bleed_A3_(420.00_x_297.00_MM)` or
+    `ISO_expand_A4_(210.00_x_297.00_MM)`; it is written unchanged, its numbers
+    are the sheet size, and they fix the orientation (reported in `applied`).
+    Or keep a catalogue paper and pass `bleed="full_bleed"` / `"expand"`,
+    which builds `ISO_full_bleed_A3_(…)` / `ISO_expand_A3_(…)`. The ISO
+    full-bleed and expand names were listed by `DWG To PDF.pc3` and
+    `AutoCAD PDF (High Quality Print).pc3` on AutoCAD 2026 (measured
+    2026-11-05); the ANSI ones (`ANSI_full_bleed_B_(…)`) follow the same
+    pattern unmeasured. The headless engine has no device and writes the name
+    as given; the live engine checks it against the device's
+    `GetCanonicalMediaNames()`.
+
+    Refused before anything is written: an unknown paper, orientation, scale,
+    plot_area or bleed, an orientation that contradicts a canonical media
+    name, `bleed` beside a canonical media name ("paper already names the
+    media"), an empty device or plot_style, margins that leave no printable
+    area, `Model`, an unknown layout. On the live engine `margins_mm` is
+    refused (the .pc3 owns them) and a media the device does not offer is
+    refused with the device's names for the same paper and its three closest
+    names.
 
     The proof is the PDF: `batch_plot` reads each sheet's `/MediaBox` back.
     """
@@ -8779,9 +10470,20 @@ async def page_setup_apply(
 
     try:
         setup = resolve_page_setup(
-            paper, orientation, plot_style, scale, plot_area, device, margins_mm, center
+            paper,
+            orientation,
+            plot_style,
+            scale,
+            plot_area,
+            device,
+            margins_mm,
+            center,
+            bleed=bleed,
         )
-        await ctx.info(f"Applying page setup {setup['paper']} {orientation} to {layout}")
+        await ctx.info(
+            f"Applying page setup {setup['canonical_media_name']} {setup['orientation']} "
+            f"to {layout}"
+        )
         return await _backend(ctx).page_setup_apply(layout, setup)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
@@ -8847,7 +10549,7 @@ async def batch_plot(
         raise ToolError(
             f"batch_plot: format must be 'pdf' (got {format!r}); PDF is the only plot format"
         )
-    destination = validate_path(output_dir, allow_write=True)
+    destination = validate_path(output_dir, allow_write=True, kinds=DIRECTORY)
     await ctx.info(f"Batch plotting {layouts or 'every sheet'} to {destination}")
     try:
         return await _batch_plot(_backend(ctx), layouts, str(destination), file_pattern)
@@ -8916,7 +10618,7 @@ async def drawing_template_save(
 
     Pack: core · lean: no (`drawing_save_as` is not lean either).
     """
-    validated = validate_path(path, allow_write=True)
+    validated = validate_path(path, allow_write=True, kinds=KINDS_TEMPLATE)
     await ctx.info(f"Saving template: {validated}")
     try:
         return await _backend(ctx).drawing_template_save(str(validated), name, description)
@@ -9247,8 +10949,9 @@ async def system_launch(
     """Connect to the application named by `CAD_PROGID` (attach if running,
     launch otherwise) and report `launched`, `attached`, `version` and the
     active `document`. Refusals: headless, `capability: "live_application"`
-    (there is no application to launch); an `open_path` that fails path
-    validation. Pack: settings · lean: no.
+    (there is no application to launch); with `CAD_LAUNCH=never` and nothing
+    running, `cad_not_running` (attach only, nothing started); an `open_path`
+    that fails path validation. Pack: settings · lean: no.
     """
     if open_path is not None:
         open_path = str(validate_path(open_path, allow_write=False))
@@ -9507,7 +11210,7 @@ async def drawing_properties_set(
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 21: Mechanical Parts (6 tools) ──────────────────────────────────
+# ── SECTION 21: Mechanical Parts (7 tools) ──────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -9916,23 +11619,112 @@ async def mech_part_inspect(
             description="Anchor handle from mech_part_draw; omit if the drawing holds one part",
         ),
     ] = None,
+    drift: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Also compare every tagged entity with the model: drift rows, "
+            "model_is_current",
+        ),
+    ] = False,
+    history: Annotated[
+        bool,
+        Field(default=False, description="Also return the model history (mech_part_revise)"),
+    ] = False,
+    param: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="A change path, e.g. 'features.bore.diameter': its value per revision",
+        ),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """The `ACADMCP_MECH` payload a drawn part carries, decoded.
 
     Never modifies the drawing. Returns the part model exactly as
     `mech_part_draw` accepts it (`part`), the views drawn so far with their
-    placements, and the payload version.
+    placements, and the payload version. `drift=True` adds `drift` (each
+    tagged entity that no longer matches the model: feature, view, expected,
+    measured, status) and `model_is_current`; `history=True` / `param` add
+    the revisions `mech_part_revise` stored in the drawing.
 
     Refused by name: an unknown part_id, a handle that carries no
     `ACADMCP_MECH` payload, a corrupt or foreign payload, and `part_id=None` on
     a drawing that holds no part or more than one (the message lists the
     handles).
     """
-    from engineering.mech.draw import read_part
+    from engineering.mech.revise import inspect
 
     try:
-        return await read_part(_backend(ctx), part_id)
+        return await inspect(_backend(ctx), part_id, drift=drift, history=history, param=param)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(
+    summary="Change a drawn part's parameters and rebuild its views in place, keeping handles.",
+    cost="destructive",
+)
+@mcp.tool(
+    annotations={"title": "Mechanical: Revise Part", "destructiveHint": True},
+    tags={"mech", "modify"},
+)
+async def mech_part_revise(
+    part_id: Annotated[str, Field(description="Anchor handle from mech_part_draw")],
+    changes: Annotated[
+        dict,
+        Field(
+            description="Path edits: {'segments[1].length': 50, 'features.bore.diameter': 24, "
+            "'features.r1': null, 'features+': {kind, id, ...}}"
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        Field(default=False, description="Replace hand edits; redraw a part drawn before 1.8.0"),
+    ] = False,
+    dry_run: Annotated[
+        bool, Field(default=False, description="Counts and a `preview`; change nothing")
+    ] = False,
+    expected_revision: Annotated[
+        int | None,
+        Field(default=None, description="Apply only at this revision (a dry run's preview)"),
+    ] = None,
+    preconditions: Annotated[
+        list[dict] | None,
+        Field(default=None, description="A dry run's `preview.preconditions`"),
+    ] = None,
+    verify: Annotated[
+        bool,
+        Field(default=True, description="Measure the stored requirements afterwards"),
+    ] = True,
+    ctx: Context = None,
+) -> dict:
+    """Edit a drawn part's model by path and rebuild its views in place, in one transaction.
+
+    LINE/CIRCLE/ARC keep their handles; other changed entities are redrawn
+    (`handle_map`); dimensions are redrawn, so their handles change. Each
+    revision joins the part's model history.
+
+    Refused, nothing written: a bad path or a value the part refuses
+    (invalid_args); a tagged entity edited by hand (hand_edited_tagged_entity)
+    or a part drawn before 1.8.0 (model_drift) unless overwrite=True; a moved
+    preview (stale_revision); a detail view or a repeated view tag.
+    """
+    from engineering.mech.revise import revise_part
+
+    await ctx.info(f"mech_part_revise: {part_id} ({len(changes or {})} change(s))")
+    try:
+        return await revise_part(
+            _backend(ctx),
+            part_id,
+            changes,
+            overwrite=overwrite,
+            dry_run=dry_run,
+            expected_revision=expected_revision,
+            preconditions=preconditions,
+            verify=verify,
+        )
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
 
@@ -11070,7 +12862,9 @@ async def data_extract(
 ) -> dict:
     """The same rows `bom_extract` returns, written to a file.
 
-    Refusals: a format that is not 'csv' or 'xlsx'; a drawing with nothing to
+    Refusals: a format that is not 'csv' or 'xlsx'; a path not ending .csv or
+    .xlsx, or naming a file AutoCAD loads (acaddoc.lsp, acad.pgp, ...), with
+    kind path_refused; a drawing with nothing to
     itemise (nothing is written); and `fmt='xlsx'` without openpyxl, which
     carries `capability: "xlsx_write"` and names both the package to install
     and the CSV route that always works.
@@ -11079,7 +12873,7 @@ async def data_extract(
     from engineering.sheet.extract import write_rows
 
     backend = _backend(ctx)
-    validated = validate_path(path, allow_write=True)
+    validated = validate_path(path, allow_write=True, kinds=KINDS_TABLE)
     records = await extract_records(backend, layer=layer or None)
     rows = rows_from_records(records, columns=columns, group_by=group_by or None)
     await ctx.info(f"Data extract: {len(rows)} rows -> {validated}")
@@ -11113,7 +12907,7 @@ async def drawing_export_dwg(
     flag is re-evaluated at call time, so installing the converter changes it
     without a restart. An unknown version is refused by name with the six.
     """
-    validated = validate_path(path, allow_write=True)
+    validated = validate_path(path, allow_write=True, kinds=KINDS_DWG)
     await ctx.info(f"DWG export {version}: {validated}")
     return await _backend(ctx).drawing_export_dwg(str(validated), version)
 
@@ -12104,12 +13898,13 @@ async def _diff_markup(backend, result: dict, new_snap, *, rev: str, description
 )
 async def drawing_diff(
     old_path: Annotated[
-        str,
+        str | None,
         Field(
+            default=None,
             description="The OLDER revision: a DXF path (a DWG only on the live engine, which "
-            "exports it read-only)."
+            "exports it read-only).",
         ),
-    ],
+    ] = None,
     new_path: Annotated[
         str | None,
         Field(
@@ -12160,6 +13955,11 @@ async def drawing_diff(
         str,
         Field(default="", description="Revision-row text for markup=True; default: the counts."),
     ] = "",
+    old_checkpoint: Annotated[
+        str | None,
+        Field(default=None, description="Instead of old_path: a checkpoint id, seq or label."),
+    ] = None,
+    new_checkpoint: str | None = None,
     ctx: Context = None,
 ) -> dict:
     """Compare two revisions of one drawing by geometric signature (spec §10).
@@ -12182,15 +13982,26 @@ async def drawing_diff(
     on an engine without the revcloud capability (the live engine -
     `capability: "revcloud"`), a path that does not exist, a DXF over
     MAX_DXF_BYTES (the size and the variable named), a file that is not a
-    readable DXF, and a non-positive `tol` or `move_tol`.
+    readable DXF, and a non-positive `tol` or `move_tol`; an unknown or evicted
+    checkpoint (checkpoint_not_found / checkpoint_evicted); a path and a
+    checkpoint for one side (invalid_args).
     """
     from backends.base import UnsupportedCapabilityError
+    from engineering.errors import InvalidArgsError
     from engineering.sheet.revision import REV_RE
     from engineering.understand.diff import block_changes, cap_report, diff_snapshots
 
     backend = _backend(ctx)
+    if (old_path is None) == (old_checkpoint is None):
+        raise InvalidArgsError(
+            "invalid_args: give the older revision as exactly one of old_path or old_checkpoint"
+        )
+    if new_path is not None and new_checkpoint is not None:
+        raise InvalidArgsError(
+            "invalid_args: give the newer revision as new_path or new_checkpoint, not both"
+        )
     if markup:
-        if new_path:
+        if new_path or new_checkpoint:
             raise ToolError(
                 "markup draws revision clouds on the current document, which must be the newer "
                 "revision: open it with drawing_open and call again without new_path"
@@ -12208,9 +14019,24 @@ async def drawing_diff(
                 "clouds (no ActiveX member; REVCLOUD is command-line only). Run the diff "
                 "without markup, or on the ezdxf engine.",
             )
-    await ctx.info(f"drawing_diff: {old_path} -> {new_path or 'the current document'}")
-    old_snap, old_blocks = await _diff_revision(backend, old_path, tol=tol, role="old_path")
-    new_snap, new_blocks = await _diff_revision(backend, new_path, tol=tol, role="new_path")
+    from engineering.history import checkpoint_revision
+
+    await ctx.info(
+        f"drawing_diff: {old_path or old_checkpoint} -> "
+        f"{new_path or new_checkpoint or 'the current document'}"
+    )
+    if old_checkpoint is not None:
+        old_snap, old_blocks = await checkpoint_revision(
+            backend, old_checkpoint, tol=tol, role="old_checkpoint"
+        )
+    else:
+        old_snap, old_blocks = await _diff_revision(backend, old_path, tol=tol, role="old_path")
+    if new_checkpoint is not None:
+        new_snap, new_blocks = await checkpoint_revision(
+            backend, new_checkpoint, tol=tol, role="new_checkpoint"
+        )
+    else:
+        new_snap, new_blocks = await _diff_revision(backend, new_path, tol=tol, role="new_path")
     try:
         result = diff_snapshots(old_snap, new_snap, tol=tol, move_tol=move_tol)
     except ValueError as exc:
@@ -12265,14 +14091,30 @@ async def drawing_topology_check(
         Field(default=0.01, gt=0, description="Within this distance two ends are joined."),
     ] = 0.01,
     limit: Annotated[
-        int,
-        Field(default=200, ge=1, le=5000, description="Rows kept per list; counts are complete."),
-    ] = 200,
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            le=5000,
+            description="Rows kept per list (None = 200); with summary=True, rows kept in "
+            "all (None = 5). Counts are complete.",
+        ),
+    ] = None,
+    summary: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Return {total, by_focus (per finding kind), by_severity, "
+            "issues[:limit]} with compact rows instead of the three lists.",
+        ),
+    ] = False,
     ctx: Context = None,
 ) -> dict:
     """Topology of a line network (spec §11): dangling ends, near misses (end to end and
     end to line within `gap`) and interior crossings (two lines of one layer crossing
-    away from their ends). Never modifies the drawing.
+    away from their ends). Never modifies the drawing. summary=True returns the counts
+    over every finding and the first `limit` as compact rows (near_miss error, dangling
+    warning, crossing info - the topo_* critique severities).
 
     An end that touches another network line, any curve on another layer (a tank
     outline) or the box of any block reference (a valve, a pump) is connected. Arcs
@@ -12322,7 +14164,15 @@ async def drawing_topology_check(
         findings = topology_findings(snap, layers=chosen, gap=gap, tol=tol)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
-    report = cap_findings(findings, limit)
+    if summary:
+        from engineering.qa_coverage import summarize
+        from engineering.understand.topology import finding_rows
+
+        compact = summarize(finding_rows(findings), summary=True, limit=limit)
+        compact["source"] = snap.source
+        compact["layers"] = list(findings["layers"])
+        return compact
+    report = cap_findings(findings, 200 if limit is None else limit)
     report["source"] = snap.source
     report["classification"] = [row for row in classification if row["layer"] in set(chosen)]
     return report
@@ -12449,7 +14299,7 @@ async def drawing_verify_requirements(
 
     report_target = None
     if report_path is not None:
-        report_target = validate_path(report_path, allow_write=True)
+        report_target = validate_path(report_path, allow_write=True, kinds=KINDS_REPORT)
         allowed = (".json",) if manifest_path is not None else (".json", ".md")
         if report_target.suffix.lower() not in allowed:
             raise ToolError(
@@ -12682,7 +14532,7 @@ async def pipe_takeoff(
 
     pid = str(validate_path(pid_path)) if pid_path else None
     layout = str(validate_path(layout_path)) if layout_path else None
-    target = str(validate_path(output, allow_write=True)) if output else None
+    target = str(validate_path(output, allow_write=True, kinds=KINDS_TABLE)) if output else None
     await ctx.info(f"pipe_takeoff: {pid or 'current drawing'} / {layout or 'no layout'}")
     try:
         return await run_pipe_takeoff(
@@ -12803,7 +14653,7 @@ async def cable_takeoff(
 
     pid = str(validate_path(pid_path)) if pid_path else None
     layout = str(validate_path(layout_path)) if layout_path else None
-    target = str(validate_path(output, allow_write=True)) if output else None
+    target = str(validate_path(output, allow_write=True, kinds=KINDS_TABLE)) if output else None
     await ctx.info(f"cable_takeoff: {pid or 'current drawing'} / {layout or 'no layout'}")
     try:
         return await run_cable_takeoff(
@@ -12974,6 +14824,28 @@ async def resource_isa51() -> str:
 
 
 @mcp.resource(
+    "autocad://pid/project/last",
+    name="Last P&ID Project Result",
+    description=(
+        "The last pid_project result of this server process (check or index), or "
+        "available: false when none has run"
+    ),
+    mime_type="application/json",
+    annotations={"readOnlyHint": True},
+    tags={"pid"},
+)
+async def resource_pid_project_last() -> str:
+    from engineering.pid.project import last_result
+
+    last = last_result()
+    if last is None:
+        return json.dumps(
+            {"available": False, "hint": "run pid_project(action='check' or 'index') first"}
+        )
+    return json.dumps({"available": True, **last}, indent=2, ensure_ascii=False)
+
+
+@mcp.resource(
     "autocad://standards/coverage",
     name="Standards Coverage Manifest",
     description=(
@@ -12988,6 +14860,23 @@ async def resource_standards_coverage() -> str:
     from engineering.mech.standards.coverage import coverage_manifest
 
     return json.dumps(coverage_manifest(), indent=2)
+
+
+@mcp.resource(
+    "autocad://critique/focuses",
+    name="Critique Focuses",
+    description=(
+        "Every drawing_critique focus (the closed set): domain, what it reports, when it is "
+        "silent; and the not_checked reasons a coverage report can carry"
+    ),
+    mime_type="application/json",
+    annotations={"readOnlyHint": True},
+    tags={"premium", "validation"},
+)
+async def resource_critique_focuses() -> str:
+    from engineering.critique_catalog import critique_focuses
+
+    return json.dumps(critique_focuses(), indent=2)
 
 
 @mcp.resource(
@@ -13159,10 +15048,11 @@ WORKFLOW
 5. pid_line_draw(from_={{"handle", "port"}}, to={{"handle", "port"}}, line_class=process_major|process_minor|
    utility|pneumatic|electric|hydraulic|capillary|data, size="100", service="P", spec="CS1")
    A bubble's radial port needs no name. Read `crossings` and `port_reuse` in the response.
+   A symbol between the ports: route="avoid" goes round it; `obstacle_hits` must be [].
 6. pid_graph() — `dangling` must be empty and `stats.confidence_min` 1.0 for a drawing you made.
 7. drawing_critique(focus=None) — must return [] (pid_dangling_line, pid_duplicate_tag,
-   pid_incompatible_connection, pid_untagged_instrument, pid_illegal_tag, pid_unconnected_equipment
-   are part of it).
+   pid_incompatible_connection, pid_untagged_instrument, pid_illegal_tag, pid_unconnected_equipment,
+   pid_line_through_symbol are part of it).
 8. pid_instrument_index() / pid_line_list() / pid_equipment_list() for the deliverables.
 9. drawing_finalize(save_path=...) — the score is the objective quality metric.
 
@@ -13323,11 +15213,20 @@ def _validate_http_bind(host: str) -> None:
             "Set ALLOW_REMOTE_HTTP=true and MCP_AUTH_TOKEN=<token> to opt in. "
             "Without auth, any client on the network can run AutoCAD commands."
         )
-    if not config.settings.mcp_auth_token:
+    if not (
+        config.settings.mcp_auth_token or getattr(config.settings, "mcp_auth_token_readonly", "")
+    ):
         raise SystemExit(
             f"Refusing to bind HTTP on '{host}' without MCP_AUTH_TOKEN. "
             "Set MCP_AUTH_TOKEN=<token> to enable bearer-token auth, or bind "
             "to 127.0.0.1 for local-only access."
+        )
+    if not config.settings.allowed_paths:
+        # 1.8-17: a network-reachable server confines every file it reads or
+        # writes; without ALLOWED_PATHS a remote client names any path.
+        raise SystemExit(
+            f"Refusing to bind HTTP on '{host}' without ALLOWED_PATHS. A non-loopback "
+            "server must confine its file reads and writes: set ALLOWED_PATHS=<folder>[,...]."
         )
     log.warning(
         "⚠ Binding HTTP on non-loopback host '%s'. Auth token required for all "
@@ -13385,11 +15284,49 @@ def _effective_http_host(kwargs: dict) -> str:
 
 async def _guarded_run_async(transport=None, *args, **kwargs):
     if (transport in _HTTP_TRANSPORTS) or (kwargs.get("transport") in _HTTP_TRANSPORTS):
-        _validate_http_bind(_effective_http_host(kwargs))
+        host = _effective_http_host(kwargs)
+        _validate_http_bind(host)
+        # 1.8-17: the request guard's Host check compares against this bind.
+        http_guard.set_bind(host, _effective_http_port(kwargs))
     return await _orig_run_async(transport, *args, **kwargs)
 
 
+def _effective_http_port(kwargs: dict) -> int | None:
+    """The port that will be bound: ``port`` when given, else fastmcp's setting."""
+    port = kwargs.get("port")
+    if port:
+        return int(port)
+    try:
+        import fastmcp
+
+        resolved = getattr(fastmcp.settings, "port", None)
+        return int(resolved) if resolved else None
+    except Exception:  # pragma: no cover - defensive; the guard then accepts any port
+        return None
+
+
 mcp.run_async = _guarded_run_async
+
+# 1.8-17 (spike S3): the HTTP request guard (Origin 403, Host 421, body 413),
+# prepended on every app builder - main(), mcp.run, `fastmcp run` and a direct
+# mcp.http_app() all reach it through this instance attribute, the SSE app
+# included. Pure ASGI, so the MCP event stream passes through unbuffered.
+_orig_http_app = mcp.http_app
+
+
+def _guarded_http_app(*args, **kwargs):
+    from starlette.middleware import Middleware as _AsgiMiddleware
+
+    guard = _AsgiMiddleware(http_guard.HttpGuard)
+    args = list(args)
+    if len(args) > 1:  # http_app(path, middleware, ...) positionally
+        args[1] = [guard, *(args[1] or [])]
+    else:
+        kwargs["middleware"] = [guard, *(kwargs.get("middleware") or [])]
+    return _orig_http_app(*args, **kwargs)
+
+
+mcp.http_app = _guarded_http_app
 
 
 def main() -> None:

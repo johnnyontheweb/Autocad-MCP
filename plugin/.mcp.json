@@ -4,9 +4,12 @@
       "command": "uvx",
       "args": [
         "--from",
-        "${AUTOCAD_MCP_SOURCE:-autocad-mcp-pro[com,pdf,office]==1.7.0}",
+        "${AUTOCAD_MCP_SOURCE:-autocad-mcp-pro[com,pdf,office]==1.8.0}",
         "autocad-mcp"
-      ]
+      ],
+      "env": {
+        "DISCOVERY_MODE": "${AUTOCAD_MCP_DISCOVERY:-search}"
+      }
     }
   }
 }

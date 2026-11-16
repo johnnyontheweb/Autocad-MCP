@@ -64,7 +64,7 @@ def test_the_suite_carries_the_five_understanding_checks():
 
     for name in UNDERSTANDING_CHECKS:
         assert CHECKS[name][1] == "Understanding"
-    assert len(CHECKS) == 61
+    assert len(CHECKS) == 83
 
 
 async def _run(task_id, tmp_path):
@@ -166,15 +166,27 @@ def test_the_suite_carries_the_four_reliability_checks():
 
     for name in RELIABILITY_CHECKS:
         assert CHECKS[name][1] == "Reliability"
-    assert len(CHECKS) == 61
+    assert len(CHECKS) == 83
 
 
-def test_the_published_report_shows_the_four_fixed_and_nothing_regressed():
-    from scripts.check_doc_numbers import AB_REPORT
-
-    report = json.loads((Path(__file__).parents[1] / AB_REPORT).read_text(encoding="utf-8"))
+def test_the_1_7_0_report_showed_the_four_fixed_and_nothing_regressed():
+    """The 1.7.0 release report stays published: it is the proof the four were real."""
+    published = Path(__file__).parents[1] / "benchmarks" / "results" / "published"
+    report = json.loads((published / "ab-v1.6.0-vs-v1.7.0.json").read_text(encoding="utf-8"))
     rows = {row["check"]: row for row in report["rows"]}
     assert report["summary"]["baseline_ref"] == "v1.6.0"
     assert report["summary"]["regressed"] == 0
     for name in RELIABILITY_CHECKS:
         assert (rows[name]["old"], rows[name]["new"]) == ("fail", "pass"), name
+
+
+def test_the_published_report_keeps_the_four_fixed_and_nothing_regressed():
+    """1.8.0's report runs against v1.7.0, where the four already pass: they must stay green."""
+    from scripts.check_doc_numbers import AB_REPORT
+
+    report = json.loads((Path(__file__).parents[1] / AB_REPORT).read_text(encoding="utf-8"))
+    rows = {row["check"]: row for row in report["rows"]}
+    assert report["summary"]["baseline_ref"] == "v1.7.0"
+    assert report["summary"]["regressed"] == 0
+    for name in RELIABILITY_CHECKS:
+        assert (rows[name]["old"], rows[name]["new"]) == ("pass", "pass"), name

@@ -36,11 +36,15 @@ from typing import Any
 from fastmcp.tools.base import Tool
 
 from discovery.aliases import aliases_for
+from discovery.descriptions import full_description
 
 __all__ = [
     "MAX_SUMMARY_CHARS",
+    "PIN_PARAM_CHARS",
     "describe_payload",
     "docstring_examples",
+    "lean_schema",
+    "pinned_card",
     "serialize_search_results",
 ]
 
@@ -210,18 +214,22 @@ def docstring_examples(text: str | None) -> list[str]:
 def describe_payload(tool: Tool, *, pack: str | None = None) -> dict[str, Any]:
     """Everything a client needs to call ``tool``, from what it already carries.
 
-    ``input_schema``, ``description`` and ``annotations`` are the tool's own MCP
-    rendering — the same object a full-catalog ``list_tools`` sends — so the
-    schema cannot drift from what the call validates against. ``cost`` is the
-    ``@cad_tool`` card's, ``acad`` / ``synonyms`` the alias corpus's, and
-    ``examples`` only what the docstring itself writes (:func:`docstring_examples`).
+    ``input_schema`` and ``annotations`` are the tool's own MCP rendering — the
+    same object a full-catalog ``list_tools`` sends — so the schema cannot drift
+    from what the call validates against. ``description`` is the *full* text
+    (:func:`discovery.descriptions.full_description`): a listing carries only
+    the leading paragraphs of a long docstring and points here for the rest.
+    ``cost`` is the ``@cad_tool`` card's, ``acad`` / ``synonyms`` the alias
+    corpus's, and ``examples`` only what the docstring itself writes
+    (:func:`docstring_examples`).
     """
     wire = tool.to_mcp_tool()
     cad = (tool.meta or {}).get("cad")
     record = aliases_for(tool.name)
+    full = full_description(tool)
     return {
         "name": tool.name,
-        "description": wire.description,
+        "description": full or wire.description,
         "input_schema": wire.inputSchema,
         "annotations": (
             wire.annotations.model_dump(mode="json", exclude_none=True)
@@ -233,5 +241,98 @@ def describe_payload(tool: Tool, *, pack: str | None = None) -> dict[str, Any]:
         "pack": pack,
         "acad": list(record.acad) if record else [],
         "synonyms": list(record.synonyms) if record else [],
-        "examples": docstring_examples(tool.description),
+        "examples": docstring_examples(full),
     }
+
+
+# ---------------------------------------------------------------------------
+# Search mode's advertised cards: pinned tools and the synthetic three
+# ---------------------------------------------------------------------------
+#
+# A pinned tool (DISCOVERY_PINNED, 1.8-11) stays listed beside the synthetic
+# tools so the commonest calls never cost a search turn. Listed with its full
+# docstring it cost what the search mode exists to save: spike S1 measured the
+# three default pins at ~2,230 tokens, cad_batch alone ~1,360. The listed card
+# keeps everything a call is validated against - every property, its type,
+# enum, default and bounds, the required list - and shortens only the prose:
+# the description to its first paragraph, each parameter description to whole
+# sentences within PIN_PARAM_CHARS. describe_tool still returns the untouched
+# description and schema (it reads the catalog, not this listing), and the
+# call itself always reaches the registered tool.
+
+#: A pinned card's parameter description is cut back to whole sentences within
+#: this many characters (at least the first sentence is always kept).
+PIN_PARAM_CHARS = 250
+
+#: Appended to a pinned card's description, so the cut is never silent.
+PIN_POINTER = "Full description: describe_tool."
+
+# A sentence ends at . ; ! or ? followed by whitespace, unless the next word
+# starts in lower case (an abbreviation, "e.g. x", "1.5 mm").
+_SENTENCE_END = re.compile(r"(?<=[.;!?])\s+(?=[^a-z\s])")
+
+
+def _sentences_within(text: str, limit: int) -> str:
+    """Whole leading sentences of ``text`` within ``limit`` characters (>= one)."""
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    kept = ""
+    for sentence in _SENTENCE_END.split(flat):
+        candidate = f"{kept} {sentence}".strip()
+        if kept and len(candidate) > limit:
+            break
+        kept = candidate
+    return kept
+
+
+def _first_paragraph(text: str | None) -> str:
+    for block in re.split(r"\n\s*\n", (text or "").strip()):
+        if block.strip():
+            return " ".join(block.split())
+    return ""
+
+
+def pinned_card(tool: Tool) -> Tool:
+    """``tool`` as search mode lists a pinned tool: same schema, shorter prose.
+
+    Never changes what a call is validated against: the copy keeps every key
+    of the input schema except over-long ``description`` strings, and it is
+    only ever *listed* - a call resolves the registered tool.
+    """
+    schema = _copy_schema(tool.parameters or {})
+    for prop in (schema.get("properties") or {}).values():
+        if isinstance(prop, dict) and isinstance(prop.get("description"), str):
+            prop["description"] = _sentences_within(prop["description"], PIN_PARAM_CHARS)
+    lead = _first_paragraph(full_description(tool)) or _summary(tool)
+    return tool.model_copy(update={"description": f"{lead} {PIN_POINTER}", "parameters": schema})
+
+
+def _copy_schema(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _copy_schema(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_schema(item) for item in value]
+    return value
+
+
+def lean_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """A synthetic tool's input schema without the wire noise pydantic adds.
+
+    ``additionalProperties: false`` and the ``anyOf [X, null]`` an optional
+    argument becomes are dropped (the default stays): the function's own
+    validation still refuses an unknown or ill-typed argument, so the
+    advertised schema loses no constraint a caller can rely on, only bytes.
+    """
+    lean = _copy_schema(schema)
+    lean.pop("additionalProperties", None)
+    for name, prop in list((lean.get("properties") or {}).items()):
+        options = prop.get("anyOf") if isinstance(prop, dict) else None
+        if isinstance(options, list) and len(options) == 2:
+            kept = [o for o in options if o != {"type": "null"}]
+            if len(kept) == 1:
+                merged = {key: value for key, value in prop.items() if key != "anyOf"}
+                merged.update(kept[0])
+                merged.pop("additionalProperties", None)
+                lean["properties"][name] = merged
+    return lean

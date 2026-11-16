@@ -28,11 +28,31 @@ not the XDATA. So:
   selector, or `entity_get` on the tagged handle - never by reading the model;
 - when the two disagree, report both and say the stored model is stale.
 
-There is no parametric rebuild in this release. To change a drawn part:
-either delete its entities and draw the corrected spec again, or edit the
-geometry in place (`entity_edit_geometry` keeps the handle, `entity_move`,
-`entity_set_properties`) and accept that the stored model now lags - then
-verify the geometry.
+`mech_part_inspect(part_id, drift=True)` says whether the drawing still
+matches its model (`model_is_current`, `drift` per feature and view);
+`history=True, param="features.bore.diameter"` reads the part's revisions.
+
+## Revise a drawn part
+
+A change to a drawn part is one call, never delete-and-redraw:
+`mech_part_revise(part_id, changes={"features.bore.diameter": 24,
+"segments[1].length": 50})`, with `dry_run=True` first and the same
+`expected_revision=` / `preconditions=` guard. Tagged lines, circles and arcs
+keep their handles; a redrawn entity is listed in `handle_map`; dimensions are
+placed again, so their handles change. A hand-edited tagged entity refuses the
+call (`hand_edited_tagged_entity`, the handles named) and so does a part drawn
+before 1.8.0 (`model_drift`); `overwrite=True` replaces the hand edit with the
+model - ask before passing it. A part with a detail view, or two views sharing
+a view tag, is refused by name. The `model_drift` critique focus names a part
+whose drawing no longer matches its model.
+
+In-place edits keep the handle, layer and XDATA (feature tags included):
+`entity_edit_geometry` takes `points` / `bulges` for a polyline (the vertex
+count may change) and `x` / `y` for TEXT and MTEXT; `entity_edit_text` takes
+`x` / `y` beside content, height and rotation. An argument the type does not
+take is refused by name. On a live seat a polyline whose vertex count AutoCAD
+will not change in place is recreated with everything carried over, and the
+result lists `replaced` `[{old, new}]` - use the new handle from then on.
 
 ## Change existing drawings under a guard
 
@@ -63,6 +83,14 @@ and `point_intersection` / `point_tangent`; never compute them in your head.
 - `drawing_apply_iso_layers("mech")` sets ISO 128 lineweights (0.13, 0.18,
   0.25, 0.35, 0.50, 0.70, 1.00, 1.40, 2.00 mm only). Scaffolding goes on
   `CONSTRUCTION` and is removed with `construction_clear()` before critique.
+- Entities follow their layer: lineweight `"ByLayer"` (-1), never -3, which
+  is *Default* (LWDEFAULT). The `property_override` focus reports an entity on
+  an engineering layer whose lineweight, colour or linetype is not ByLayer
+  (an explicit non-ISO-128 lineweight is an error and fails finalize);
+  `drawing_refine` sets them back to ByLayer.
+- `mech_dimension_part` tags every DIMENSION it draws in `ACADMCP_MECH` XDATA
+  with its part, feature and view (`role: "dim"`; the hole table
+  `role: "hole_table"`).
 - `mech_dimension_part(part_id=...)` dimensions a part model (ISO 129, ISO 286
   fits). Elsewhere `dimension_linear` / `dimension_radius` /
   `dimension_diameter` take read-back feature points, `fit="H7"` (from the
@@ -78,4 +106,5 @@ and `point_intersection` / `point_tangent`; never compute them in your head.
 `surface_texture` (ISO 21920-1), `weld_symbol` (ISO 2553), `centre_marks`,
 `gd_frame` / `datum_feature` (ISO 1101), `balloon_add` linked to `bom_table`
 (a rerun renumbers instead of duplicating). The six `mech_*` critique focuses
-run inside `drawing_critique(focus=None)` and `drawing_finalize`.
+and `model_drift` run inside `drawing_critique(focus=None)` and
+`drawing_finalize`.

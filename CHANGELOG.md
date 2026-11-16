@@ -7,6 +7,1878 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-11-06
+
+1.8.0: the server remembers, finishes a job in one call and measures itself
+honestly. Nine tools are added (248 -> 257) and two resources (11 -> 13); the
+5 prompt templates are unchanged, and `system_about` is the authority for the
+counts. This head is the release summary; the three phase blocks below (W1,
+W2, W3) keep what each phase shipped, with its own migration notes or Breaking
+table. Spec: `docs/superpowers/specs/2026-11-03-v1.8.0-design.md`.
+
+### Breaking at a glance
+
+One line per default that changed, and what restores the 1.7.0 behaviour (the
+W1 *Migration notes* and the W2 / W3 *Breaking* tables carry the detail):
+
+- **Server discovery:** `DISCOVERY_MODE` defaults to `search`: a client lists
+  `search_tools`, `describe_tool`, `call_tool` and the `DISCOVERY_PINNED` tools
+  (`cad_batch`, `drawing_info`, `entity_list`), and every tool stays callable
+  by name. Restore: `DISCOVERY_MODE=off`; `DISCOVERY_PINNED=""` pins nothing.
+- **Plugin discovery:** `plugin/.mcp.json` passes
+  `DISCOVERY_MODE=${AUTOCAD_MCP_DISCOVERY:-search}`. Restore:
+  `AUTOCAD_MCP_DISCOVERY=off`.
+- **Long descriptions on the wire:** a description over 800 characters is
+  listed as its leading paragraphs plus `Details: describe_tool.` (47 of 257
+  tools), and `DISCOVERY_MODE=off` lists `describe_tool` too (253 tools). No
+  switch: the registered tool and `describe_tool` keep the whole docstring.
+- **`meta["cad"]`** carries `summary` and `cost` only. The AutoCAD names and
+  synonyms are in `describe_tool` and `docs/tool-inventory.json`.
+- **`cad_batch(on_error=)`** defaults to `auto`: a batch that writes is all or
+  nothing, and a literal handle that names no entity refuses the whole batch
+  (`unknown_handle`) under every mode. Restore: `on_error="stop"` (the handle
+  pre-check stays).
+- **`entity_delete_many`** deletes all of its handles or none and answers
+  `ok: false` whenever it reports an error. No switch: send live handles,
+  read `ok`.
+- **`system_status.operations`** is a summary, `{count, last,
+  unknown_commit}`. Restore: `system_status(detail="operations")` (this
+  release only), or `drawing_history`.
+- **`strict_critique=True`** (opt-in on `drawing_finalize`, the default of
+  `drawing_deliver`) also fails on every `not_checked` lane except
+  `domain_absent`, so a default live delivery is `failed_validation`.
+  Restore: `strict_critique=False`.
+- **Headless `dimstyle_modify`** redraws the dimensions that use the style.
+  Restore: `rerender=False`.
+- **`LISP_POLICY`** defaults to `read` (the read tier, with the denylist as a
+  second pass). Restore: `LISP_POLICY=denylist`.
+- **`drawing_topology_check(limit=)`** defaults to `None`: 200 rows per list
+  without `summary`, 5 with it. Restore: `limit=200`.
+- **A writer's output path** takes only the tool's own extensions and never a
+  name AutoCAD or Windows loads (`path_refused`). No switch: name the file
+  with the tool's extension.
+- **HTTP:** an unknown Origin is 403, a foreign Host 421, a body over 8 MiB
+  413. Restore: `HTTP_ALLOWED_ORIGINS` / `HTTP_ALLOWED_HOSTS` (or `*`),
+  `MAX_HTTP_BODY_BYTES=0`. A non-loopback bind also needs `ALLOWED_PATHS`
+  now, with no switch.
+- **Lineweights:** -3 reads as Default, never ByLayer, and a layer refuses
+  ByLayer / ByBlock by name. No switch: the old answer was a mislabel.
+- **Errors:** every route returns one typed envelope, and a missing handle,
+  path, command or file has its own kind. The text content is unchanged.
+- **Durable journal:** on by default in `ACADMCP_STATE_DIR`, so a reopened
+  file continues its `document_id` and revision, and headless `drawing_undo`
+  without `EZDXF_UNDO_DEPTH` steps back to the newest checkpoint, also after a
+  restart. Restore: `JOURNAL_DURABLE=off`.
+- **COM target space:** a live seat draws in model space until
+  `layout_set_current` names a sheet; the tab the operator clicks no longer
+  moves it. Restore: `layout_set_current`.
+- **COM commands and undo:** `system_run_command` and live undo / redo wait
+  for the command and can fail `command_incomplete`. `COMMAND_DEADLINE_S`
+  bounds the wait; there is no fire-and-forget mode.
+- **COM refresh and bulk jobs:** one display refresh per COM job (`Update()`
+  of the entity for a single create, one Regen otherwise), and
+  `entity_batch_create` / `entity_delete_many` run as STA jobs sliced at a
+  quarter of `COM_CALL_TIMEOUT`, cancellable only between jobs. Restore:
+  `COM_REFRESH_MODE=regen` (one Regen per job; there is no per-entity mode);
+  no switch for the slicing.
+- **Headless `.dwg` open (`dwg_read`):** converted through the ODA File
+  Converter, then `accoreconsole`; with neither, a typed `dwg_read` refusal.
+  Restore: `ACCORECONSOLE_PATH=off` (and no ODA).
+- **`drawing_critique(focus=None)`** reports one `model_drift` `unstamped`
+  info issue per part drawn before 1.8.0. Restore: redraw it with
+  `mech_part_revise(..., overwrite=True)`.
+- **Screenshots:** the image is still `content[0]`; the report is `content[1]`
+  and the structured content.
+
+### Gate numbers
+
+Measured on the release tree (`release/1.8.0`, headless), each with its
+command:
+
+- **A/B:** `python benchmarks/compare_versions.py v1.7.0 --json ...` - 61 / 83
+  (73.5 %) on v1.7.0 against 83 / 83, 22 fixed, 0 regressed
+  (`benchmarks/results/published/ab-v1.7.0-vs-v1.8.0.json`, taken at
+  `ab07c47`, whose `correctness_suite.py` is the release tree's; the current
+  side alone re-run on `78b9b1e`: 83 / 83).
+- **Tokens:** `python -m benchmarks.token_suite --budget
+  benchmarks/token_budget.json --release` exits 0. Idle, prompt payload / wire
+  (ratio/v1 estimates): the 1.8.0 default surface (`search_pinned`, six tools)
+  1,026 / 1,300 (ceiling 1,500); `search` 220 / 230 (250; 1.7.0 455 / 503);
+  `DISCOVERY_MODE=off` 253 tools 59,138 / 78,391 (65,594; 1.7.0 62,471 /
+  89,350); `lean` 16,182 / 21,189 (18,842); `packs_core` 40,722 / 55,169
+  (43,997); instructions 199 (250; 1.7.0 461). Result cells: `system_status`
+  +18 bytes at 1,000 journal rows (300), a 500-issue critique summary 735
+  characters (2,500), finalize's `qa_coverage` 226 tokens (300), the error
+  envelope 58 tokens per error (60), `drawing_history(limit=10)` 344 tokens
+  (400). Task cells (calls): sketch 1, foreign inspection 1, layer clean-up 2
+  (1.7.0 124, the rival 11), plate dimensions 2 (1.7.0 89, the rival 10),
+  round-2 value 2. `benchmarks/results/published/token-cost.json` is this run.
+  `real_model.plugin_eval` is not checked by `--budget`; its
+  `dimension-budget` case was over its 6 calls in 1.8-11's runs (9 and 12).
+- **Matrix v9:** `python -m benchmarks.run_competitors --server autocad-mcp-pro
+  --backend ezdxf --matrix v9 --no-fetch` - 49 tasks, 47 / 47 attempted pass
+  (score 100.0); `lisp_read_tier` `environment_blocked` (AutoLISP runs only in
+  AutoCAD), `std_tables_b40` `not_run` (no B40 row); `dwg_headless_roundtrip`
+  passed through `accoreconsole` on the run machine. The AgentCAD lane
+  (`lizaixi01-agentcad`, no adapter) is `not_run` on all 49.
+  `benchmarks/results/published/lanes-v9/`.
+- **Full suite:** `AUTOCAD_MCP_BACKEND=ezdxf pytest -q -p no:cacheprovider`
+  with no deselection - 7,583 collected, `7582 passed, 1 xfailed` (685 s under
+  `-v`) at `e427387`, the last code commit of this release (the four tracker
+  fixes merged, the wire risk-notice test derived), with `git` on PATH (the
+  benchmark runner's `git_sha` row needs it) and no AutoCAD running. Earlier
+  the same day: 7,541 collected, `7540 passed, 1 xfailed` (344 s) at
+  `50a4049`; and at `94aaba1` the suite had died twice with a native crash
+  (STATUS_ILLEGAL_INSTRUCTION, then ACCESS_VIOLATION at 18 %): the message
+  filter's lifetime, fixed in `9cafaa0` and `50a4049` (*Live-seat fixes*).
+- **Headless performance:** `python -m benchmarks.perf_compare --base v1.7.0
+  --aa --rounds 20` at `f3523db` on 2026-11-05 - `ok: true`, A/A spread
+  7.1 % (bound 1.14): `create_lines_2k` 1.02, `roundtrip_10k` 1.03,
+  `region_query_10k` 0.97, `premium_pass` 0.96, `server_create_lines_2k`
+  1.06 (`benchmarks/results/published/perf-v1.7.0-vs-v1.8.0.json`). The
+  server row is the durable journal's commit per mutating call (about 50 µs
+  of a 1.7 ms call; 1.03 with `JOURNAL_DURABLE=off`): on a quiet machine the
+  bound is the 1.05 floor and that row misses it by about 1 %, said in the
+  README's *Headless performance* and in *Not in 1.8.0* below. A first run
+  that day gave 1.15 and 1.09 on those two rows: the workers had written into
+  the machine's default state folder (a 213 MB journal and 656 checkpoint
+  lineages left by earlier runs), which `f3523db` ends - every measurement
+  now runs in a fresh state folder of its own. The W1 gate numbers below are
+  history; their A/A spread was 12.3 %, so their bound was 1.25.
+
+### Live-seat fixes (2026-11-04)
+
+The first runs of the live smokes on AutoCAD 2026 found these; each is fixed
+where the fault was, with a test that fails on the previous code. The result
+files they cite are the live-fix run's; *Live evidence* below records what is
+pinned to the release.
+
+- **Two lines are trimmed and extended by geometry
+  (`backends/com_backend.py`).** Measured: the seat's `TRIMEXTENDMODE` is 1
+  (Quick, the default since AutoCAD 2021), so the `_TRIM` script took the
+  cutter as the object to trim and erased it; in Standard mode the pick is a
+  screen point, so a line outside the view selected nothing and left
+  `SendCommand` blocked at a crossing-window prompt, and TRIM removes the
+  picked side where the contract keeps it. LINE + LINE now goes through
+  `_line_corner`, the headless engine's own rule (the intersection of the
+  infinite lines; trim keeps the segment holding the point, extend moves the
+  nearer end), in place, handle kept, with no command and no tab switch.
+  Other pairs keep the command, now under `TRIMEXTENDMODE` 0 for that command
+  only (`_safe_send_command(sysvars=)`, restored after); `_set_variable`
+  retries an int as a `VT_I2` VARIANT, because a Python int raised `Error
+  setting system variable`. Tests in `tests/test_com_space.py`.
+- **`drawing_undo` and `drawing_redo` touch no system variable.** Measured:
+  `_safe_send_command` zeroed OSMODE / SNAPMODE / CMDECHO around a command,
+  and a `SetVariable` is an undo record of its own - after
+  `SetVariable(OSMODE, 0)`, `_UNDO 1` undid the variable and left the drawing,
+  and `_REDO` after the restore answered `Nothing to redo`. The undo check had
+  passed only because the variables were already 0. `_undo_step_sync` now
+  calls `_safe_send_command(quiet=False)`, which touches no variable
+  (`tests/test_com_space.py::test_undo_and_redo_touch_no_system_variable`).
+- **The space smoke's raw-command stage measures what AutoCAD 2026 allows
+  (`scripts/smoke_space_com.py`; product unchanged).** A raw command runs in
+  the active space, so with the operator's tab on Layout1 its circle is
+  reported in Layout1 with `created_outside_target_space`, and on the Model tab
+  in Model, clean; the stage now checks both. A command left at its prompt
+  cannot be produced through ActiveX on this seat: `SendCommand('_SCALE\n')`
+  does not return until the prompt is answered, `PostCommand` returns but then
+  every COM call is `RPC_E_CALL_REJECTED` until a key is pressed in AutoCAD,
+  and an ESC character in a `SendCommand` string is refused as `Invalid
+  input`. The smoke no longer sends such a command and records
+  `PROMPT_LIMITATION`; `_safe_send_command`'s docstring says that a raw
+  command left at its prompt overruns `COM_CALL_TIMEOUT`.
+- **An entity fingerprint leaves out what AutoCAD regenerates on every export
+  (`engineering/changes/preview.py`).** Measured: two `Document.Export` reads
+  of an untouched parts-list ACAD_TABLE differed, because each export hands
+  the table a new extension dictionary (the `{ACAD_XDICTIONARY` pointer, 360)
+  and new proxy graphics (160 + 310), so the preview and precondition
+  fingerprints of any live TABLE moved on every read and an apply with a
+  precondition on one would have been refused `stale_revision` for nothing.
+  The fingerprint now hashes `_content_tags`: the extension dictionary's
+  pointer becomes a marker that one exists, the proxy graphics are dropped,
+  every other tag counts. Both engines use it; headless fingerprints of
+  entities with neither are unchanged
+  (`tests/test_change_preview.py::test_what_autocad_regenerates_on_every_export_does_not_move_a_fingerprint`).
+- **The live harness never runs a write twice after a refused later call
+  (`scripts/live/harness.py`).** Measured: on a freshly started seat a
+  content-changing job that had already drawn its LINE when a later call was
+  refused was retried whole and drew the line again (`Lines 9D and 9E are
+  duplicates`). Inside a `ComBackend` `_mutating` call, a job that had touched
+  the Application before the refusal is no longer retried and the refusal is
+  raised; reads, the smoke's own raw jobs and `application_busy` (refused
+  before anything ran) are retried as before (`tests/test_live_harness.py`).
+- **The settings smoke counts both diameter glyphs in the `%%c<>` read-back
+  (`scripts/smoke_settings_com.py`).** Measured: the `*D` text AutoCAD holds
+  for a diameter with the override `%%c<>` is `Ø∅20` - U+00D8 from `%%c`, then
+  U+2205, the diameter dimension's own prefix - and the smoke counted only
+  `Ø`, so its recorded (not asserted) `double_prefix_is_double` read false
+  although the sign is printed twice. It now counts both and records
+  `double_prefix_codepoints`.
+- **A refused member lookup is waited out before it reaches the caller
+  (`backends/com_backend.py`, `RejectedLookupError`).** Measured: pywin32's
+  dynamic `CDispatch.__getattr__` swallowed the `RPC_E_CALL_REJECTED` of its
+  `GetIDsOfNames` and raised a bare `AttributeError` (`<unknown>.Count` right
+  after a document was closed), so no rejection handler ever saw it; and in a
+  5,000-line drawing one `entity_fillet`'s `SendCommand` lookup was refused
+  right after the previous FILLET. `com_backend` wraps
+  `CDispatch.__getattr__` once at import: a lookup that already failed costs
+  one more `GetIDsOfNames`; a busy answer is repeated (0.05 s doubling to
+  1 s) for up to `_LOOKUP_PATIENCE_S` = 10 s, then raised as
+  `RejectedLookupError` (an `AttributeError`, so `hasattr` is unchanged, and a
+  `com_error` carrying the HRESULT, so every rejection handler sees it); a
+  missing member stays the `AttributeError` it was
+  (`tests/test_com_rejected_lookup.py`).
+- **The operator-edit counter never calls into a closed document's namespace
+  (`backends/com_backend.py`).** Measured: AutoCAD 2026 crashed three times
+  (heap corruption 0xC0000374), and a probe that saves a DWG, closes it, opens
+  it again and draws reproduced an access violation in OLEAUT32 in one round.
+  The counter cached its Visual LISP function objects per document id, and a
+  file closed and reopened in one session keeps its name, path and document
+  id, so the reopened document's first job called the closed namespace's
+  evaluator. The cache key is now the document id and the document's window
+  handle (`_doc_window`, new for every open), so a reopened document misses
+  the cache, the stale entry is dropped without being called, and without a
+  readable window nothing is cached. The probe then ran 4 rounds (8 documents
+  opened and closed) with no Application Error
+  (`tests/test_operator_edit_revision.py`).
+- **A call AutoCAD answers "retry later" is retried by COM
+  (`backends/message_filter.py`).** Measured: one `entity_create_line` inside
+  the mech smoke's title block and one `entity_fillet` in
+  `benchmarks/perf_com.py` failed with `RPC_E_CALL_REJECTED` mid-write. A
+  ctypes `IMessageFilter` is registered on the STA thread right after
+  `CoInitialize` (`com_backend._com_init`): while AutoCAD answers
+  `SERVERCALL_RETRYLATER` the same call is retried after 100 ms
+  (`RETRY_PAUSE_MS`) until 15 s have passed (`RETRY_BUDGET_MS`), instead of
+  failing mid-write. `_com_teardown` removes it before `CoUninitialize`; a
+  registration that fails is logged and every call behaves as before
+  (`tests/test_com_message_filter.py`). 2026-11-05, measured by the full
+  suite dying with a native crash: a filter is kept for the life of the
+  process, registered or not (`message_filter._filters`), because COM calls
+  it when it is replaced, at `CoUninitialize`, and when a thread that never
+  unregistered it ends - the STA worker `ComBackend._run` abandons on a
+  timeout - and a freed ctypes callback is a jump into unmapped memory;
+  `tests/test_com_timeout.py` crashed every run before `50a4049`.
+- **A killed accoreconsole's staging folder is removed again
+  (`backends/dwg_read._remove_staging`).** Measured: right after thirteen COM
+  smokes, the accore smoke found the timed-out conversion's staging folder a
+  second later, still held by the killed console. The removal is now repeated
+  for up to 5 s (`_REMOVE_PATIENCE_S`, 0.1 s apart); what is still held is
+  logged and left to the hourly sweep (two tests in
+  `tests/test_dwg_read.py`).
+- **Spikes S4 and S5 are measured on AutoCAD 2026**
+  (`docs/analysis/spikes-1.8.0.json`). S4: `Coordinates` with a different
+  vertex count is written in place (a 4-vertex LWPOLYLINE set to 6 vertices
+  kept its handle, layer and XDATA), so `entity_set_vertices` needs no replace
+  fallback on 2026; a dimension's `*D` block is redrawn by `Update()` after a
+  DIMDEC change and after `entity_scale`, confirmed by the export read-back;
+  `%%c<>` prints a double sign (`Ø∅20`), so `dim_double_prefix` is confirmed
+  and its severity may rise in 1.8.1. UNDO steps per `mech_part_draw`, nested
+  `StartUndoMark` and HATCH loop deletion stay unmeasured, their runtime
+  fallbacks stay, and no claim is made. S5: a DWG reopened on Layout1 and an
+  operator's Layout1 tab both make 1.7.0's `ActiveLayout.Block` rule draw on
+  Layout1 (both reproduce), so 1.8-05's bound target space is kept; a
+  `_SCALE` left at its prompt blocks the seat instead of drawing in paper
+  space (`PROMPT_LIMITATION`), so `command_incomplete` is not reachable
+  through ActiveX on AutoCAD 2026.
+
+### A hidden tool's call, measured (2026-11-05)
+
+The release perf gate (`perf_compare.py --base v1.7.0 --aa --rounds 20`, at
+`19ada05`) failed on `server_create_lines_2k`: 2,000 direct
+`entity_create_line` calls through an in-memory client took 8.5 x their
+v1.7.0 time (68.7 s against 7.5 s), 0.96 x with `DISCOVERY_MODE=off`, and
+`JOURNAL_DURABLE=off` changed nothing (26.1 s standalone against 27.6 s). The
+profile showed six `tools/list` per call. Under the search default every tool
+but the pinned ones is unlisted, and an unlisted tool's call listed the
+catalog on both sides - the low-level MCP server refreshes its definition
+cache on a miss, and `mcp`'s client session lists again for a tool it was not
+shown - while every listing built the three synthetic tools from scratch
+(`Tool.from_function`, a pydantic schema each) and the pinned cards again.
+
+- **The synthetic tools and the pinned cards are built once per transform**
+  (`discovery/transform.py`, "Built once"; off mode's `describe_tool` too). A
+  listing fell from 2.96 ms to 0.49 ms.
+- **A call of a tool the catalog does not list resolves that tool, not the
+  catalog** (`server._install_tool_definition_cache`): a definition-cache
+  miss resolves the one tool by name (`FastMCP.get_tool`) and keeps it, so
+  the schema check runs as it does for a listed tool and nothing is listed; a
+  name no tool has takes the stock path. The attributes are private to `mcp`
+  1.x / fastmcp 3.4 and `tests/test_discovery_perf.py` holds them; not
+  installed means slower, never wrong.
+- **The gate compares one catalog shape** (`benchmarks/perf_compare.py`):
+  every measurement runs with `DISCOVERY_MODE=off` on both sides, because
+  the in-memory client's own listings - one `tools/list` per call of a tool
+  it was not shown, the SDK's rule, not the server's - would measure the
+  client. Standalone on the fixed tree: 6.3 s under the search default (the
+  client's four listings a call, 0.5 ms each), 4.0 s with `off`, against
+  27.6 s before the fix.
+
+### Issues fixed from the tracker (2026-11-05)
+
+Four reports on the tracker were checked against the release tree on
+2026-11-05 - two reproduced on this machine, two confirmed in the code - and
+fixed the same day, each on its own branch with an adversarial review and
+tests that fail on the old code (`tests/test_screenshot_dpi.py`,
+`tests/test_page_setup.py`, `tests/test_batch_plot.py`,
+`tests/test_cad_launch.py`, `tests/test_com_snapshot_reuse.py`), merged at
+`9c30874`. What each one measured live is at the end of its bullet; the seat
+crashed in the middle of that stage (*Live evidence* below).
+
+- **#17 `view_screenshot` / `view_zoom_and_screenshot` captured only the
+  top-left 2/3 of the AutoCAD window at 150 % display scaling.** The server
+  process was DPI-unaware, so `GetWindowRect` answered logical pixels while
+  `PrintWindow` drew physical ones (measured 2026-11-05, AutoCAD 2026,
+  2560x1600 at 144 DPI: 158x26 unaware, 237x39 aware). The live engine now
+  makes the process DPI-aware once (per-monitor v2, else shcore per-monitor,
+  else system-aware; a refusal is logged, never raised), from the STA
+  initializer and before every capture. If awareness cannot be set, it scales
+  the bitmap by `GetDpiForWindow` over the DPI the process sees. The window
+  report now carries `dpi`, `dpi_awareness`, `capture` (the bitmap in physical
+  pixels) and `window_minimized`, and a minimized window is never restored
+  from the server. Live after the fix on this seat: the process reads back
+  per-monitor aware and the capture is 2558x1526, equal to the window's
+  physical rect, with the right-hand ribbon, the title-bar buttons, the status
+  bar and the layout tabs present (the old code gave about 1705x1017 there).
+  The unaware fallback and the minimized flag are covered by unit tests and
+  not yet measured live: AutoCAD crashed four seconds into that probe, after
+  both captures had returned.
+- **#18 `page_setup_apply` can choose the device's full-bleed and expanded
+  media.** `paper` used to accept only the catalogue names (`ISO_A0` to
+  `ISO_A4`, `ANSI_A` to `ANSI_E`), and `canonical_media_name()` always built
+  the plain `ISO_A3_(420.00_x_297.00_MM)`, so a sheet drawn for full-bleed
+  paper kept the device's non-printable margins. `paper` now also takes any
+  canonical media name in AutoCAD's spelling
+  (`ISO_full_bleed_A3_(420.00_x_297.00_MM)`,
+  `ISO_expand_A4_(210.00_x_297.00_MM)`). The name is written unchanged and its
+  numbers are the sheet size. They also fix the orientation: `orientation`
+  now defaults to `None`, which is landscape for a catalogue paper and taken
+  from the name otherwise, and a contradicting value is refused by name. A
+  new `bleed: none | full_bleed | expand` builds `ISO_full_bleed_<size>_(...)`
+  / `ISO_expand_<size>_(...)` from a catalogue paper and is refused beside a
+  canonical name ("paper already names the media"). On AutoCAD 2026
+  (2026-11-05), `DWG To PDF.pc3` and `AutoCAD PDF (High Quality Print).pc3`
+  each listed 112 media, the ISO full-bleed and expand A3 names in both
+  orientations among them. The ANSI names (`ANSI_full_bleed_B_(...)`) follow
+  the same pattern but were not measured. The live engine still checks the
+  name against `GetCanonicalMediaNames()`, and its refusal now also names the
+  device's three closest media. Headlessly the name and size land in the
+  LAYOUT plot settings, the saved DXF carries both, and `batch_plot` reads a
+  420 x 297 mm `/MediaBox` for a full-bleed A3 sheet. Not yet measured on a
+  live seat: the seat was gone when its turn came.
+- **#19 COM: with AutoCAD closed, the first call launched it, sometimes
+  leaving a windowless acad.exe.** New `CAD_LAUNCH` setting: `auto` (default,
+  the 1.7 behaviour: attach, else start the application) or `never` (attach
+  only). Under `never`, a failed `GetActiveObject` is refused with kind
+  `cad_not_running` (category `dependency`, retryable, "Open AutoCAD (or set
+  CAD_LAUNCH=auto to let the server start it) and retry."), its message says
+  so with the `GetActiveObject` failure at the end, and `Dispatch` is never
+  called. This holds on the first tool call and on `system_launch`; an
+  unknown value stops the server at startup by name. Under `auto`,
+  `Visible = True` on the instance `Dispatch` just started is retried every
+  250 ms while it answers `RPC_E_CALL_REJECTED`, `RPC_E_SERVERCALL_RETRYLATER`
+  or the `AttributeError` pywin32 makes of a refused lookup ("Property
+  'AutoCAD.Application.Visible' can not be set.", the message in the report).
+  It gives up after min(30 s, `COM_CALL_TIMEOUT` / 2), and at once on any
+  other error; the server then calls `Quit()` on the instance it started,
+  does not cache it, and the raised error keeps no reference to its proxy.
+  `system_status` reports `cad_launch`, and `system_capabilities.live_application`
+  reports mode `attach_only` under `never`. The windowless outcome was not
+  reproduced: the maintainer's AutoCAD was never closed on purpose. The
+  refusal under `never` was measured live on 2026-11-05 with no AutoCAD
+  running: real `GetActiveObject`, zero `Dispatch` calls, no acad.exe before
+  or after, `cad_not_running` on `document_list`, `system_launch` and
+  `system_get_variable`, `system_status` reporting `cad_launch: never`, and
+  `CAD_LAUNCH=nevr` stopping the server by name. The launch, the `Visible`
+  retry and the `Quit` are covered by fake-COM tests only.
+- **#20 a live `entity_get` on a DIMENSION or HATCH no longer exports the
+  whole drawing on every call.** 1.7.0 and 1.8.0 read those fields through a
+  fresh `Document.Export` per call. On the reporter's 3.5 MB site plan each
+  read cost about as much as `drawing_understand` (120-161 s for four reads
+  issued together); on a two-entity drawing on this seat, about 55 ms of every
+  66-75 ms read was the export. The export is now reused for
+  `COM_SNAPSHOT_TTL` seconds (default 5, counted from when the export
+  returned; 0 exports on every read, as before) while the bound document, its
+  revision and its operator-edit count stand still, no write was queued and
+  no document was rebound. N reads of an unchanged drawing cost one export,
+  and reads issued together wait for that one export. The age is the backstop
+  for what the revision does not count: view changes, `SetVariable`, an edit
+  during a server call, everything without Visual LISP. A handle the live
+  read finds but a reused export lacks is looked up again in a fresh export,
+  never reported unavailable. Inside a write (`dimension_rerender`,
+  `entity_scale`, `dimstyle_modify`) the before and after reads still export
+  afresh. `system_status.snapshot_reuse` reports `{ttl_s, exports, reused}`.
+  Not yet measured live: the seat was gone when its turn came; the figures
+  above are the pre-fix measurements.
+
+### Live evidence
+
+**The matrix.** `python scripts/live/run_all.py` ran every smoke once, each
+in its own child process, on AutoCAD 2026 (`Application.Version` 25.1s, build
+W.60.0.0) on 2026-11-05 from 07:20 to 07:27 UTC, at `da2d7f6` with a clean
+tree (`server.dirty` false): **14 pass, 0 fail, 0 `environment_blocked`, no
+COM disconnection**, no RPC retry recorded by any smoke
+(`benchmarks/results/live/1.8.0/matrix.json`, one result file per smoke
+beside it). The first run of the day was the release run; nothing had to be
+fixed for it.
+
+| Smoke | Checks | Duration |
+|---|---|---|
+| `arch` | 6 / 6 | 57.3 s |
+| `document` | 22 / 22 | 5.3 s |
+| `durability` | 6 / 6 | 4.1 s |
+| `edit` | 10 / 10 | 4.7 s |
+| `lisp` | 9 / 9 | 6.8 s |
+| `mech` | 13 / 13 | 31.9 s |
+| `operator_edits` | 16 / 16 | 8.0 s |
+| `pid` | 14 / 14 | 25.8 s |
+| `render` | 4 / 4 | 4.2 s |
+| `settings` | 54 / 54 | 22.9 s |
+| `space` | 13 / 13 | 96.2 s |
+| `understand` | 7 / 7 | 75.8 s |
+| `verify` | 27 / 27 | 73.1 s |
+| `accore` | 8 / 8 | 4.0 s |
+
+This includes everything 1.8.0 had written and not run: the five new smokes
+(`space`, `edit`, `render`, `lisp`, `durability`), `operator_edits`, the
+`set edits`, `dimension truth` and `dimension auto` stages of the settings
+smoke, the revise stage of the mech smoke (in-place handles kept, a hand-moved
+tagged line refused, `overwrite=True` putting it back) and the `avoid` and
+`project` stages of the pid smoke (the active document plus two DXF sheets).
+The two failures of the 2026-11-04 run are gone: the mech smoke drew its title
+block with no `RPC_E_CALL_REJECTED` (the message filter), and the accore
+smoke's staging folder was empty after the console. Spikes S4 and S5 were
+measured on 2026-11-04 (*Live-seat fixes* above).
+
+**`benchmarks/perf_com.py`** ran against a v1.7.0 worktree on the same seat
+(2026-11-05, 08:41 to 09:16 UTC; the current side at `cc82532`, clean). Its
+targets were fixed before any run, and **three of four are missed**
+(`benchmarks/results/live/perf_com.json`, `status: "failed"`):
+
+| Target | v1.7.0 | 1.8.0 | Met |
+|---|---|---|---|
+| `entity_batch_create(200)` >= 5x 200 single creates | 8,838 ms (200 calls) | 3,047 ms: 2.90x | no |
+| `entity_delete_many(200)` >= 5x 200 single deletes | 3,113 ms (200 calls) | 824 ms: 3.78x | no |
+| single `entity_create_circle` median >= 30 % lower | 41.0 ms | 37.3 ms: 8.9 % lower | no |
+| `entity_fillet` at 10,000 lines <= 1.2x at 5,000 | 17.2 s / (30 of 50 failed) | 0.081 s / 4.46 s: 55x | no |
+
+The fillet row is not stable on this seat: the median job's work inside
+AutoCAD was 64 ms at 5,000 lines in this run and 5,978 ms in a first run of
+`da2d7f6` an hour earlier (no error in either), whose verdicts were 3.28x,
+1.74x, 7.3 % and 1.19x (the fillet target met). That first run's file named
+its v1.7.0 side "1.8.0", the bug `cc82532` fixes, so it was not committed.
+Against v1.7.0, a 1.8.0 fillet is 4x to 200x faster in both runs (v1.7.0 17 s
+to 24 s at 5,000 lines); the N-independence the target names is not shown.
+At 10,000 lines v1.7.0 overran `COM_CALL_TIMEOUT` once and then failed its
+next 30 fillets with `RPC_E_WRONG_THREAD`, and its document could not be
+closed until AutoCAD was idle again (it was closed by hand, unsaved). The
+1.8.0 side made no tool error in either run. ADR 0001's worker spike is
+decided on these numbers, not here.
+
+**After the matrix.** The four tracker fixes above landed after that run,
+at `9c30874`, and touch the live engine (the window capture, the launch
+path, the detail export, the page setup). Their live verification started
+on the same seat: #17's capture was measured, and then AutoCAD 2026 crashed
+at 14:37:06 on 2026-11-05, four seconds into that probe and after both
+captures had returned - exception 0xc0000374 (heap corruption) in
+ntdll.dll, a signature the seat's event log already shows five times on
+2026-11-04, before that branch existed; the cause is unmeasured. The seat
+was not back before the tag, so 1.8.0 ships without them: the probes for #18
+and #20, the attach checks for #19 on a running seat and a matrix run of the
+final tree were **not run**, and the pass rows above are the `da2d7f6` run,
+the tree before the four fixes. Each fix is covered by fake-COM tests; #17's
+main case and #19's refusal with no AutoCAD running are the only parts
+measured live. The rest is 1.8.1's first live job (*Not in 1.8.0*).
+
+**Still not run.** The B40 stage of the mech smoke ran but measured nothing:
+all eight feature tables are empty, so each was skipped. The live `.dwg`
+sheet route of `pid_project` is covered by a fake-COM test only.
+`view_screenshot` showing a new entity after `Update()` (1.8-23) has no
+smoke check. UNDO steps per `mech_part_draw`, nested `StartUndoMark` and
+HATCH loop deletion (spike S4) stay unmeasured.
+
+### Not in 1.8.0
+
+- **No B40 row is transcribed.** The licensed copies of DIN 471/472:2011-04,
+  DIN 509, DIN 332-1:1986-04 and ISO 3601-2:2016 were not at hand, so all
+  eight tables (DIN 471, DIN 472, DIN 509-E, DIN 509-F, DIN 332-A,
+  DIN 332-B, ISO 3601-2, ISO 3601-2-axial) ship empty, refuse every size by
+  name and are deferred to 1.8.1 by name - each waiting on its copy (DIN
+  471/472 Table 1, DIN 509 Table 1 forms E and F, DIN 332-1 Table 1 forms A
+  and B, ISO 3601-2 radial static and axial). Nothing is filled from memory
+  or a secondary catalogue; before the first DIN 509 row ships,
+  `profile_from_dims` is confirmed against the standard's figure. The v9
+  `std_tables_b40` task is `not_run` and the smoke's B40 stage only prints
+  its skip.
+- **The native .NET worker is deferred to 1.9.0, by a rule fixed before any
+  measurement** (`docs/adr/0001-native-worker.md`). 1.9.0 builds it only if
+  it is at least 3× faster than the 1.8-23 COM bulk job on the same 1,000
+  lines, or if atomic rollback cannot be made reliable with UNDO marks.
+  Otherwise it stays deferred: a build and signature per AutoCAD release, the
+  SECURELOAD route (`NETLOAD` is on our own denylist), no CI coverage, and a
+  second language for one maintainer. The one-day spike was not run, and no
+  timing is claimed.
+- **The journal's commit per mutating call stays, and the checkpoint budget
+  scan is per checkpoint.** The `running` row is committed before a mutating
+  call runs (B13): about 50 µs of a 1.7 ms headless create through the
+  server, the one perf-gate row above the 1.05 floor (1.06). An append-only
+  running log - one write per call, the rows written in batches, reconciled
+  at open - keeps what a restart reports and takes that row to about 1.04;
+  it is 1.8.1. `CheckpointStore._evict_budget` scans every lineage folder at
+  every checkpoint: 0.2 ms in a fresh store, 41 ms at 656 lineages (measured
+  on the maintainer's machine); a cached total is 1.8.1 as well.
+- **The tracker fixes' remaining live checks.** #18 (a full-bleed media read
+  back and its PDF `/MediaBox`), #20 (one export for N reads, measured), #19
+  (attach under both `CAD_LAUNCH` values) and #17 (the unaware fallback, the
+  minimized flag) were not run on a seat before the tag, and neither was the
+  matrix on the final tree; they are 1.8.1's first live job.
+- **Server gaps the README sheets found.** `DIMTDEC` is not in
+  `DIM_VARIABLE_WHITELIST`, so a stacked deviation prints at the style's
+  `DIMDEC` (+0.025 as +0.03; the sheets write the fit in the text instead);
+  `gear_draw_section_aa` draws a section's keyway as a 12 mm notch instead of
+  the full-width groove (the gear sheet redraws it); a headless
+  `dimension_linear` has no text location, so a chain text wider than its gap
+  is drawn over the neighbouring extension lines (four on the plan sheet);
+  and the critique does not report two dimensions on one station or a text
+  over a hatch. All 1.8.1.
+- **1.8.1, from the phases:** batch lease, `confirm_large` and batch budgets;
+  `cad_batch` step coalescing; the AutoLISP write tier (`command`, `entmod`,
+  `setvar`, `vla-put-*`); `mech_part_revise`'s spec-reconciliation and
+  keep-the-hand-edit modes (a part with a detail view, or with two views
+  sharing a view tag, is refused by name); `pid_project`'s write side (a
+  project-wide tag sequence and a refusal of a tag another sheet holds,
+  through `project=`); DWG export and AUDIT through accoreconsole (the
+  console runs without `/isolate`, so AutoCAD's own support-path
+  `acaddoc.lsp` still loads - noted for 1.8.1); redrawing a dimension after
+  move / rotate / mirror / copy / array and inside block definitions, and the
+  headless reflex-angle redraw (`dim_render_stale`, `reflex_render`).
+- **1.8.1, from the plan:** the headless creation speed lost against v1.4.0
+  (B10; 1.8.0 only gates against regressing from 1.7.0); the XDATA chunk /
+  case / budget rework (B08); `modified` summaries; a checkpoint per
+  operation and a create-only inverse layer; the `ACADMCP_IDENTITY` XRECORD
+  stamp; `operation_reconcile`; a COM undo group per operation;
+  `history_purge`; `RESULT_VERBOSITY=terse` and dropping `bounding_box` from
+  the default `entity_list` row; a run-time batch hint; highlighting,
+  `cad_batch(render=True)` and a live viewer; semantic tag replay
+  (`if_tag_exists`); inline symbol cutting and symbol move-and-reroute on a
+  P&ID; editing an `arch` element; constraint enforcement; the
+  `plot_readability` and `text_hygiene` focuses; an `autocad_live` bridge and
+  a multi-document `cad_batch`; an `inspect_image` equivalent and a CLI;
+  STRETCH / BREAK / JOIN / OVERKILL / draw order and the ISO 273 hole table; a
+  jump mark where P&ID lines cross (1.8.1 or later).
+- **1.9.0:** IEC 60617 electrical schematics, reusing the P&ID symbol, port
+  and graph machinery; extracting a spec from a document; the .NET worker if
+  ADR 0001's rule fires.
+- **Not planned:** Plant 3D, `run_script`, an HTTP REST `/v1` beside MCP's
+  own HTTP transport, and 3D beyond the opt-in live solids.
+- **Built narrower than planned:** `_command_context` (1.8-23 point 4) is not
+  built, because the 1.8-05 smoke that would justify it never ran; a per-line
+  `route="avoid"` inside `pid_from_spec` is refused (only `sheet.routing`),
+  its dry run reports no `label_hits`, and `pid_line_draw` does not expose
+  the node budget; a lost connection in the middle of a live bulk job loses
+  the per-item rows of the jobs already done.
+
+1.8.0, first phase (W1, "the trust foundation"). 1.7.0 made what the server
+draws provable; W1 makes what it **says** true. A lineweight of -3 is called
+*Default* - never ByLayer - and the critique sees an entity that overrides its
+layer. Every error on every route is one typed envelope that says what to do
+next, with the 1.7 sentence unchanged beside it. The operation journal
+survives the process; a headless save is atomic; a reopened drawing continues
+its revision; a damaged DXF can be recovered on request. On a live seat the
+server draws where it means to, and a raw command reports what it did. A
+polyline is edited in place, and mechanical dimensions carry feature tags. A
+region screenshot really shows the region. No tool is added or removed in W1
+(`system_about` is the authority for the count). The correctness suite has
+67 checks: 61/67 on v1.7.0, 0 regressions. Spec:
+`docs/superpowers/specs/2026-11-03-v1.8.0-design.md`; plan:
+`docs/superpowers/plans/2026-11-03-v1.8.0-w1-implementation.md`. Spike
+evidence is in `docs/analysis/spikes-1.8.0.json`, rows S1-S3, all headless:
+- **S1**: with `DISCOVERY_MODE=search`, hidden tools stay directly callable
+  by name. Search plus three pinned tools measured 2,730 tokens against the
+  plan's 1,500 ceiling, so 1.8-11 re-sets that ceiling.
+- **S2**: sqlite WAL with `synchronous=NORMAL` survived 14 process kills
+  with no lost or partial commit, at about 12 µs per commit.
+- **S3**: the HTTP guard for 1.8-17 wraps `mcp.http_app` beside the
+  existing `run_async` wrap.
+
+### Added
+
+- **One typed error envelope (1.8-02).** Every exception a tool call ends in
+  is returned as `ToolResult(is_error=True)`. Its structured content is
+  `{ok: false, kind, category, retryable, hint, tool, backend, operation_id,
+  message, ...the kind's own fields}`. The text content is byte-for-byte what
+  a 1.7 client read: the refusal sentence for the 1.7 refusal kinds,
+  FastMCP's `Internal error: ...` line for the rest.
+  `engineering/errors.py` holds the shared parts:
+  - the closed `ERROR_KINDS`: the 17 1.7 batch kinds, then `not_found`,
+    `unknown_handle`, `path_refused`, `policy_refused`, `file_not_found`,
+    `application_busy`, `command_incomplete`, `internal`,
+    `requires_reconcile`, the gate kinds `validation_failed`,
+    `critique_gate_failed` and `failed_acceptance`, the 1.8-04 open / save
+    kinds `damaged_drawing`, `recover_unsupported`,
+    `recovered_source_protected`, `save_locked`, `save_verify_failed` and
+    `save_failed`, and the journal's `process_exit`. Every kind a tool can
+    put on the wire is declared, with its category, retry default and hint;
+  - eight categories (`input`, `spec`, `geometry`, `file`, `policy`,
+    `validation`, `dependency`, `internal`);
+  - one hint per kind;
+  - `classify(exc)`, which types by exception class along the cause chain
+    and never by message text.
+
+  The refusal middleware and `cad_batch` both call `classify(exc)`, so a
+  direct call and a batch step give one kind, category and `retryable`
+  (`tests/test_error_envelope.py` provokes each kind both ways, the 1.8-04
+  kinds included). A damaged, DWG or recovered source and a locked target
+  are recorded `refused` (nothing was opened or written; `save_locked` is
+  the one retryable save kind), `save_verify_failed` / `save_failed` are
+  `failed`, and the envelope's message for those kinds is the typed
+  sentence that names `recover=True` or `overwrite_source=True`, not the
+  parser's or the OS's text. The journal's own refusals -
+  `operation_conflict`, `requires_reconcile` and a malformed client id
+  (`invalid_args`) - carry the same envelope with the 1.7 text content
+  byte for byte, and a bad `detail` on `drawing_finalize` /
+  `drawing_deliver` is `invalid_args` (`InvalidArgsError`), not
+  `refused`. `retryable` is true only when
+  the kind allows a retry **and** the operation record is `refused` or
+  `cancelled`, which means nothing was written. `internal` is kept for the
+  builtin bug types (`AttributeError`, `NameError`, `UnboundLocalError`,
+  `AssertionError`, `RecursionError`). A caller's `TypeError`, `KeyError`,
+  `IndexError` or `ZeroDivisionError` stays `failed`, as in 1.7. Typed
+  exceptions at the sources: `EntityNotFoundError` (headless
+  `_get_entity`, live `_handle_to_object`), `PathRefusedError`,
+  `CommandRefusedError` (`verbs`, `symbols`, `alternatives`),
+  `ApplicationBusyError` (`RPC_E_CALL_REJECTED` before the job touched the
+  document; no revision moves), `CommandIncompleteError` and
+  `GateFailure`.
+- **The finalize gate returns what it computed.** A failed
+  `drawing_finalize` carries `score`, `blocking` (`[{code, severity,
+  handles, message}]`), `blocking_count` and `qa_coverage`. By default
+  `blocking` holds the first 10 rows with up to 5 handles each (a longer
+  list adds `handle_count`). `detail="full"` returns every row, every
+  handle and the whole report. `drawing_deliver` adds the same payload as
+  `gate_failure` to a `failed_validation` / `failed_acceptance` result. No
+  second QA read is needed to see why a gate failed.
+- **Refused commands name the typed tools (1.8-02).** A
+  `system_run_command` or `system_run_lisp` refusal is `policy_refused`. It
+  carries `verbs` (and `symbols` for LISP) and `alternatives`
+  (`[{tool, summary}]`, from `discovery.aliases.tools_for_command`).
+  `alternatives` lists only tools the active profile, packs and `ENABLE_3D`
+  leave callable, never an escape hatch. A permitted command that a typed
+  tool also performs carries `typed_alternative` in the same shape.
+- **A durable operation journal (B13, 1.8-03).** `DurableJournal`
+  (`backends/journal_store.py`) keeps the in-memory journal's API and writes
+  every record through to `<ACADMCP_STATE_DIR>/journal.sqlite3` (sqlite WAL,
+  `synchronous=NORMAL`, `busy_timeout=5000`). The default folder is
+  `%LOCALAPPDATA%\autocad-mcp-pro\state`; off Windows it is
+  `$XDG_STATE_HOME/autocad-mcp-pro`.
+  - **Replay across restarts:** a client id replays its recorded result
+    after a restart. An answer over `JOURNAL_RESULT_MAX_KB`, and every
+    answer under `JOURNAL_ARGS=digest` / `off`, keeps only its sha256 and
+    replays as `result_truncated: true` with `revision_after`.
+  - **A dead owner's rows:** at open, a `running` row whose owner (pid plus
+    process start time) is dead becomes `unknown_commit` with
+    `error_kind: "process_exit"`; a read-only tool's row becomes
+    `cancelled` instead. A retry under that id is `requires_reconcile`. The
+    rows of a live second server sharing the file are never touched.
+  - **One commit per call:** a mutating call pays one commit, its `running`
+    row committed before the call runs. Its final state, and a read's row,
+    are flushed in the background 0.1 s later, while a client id's final
+    state is committed before the call returns. Measured inside the server:
+    about 125 µs over the in-memory journal per call.
+  - **Refused folders:** a folder inside a repository checkout (this
+    server's tree or any folder with a `.git` above it) or a folder holding
+    drawings is refused at startup.
+  - **Degraded mode:** a refused folder, a bad setting, an unusable file or
+    a lock held past the timeout leaves the journal in memory. It is
+    reported in `system_status.state_store` (`mode`, `path`, `bytes`,
+    `documents`, `operations`, `checkpoints`, `write_failures`, `degraded`),
+    and no tool call ever fails because of its journal.
+- **Atomic saves, lineage and recovery (1.8-04, B09).**
+  - **Atomic writes:** every headless DXF write goes through
+    `backends/atomic_write.py`. That covers `drawing_save`,
+    `drawing_save_as`, `drawing_export_dxf`, `document_close(save=True)`,
+    and through them the finalize / deliver writes and
+    `drawing_template_save`. The protocol: a pending marker under
+    `<STATE_DIR>/pending`, `<target>.acadmcp-<pid>.tmp` beside the target,
+    flush and fsync, a check (HEADER first, `EOF` last, `$ACADVER`,
+    `$HANDSEED` and the ENTITIES count), the marker completed with the
+    expected sha256, `SAVE_BACKUP=1` → `<name>.bak`, then `os.replace`. The
+    replace is retried 3 × 50 ms on a sharing violation, after which it is
+    `save_locked`.
+  - **Interrupted saves:** a save a dead process left half done is resolved
+    at startup and by a `drawing_open` of the same path, reported as
+    `save_recovery` (`completed`, `finished`, `rolled_back`, `orphan_tmp`).
+  - **Lineage:** kept in the state folder, never in the DXF. Reopening an
+    unchanged file continues its `document_id` and `revision`. A file
+    changed outside the server reports `external_change: true` and moves
+    the revision by one, with an `external_edit` journal row. The same
+    lineage opened under a second path forks (`lineage_parent`), and a
+    revision already issued is never issued again.
+  - **Recovery:** `drawing_open(path, recover=True)` reads a damaged DXF
+    through `ezdxf.recover` and reports
+    `recovered: {fixes, errors, messages[:20], entities_read}`, with a
+    warning when nothing was read back. The recovered drawing starts a new
+    lineage with `recovered_from`. Its source is protected:
+    `recovered_source_protected` refuses a save onto it unless
+    `drawing_save(overwrite_source=True)`. A DWG is `recover_unsupported`.
+    Live, the repair goes into a private temporary DXF that
+    `Documents.Open` then opens.
+  - **Cost:** measured with the marker files fsynced, the protocol cost
+    about 35 ms on a 2,000-entity save, about 10 ms of it those two fsyncs.
+    The marker files are therefore written without fsync; the DXF tmp
+    still is fsynced, and a power loss resolves it as an orphan.
+- **The `property_override` critique focus (1.8-01).** One issue per layer
+  and code - `lineweight_not_bylayer`, `color_not_bylayer`,
+  `linetype_not_bylayer` - with the count, a value histogram and up to 50
+  handles. An explicit lineweight outside ISO 128 is an `error`; -2, -3 or
+  an ISO value is a `warning`.
+  - **Scope:** the engineering layers plus the layer set applied to the
+    drawing. Title-block and construction layers are exempt, and so is every
+    member of a block definition, layer 0 included. Any other layer is
+    `info` with `in_scope: false`.
+  - **Where it runs:** under `focus=None` and inside `drawing_finalize`,
+    reading the run's all-spaces snapshot.
+  - **Repair:** `drawing_refine` re-reads the layer and sets ByLayer.
+- **In-place vertex and label edits (1.8-06).**
+  - `entity_edit_geometry` takes `points` and `bulges` for an LWPOLYLINE
+    (the vertex count may change), and `x` / `y` for TEXT and MTEXT.
+    `entity_edit_text` takes `x` / `y`, and `entity_create_polyline` takes
+    `bulges`.
+  - An argument the entity's type does not take is refused by name. A
+    tilted plane is refused `ocs_tilted_plane`.
+  - Behind these is the new contract member `entity_set_vertices` on both
+    engines; it is not a tool. Headless it runs through `backends/ocs.py`.
+    Live it writes `Coordinates`, `SetBulge` and `Closed` in place and is
+    registered in `_MUTATING_METHODS` (98 → 99). When the seat refuses or
+    ignores a changed vertex count, the polyline is recreated with its
+    layer, colour, linetype, ltscale, lineweight and XDATA. The result then
+    reports `replaced: [{old, new}]`.
+- **Tagged mechanical dimensions (1.8-06).** `xdata=` reaches
+  `dimension_linear`, `dimension_aligned`, `dimension_radius`,
+  `dimension_diameter` and `entity_create_table`, written in the same create
+  job. `mech_dimension_part` tags each DIMENSION in `ACADMCP_MECH` XDATA
+  (`{kind: "feature", part, feature, view, role: "dim"}`) on the dimension
+  object itself, not on its anonymous block. The hole table is tagged
+  `role: "hole_table"`, and `draw_prims` writes an ordinal `i` on every
+  primitive.
+- **Region screenshots (1.8-07).** `view_screenshot(region=[x0, y0, x1, y1],
+  max_px=1568)` and `view_zoom_and_screenshot(..., max_px=)` draw the window
+  they are given on both engines. Beside the image they report `applied`,
+  `framing`, `source`, `px` (read from the PNG's IHDR), `region` (the window
+  drawn, widened by under a pixel so x and y share one scale),
+  `requested_region` and `px_per_unit`.
+  - **Headless:** the current space is drawn through
+    `backends/region_render.py`.
+  - **Live:** a region is the bound document's `Document.Export` snapshot
+    drawn by the same renderer (`source: "export_snapshot"`). With no
+    region, the result is the window capture (`source: "window"`), with
+    `region` and `px_per_unit` null.
+  - **Refused by name:** a zero-area region, a `max_px` outside 64-4096,
+    and a partial `view_zoom_and_screenshot` window.
+- **Lineweight names (1.8-01).** One parser (`backends.base.parse_lineweight`)
+  for every lineweight input. It takes an integer (hundredths of a mm),
+  a millimetre float, a numeric string, or `"ByLayer"` / `"ByBlock"` /
+  `"Default"` in any case. It serves `entity_set_properties`,
+  `layer_create`, `layer_modify`, and every row of `entity_batch_create` /
+  `entity_batch_modify`. Entity rows (`entity_get`, `entity_list`) carry
+  `lineweight_name`. The QA snapshot's entity records gain `lineweight`,
+  `color`, `linetype` and `transparency`, and its layers gain `lineweight`,
+  `plot`, `on` and `frozen`, on both engines.
+- **Six W1 correctness checks.** `benchmarks/correctness_suite.py` gains
+  `lineweight_truth` (Entities), `error_envelope_routes_agree`
+  (Reliability), `journal_replay_after_kill`,
+  `atomic_save_untouched_on_failure`, `lineage_revision_continues`
+  (Durability) and `region_render_applied` (Render): 61 → 67 checks. Each
+  imports its 1.8.0 modules inside the check, so the suite still runs
+  against the v1.7.0 tree; the journal check runs the tree's own
+  `server.py` over stdio twice on a private `ACADMCP_STATE_DIR` and kills
+  the first with `Popen.kill()`. Against v1.7.0 the six are old fail /
+  miss and new pass: 61/67 on v1.7.0, 67/67 here, 0 regressions.
+  `tests/test_benchmark_w1_checks.py` also holds that a write straight
+  into the target (1.7.0's save) fails the atomic check.
+- **Environment variables:**
+  - `ACADMCP_STATE_DIR`, the default folder above.
+  - `JOURNAL_DURABLE` (`on`).
+  - `JOURNAL_ARGS` (`bounded` - canonical JSON up to 4,096 bytes; `digest`
+    - sha256 only; `off`).
+  - `JOURNAL_SYNC` (`normal`; `full` covers an OS crash at about 30 × the
+    cost per commit).
+  - `JOURNAL_RETAIN_DAYS` (30).
+  - `JOURNAL_RESULT_MAX_KB` (64).
+  - `CHECKPOINT_KEEP` (20), `CHECKPOINT_BUDGET_MB` (512) and
+    `CHECKPOINT_MAX_DOC_MB` (32). These are read and reported for 1.8-08's
+    checkpoints.
+  - `SAVE_BACKUP` (off).
+  - `COMMAND_DEADLINE_S` (8).
+
+### Changed
+
+- **Error kinds, renamed where 1.7 had only a generic one.** These names
+  appear in `cad_batch` step rows, in the envelope and in the journal's
+  `error_kind`:
+  - a handle that names no entity is `not_found` (was `failed`);
+  - a path refusal is `path_refused` (was `refused`);
+  - a refused command or LISP expression is `policy_refused` on both routes
+    (the direct call was `refused`, a batch step `denied`; `denied` stays
+    for a permitted string, because `cad_batch` never runs the escape
+    hatches);
+  - a missing file is `file_not_found` (was `failed`).
+- **A missing handle on a live seat reads like the headless one:**
+  `Entity with handle '…' not found.` instead of a raw COM error. A
+  caller's handle is resolved through `_handle_to_object` (or a local
+  `try` that raises `EntityNotFoundError`), which leaves connection-level
+  HRESULTs untouched. Not yet everywhere: `entity_trim`, `entity_extend`,
+  `entity_fillet` and `entity_chamfer` still read the caller's handle back
+  with a bare `HandleToObject` after the command has run.
+- **A retryable refusal is not replayed by its operation id.** Its record
+  is kept, but not its answer, so the same request under the same client
+  id runs again. A `not_found` or any other non-retryable error still
+  replays.
+- **Revisions survive a reopen.** `drawing_open` of a file this server saved
+  continues its `document_id` and `revision`; the refusal of a file that
+  does not parse is `damaged_drawing` and names `recover=True`.
+- **COM: the server's target space (1.8-05).**
+  - **Model space by default.** The bound document carries a target space:
+    model space until `layout_set_current` names a sheet.
+    `drawing_new`, `drawing_open` and `document_activate` reset it,
+    `layout_rename` follows it and `layout_delete` falls back from it.
+  - **Never the operator's tab.** `_msp()` returns the target, never the
+    tab the operator has active. A create on a sheet reports its `space`
+    on both engines.
+  - **Corner operations** pick with the `*x,y` WCS override, with the
+    target's tab active, and restore the operator's tab afterwards.
+- **`system_run_command` reports what the command did (1.8-05).** The call
+  waits until the command finishes: it polls CMDACTIVE up to
+  `COMMAND_DEADLINE_S` (default 8 s). It returns `{completed: true,
+  created: [{handle, type, space}]` (the first 50), `created_count`,
+  `last_prompt`, `target_space}`. A new entity outside the target space
+  adds `warning: "created_outside_target_space"`. A command still at a
+  prompt has AutoCAD's own `LASTPROMPT` read, is cancelled with ESC × 3,
+  and fails with kind `command_incomplete` (`{command, last_prompt}`).
+  `drawing_undo`, `drawing_redo` and `transaction_begin`'s `_.UNDO _M` go
+  through the same deadline-guarded send.
+- **`drawing_undo` / `drawing_redo` report `verified`.** A headless
+  snapshot restore is always `true`. Live, `verified` is true when the
+  entity total over every layout or the document's edit counter moved,
+  with `evidence` holding both.
+- **The view tools return the image and a JSON report.**
+  `view_screenshot` and `view_zoom_and_screenshot` answer with two content
+  blocks, the PNG and the report as JSON text. The report is also the
+  structured content.
+- **Lineweight descriptions.** No registered schema maps -3 to ByLayer any
+  more (`tests/test_lineweight_truth.py` sweeps every tool). A layer's
+  lineweight refuses ByLayer and ByBlock, by number or by name, before
+  anything is written.
+- **The headless hatch is created ByLayer.** ezdxf's `add_hatch` /
+  `set_pattern_fill` wrote an explicit ACI 7, which ActiveX `AddHatch`
+  does not; the new focus flagged it on `mech_assembly` and
+  `arch_roundtrip`.
+
+### Fixed
+
+- **-3 was described as ByLayer** in `entity_set_properties` and
+  `layer_create`. DXF has -1 ByLayer, -2 ByBlock and -3 Default
+  (LWDEFAULT), so an entity left at -3 was reported as following its layer,
+  and `drawing_critique(focus=None)` could not see it (rival claim 4.5).
+- **A region was silently ignored headlessly.** `view_zoom_and_screenshot`
+  with a window rendered the whole model space and still answered as if it
+  had zoomed.
+- **A killed headless save could truncate the drawing.** `doc.saveas`
+  wrote straight into the target; the atomic protocol above leaves the
+  previous file in place.
+- **Live, a create could land on a paper layout** when the operator (or a
+  DWG saved with a layout active) left a sheet tab current. Nothing is
+  drawn outside the target space any more (rival claim 4.6; which of the
+  three candidate mechanisms reproduces it on 1.7.0 is spike S5, pending).
+- **`system_run_command` returned before the command finished**
+  (`{ok, command}` straight after `SendCommand`). A command left at a
+  prompt then deadlocked the next COM call.
+- **In `DISCOVERY_MODE=search` an error through `call_tool` was wrapped
+  twice** (`Error calling tool 'call_tool': ...` around the real refusal).
+  It now carries the same text and envelope as the direct call, naming the
+  inner tool.
+
+### Migration notes
+
+- **Lineweights:** a lineweight input accepts `"ByLayer"`, `"ByBlock"` and
+  `"Default"`. -3 means Default. `layer_create` / `layer_modify` refuse
+  -1 / -2. The new `property_override` focus runs inside
+  `drawing_finalize`, so a drawing with an explicit non-ISO-128 lineweight
+  on an engineering layer now fails the gate. `drawing_refine` repairs it.
+- **Error kinds:** a client that branched on `failed` / `refused` /
+  `denied` for a missing handle, a path, a command or a missing file reads
+  the new kinds above. The text content is unchanged. `kind`, `category`,
+  `retryable` and `hint` are in the structured content.
+- **Journal folder:** the journal is durable by default and writes to
+  `ACADMCP_STATE_DIR`. Point it at a private folder, or set
+  `JOURNAL_DURABLE=off` for the 1.7 in-memory journal. A folder inside a
+  checkout or beside drawings runs the server in memory, with
+  `state_store.degraded`. Test suites should give each run its own folder
+  (this repository's `tests/conftest.py` does).
+- **Revisions:** a reopen no longer resets `document_id` / `revision`, so
+  an `expected_revision` taken by an earlier process is meaningful.
+- **Recovered drawings:** a drawing opened with `recover=True` will not
+  save over its source without `drawing_save(overwrite_source=True)`.
+- **COM sheets:** on a live seat, drawing on a sheet takes
+  `layout_set_current`. Clicking a layout tab no longer moves where the
+  server draws.
+- **COM commands and undo:** `system_run_command` and live undo / redo
+  wait up to `COMMAND_DEADLINE_S` and can fail `command_incomplete`. A
+  caller that read only `ok` should read `completed`.
+- **Screenshots:** a client that took `content[0]` as the whole answer
+  still gets the image there. The report is `content[1]` and the
+  structured content.
+
+**W1 gate (2026-11-03, `41588a8`).** The full suite green at 6,348
+collected tests with the document numbers retaken; ruff, the inventory, the
+plugin validation and `scripts/check_doc_numbers.py` green;
+`compare_versions.py v1.7.0 --fail-on-regression` 67 / 67 against v1.7.0's
+61 / 67, six fixed, zero regressed; `perf_compare.py --base v1.7.0 --aa
+--rounds 20` `ok: true` with ratios `create_lines_2k` 1.08, `roundtrip_10k`
+1.08, `region_query_10k` 0.98, `premium_pass` 1.00 and
+`server_create_lines_2k` 1.11 (the durable journal, about 200 µs per call on
+this run). The A/A spread was 12.3 % on that machine, so the bound was 1.25:
+the server workload is the number to re-measure on an idle machine, and the
+one 1.8-10's change summary must not push further.
+
+**Live evidence pending.** AutoCAD 2026 was not running on 2026-11-03, so
+`scripts/smoke_space_com.py`, `scripts/smoke_edit_com.py` and
+`scripts/smoke_render_com.py` are written but not yet run. The S4 row
+(`Coordinates` with a changed vertex count, undo steps, nested undo marks,
+`*D` regen, `%%c<>`, hatch-loop deletion) and the S5 row (which mechanism
+puts the rival's circle in paper space on 1.7.0) are not yet run either:
+`spikes-1.8.0.json` records both as `pending`. Every COM path above is
+covered by fake-COM tests only.
+
+1.8.0, second phase (W2, "call economy, QA truth, security"): all eleven
+items, 1.8-08 to 1.8-18. The first documentation pass described 1.8-14,
+1.8-16, 1.8-15, 1.8-17, 1.8-18, 1.8-12 and 1.8-13; the second adds 1.8-08
+(durable checkpoints), 1.8-09 (the atomic `cad_batch` default), 1.8-10
+(`drawing_history`) and 1.8-11 (the search default and the instruction
+builder). A layer clean-up and a part's dimensions are now one or two calls
+instead of hundreds. Undo survives a restart, a batch that writes is all or
+nothing by default, and the value a drawing had in round 2 is two calls away
+after a restart. A client sees six tools by default and can still call all of
+them. A QA lane that did not run is named, never read as clean. A dimension is
+judged by the text the sheet really shows. A server can be narrowed to reads,
+a writer cannot leave an AutoCAD autoload file, and the HTTP transport checks
+Origin, Host and body size. `system_run_lisp` runs the AutoLISP read tier.
+Seven tools are added (`entity_modify_where`, `layer_rename`, `layer_merge`,
+`checkpoint_create`, `checkpoint_list`, `checkpoint_restore`,
+`drawing_history`) and one resource (`autocad://critique/focuses`);
+`system_about` is the authority for the counts. W2 leaves the correctness
+suite at 79 checks (W3 adds four more); the published A/B report is still the
+W1 run over 67 and is regenerated by the numbers pass.
+
+### W2: Added
+
+- **Set-based edits (1.8-12, core pack).** Three new tools; a layer
+  clean-up is one `cad_batch`, not one call per entity.
+  - `entity_modify_where(where, set, space="model", dry_run=False,
+    expect_count=None)` is AutoCAD's QSELECT + CHPROP. `where` filters by
+    `layer` (a name or a list; `*` and `?` are the only wildcards,
+    case-insensitive), `type`, `color`, `linetype`, `lineweight`, `region`
+    `[x0, y0, x1, y1]` and `block`. `set` writes `layer` (created when
+    missing), `color`, `linetype`, `lineweight` (the 1.8-01 parser) and
+    `visible`. `space` is `model`, `paper` (every paper layout) or `all`;
+    block definitions are never searched. The dry run reports `count`,
+    `would_change`, the first 20 `handles`, `truncated`, `skipped_locked` and
+    a `preview` (the revision, plus the region fingerprint when `where` has a
+    region) that `cad_batch(expected_revision=, preconditions=)` accepts. An
+    `expect_count` the drawing no longer matches is refused `stale_revision`
+    with nothing changed. Entities on a locked layer are skipped and reported
+    in `skipped_locked`, never counted as matched; `changed` counts only
+    entities whose value really moved. An empty `where` or `set` is
+    `invalid_args` (select everything with `{type: "*"}`).
+  - `layer_rename(old, new)` renames the table entry and every reference:
+    headless, every layout, block definition, attribute, viewport freeze list
+    and the current layer (`entities`, `by_space`, `blocks_touched`); live,
+    `AcadLayer.Name` (`entities: null`, because AutoCAD references a layer by
+    object id). Refused by name before anything changes: `0`, `DEFPOINTS`, an
+    xref-dependent layer, a missing `old`, an existing `new`, a case-only
+    change and a DXF-illegal name.
+  - `layer_merge(sources, target, delete_sources=True)` is LAYMRG: the
+    sources' entities in model space, every paper layout and every block
+    definition move to `target`, then the sources are deleted. It names the
+    touched block definitions (`blocks_touched`, with a `note`), because an
+    edited definition changes every INSERT of that block. The current layer
+    moves to the target when it was a source, and a source's viewport freezes
+    are dropped. Live, a locked source or target is unlocked for the move and
+    the target relocked; a source AutoCAD will not delete is listed in
+    `layers_not_deleted`. Refused by name: a missing source or target
+    (`layer_create` it first), `0` / `DEFPOINTS` / an xref-dependent source,
+    the target among the sources, a duplicate source.
+  - All three carry `changes: {added, deleted, counts, complete}` on both
+    engines. Costs: `entity_modify_where` and `layer_merge` `destructive`,
+    `layer_rename` `mutate`. The alias corpus gains LAYMRG; RENAME
+    (`layout_rename` + `layer_rename`) and CHPROP (`entity_set_properties` +
+    `entity_modify_where`) become shared commands. Live, the selection is one
+    `ssget "X"`-style SelectionSet filter (group codes 0 / 8 / 2 / 410, 62
+    only for ACI 1-255) inside one STA job through `_acad_doc()`; ByLayer and
+    ByBlock colour, linetype, lineweight and region are checked per entity.
+- **`dimension_auto` v2: a part in one call (1.8-13).** No new tool and no
+  new capability: `dimension_auto(handles=None, selector=None, style="chain",
+  offset=10.0, layer=None, include=None, group_equal=False,
+  skip_existing=True, dry_run=False)`. Exactly one of `handles` /
+  `selector` (an `entity_select_smart` predicate, e.g. `{"layer":
+  "GEOMETRY"}`). A selection of LINEs alone is planned exactly as in 1.7;
+  otherwise LWPOLYLINE straight edges are chained per side (an oblique edge
+  aligned), CIRCLEs get diameters and ARCs radii with the text outside the
+  part box, and the overall width and height are drawn unless an edge
+  already measures them (listed under `redundant`). `include` takes
+  `linear`, `diameter`, `radius`, `overall` (default: all); `group_equal`
+  draws one `n× <>` diameter for equal circles; `skip_existing` binds the
+  existing DIMENSIONs through `bind_dimension` and skips a feature already
+  dimensioned, so a rerun draws nothing; `dry_run` returns the plan. Every
+  entity not dimensioned (ELLIPSE, SPLINE, a bulged segment, anything
+  `include` leaves out) is in `omitted: [{handle, type, reason}]`, never
+  dropped, and the `dim_overlap` self-check over what was drawn is reported.
+  A source carrying a 1.8-06 feature tag gives its dimension a `role: "dim"`
+  feature record. Refused by name (`invalid_args`): neither or both of
+  `handles` / `selector`, an unknown or empty selector, an unknown or empty
+  `include`.
+- **QA coverage ledger (1.8-16).** Every critique check writes
+  `checked(focus, layout, n)` or `not_checked(focus, layout, reason)`
+  (`engineering/qa_coverage.py`). The reasons are a closed vocabulary:
+  `domain_absent`, `engine_live_document_template`, `no_viewport_scale`,
+  `viewport_scale_deferred`, `font_unresolved` (declared, no emitter until
+  1.8.1), `scan_incomplete`, `check_failed`, `check_unreported` (a check that
+  wrote no row - a server bug, reported). `drawing_critique(report=True)`
+  returns `{issues, coverage: {layouts, complete}}`. `drawing_finalize`,
+  `drawing_deliver`, their gate failure and the delivery manifest carry
+  `qa_coverage: {complete, records, spaces, reason, not_checked: [{focus,
+  layout, reason, lane}], domain_absent}`. On a paper layout (headless):
+  nothing but its own viewport is checked; a model viewport onto lettered
+  model space is `viewport_scale_deferred` (text at plot scale is 1.8.1); a
+  layout with content and no model viewport is `no_viewport_scale`.
+- **Compact QA answers (1.8-16).** `drawing_critique`, `validation_check`
+  and `drawing_topology_check` take `summary` and `limit` and then return
+  `{total, by_focus, by_severity, issues[:limit]}` (`summary=True`: compact
+  rows, messages cut to 160 characters, 5 handles plus `handle_count`, 5
+  rows unless `limit` says otherwise). `total` and the counts always cover
+  every issue; there is no cursor. Without these arguments each tool answers
+  as in 1.7. `drawing_topology_check(summary=True)` flattens its findings
+  with the `topo_*` severities (near miss error, dangling warning, crossing
+  info).
+- **The `autocad://critique/focuses` resource (1.8-16).** One row per focus
+  in `ALL_CRITIQUE_FOCUSES` order (`{focus, domain, reports, silent?}`), the
+  `not_checked` reasons and which of them strict mode exempts.
+  `drawing_critique`'s `focus` description no longer carries the
+  ~1,000-character enum (now 195 characters); an unknown focus is still a
+  warning issue.
+- **Dimension truth (1.8-15).**
+  - `engineering/dimtext.py` formats a dimension's displayed text the way
+    the drawing does: DIMDEC, DIMRND, DIMZIN, DIMDSEP, DIMPOST, DIMLFAC, the
+    automatic Ø / R prefix, and DIMADEC / DIMAZIN / DIMAUNIT for angles
+    (DIMLFAC never scales an angle). `bind_dimension` uses it and reports
+    `display_rounding`: on a DIMDEC 0 sheet a 19.6 mm dimension shows "20"
+    with `display_rounding` 0.4, and a shown value within half its last
+    unit of the geometry is not a finding.
+  - The QA snapshot's DIMENSION records carry `rendered_text` (the plain
+    text of the `*D` block), `group42` and the style variables, on both
+    engines (live through the same `Document.Export` reader).
+  - The new critique focus **`dimension_truth`** binds every DIMENSION in
+    every space to its geometry and reports, one issue per dimension and
+    code: `dim_override_disagrees` (an override marked NTS is info),
+    `dim_dimlfac_scaled`, `dim_render_stale` (the `*D` block shows another
+    text than the style formats), `dim_group42_stale`, `dim_double_prefix`
+    (a warning until the live ØØ check), `dim_value_hidden` (an empty or
+    digitless override, DIMTXT 0, 90 % or more transparency, the text in
+    its own fill colour, a layer off, frozen or not plotted) and
+    `dim_unbound` (info: not checked, never a pass). It runs under
+    `focus=None` and inside `drawing_finalize`. Only `dim_render_stale` and
+    `dim_group42_stale` are repairable: `drawing_refine` redraws them
+    through the new backend contract method `dimension_rerender(handles,
+    force)` (not a tool); every other code is `manual_required`.
+  - `entity_edit_geometry` edits a linear or aligned DIMENSION's measured
+    points (`x1` / `y1` / `x2` / `y2`) and redraws it; any other dimension
+    type or argument is refused by name. `entity_scale` redraws a
+    DIMENSION's number and group 42 (the other transforms follow in 1.8.1).
+    Old `*D` blocks are purged; a text its author placed keeps its position
+    (`text_kept`) unless `dimstyle_modify(force=True)`.
+- **Tool policy (1.8-17).** `READ_ONLY=true` runs only `read` tools and
+  writes no file. `TOOL_ALLOWLIST` / `TOOL_DENYLIST` take comma-separated
+  names or globs; an entry naming no tool is warned about at startup and
+  listed under `system_about.policy.unmatched`. `MAX_TOOL_COST=read|safe|
+  mutate|destructive|escape` caps the `@cad_tool` cost a call may carry. A
+  refused tool is not advertised, and a call to it - directly, through the
+  search proxy's `call_tool`, or as any `cad_batch` step - is refused before
+  anything runs with kind `policy_refused` `{policy, tool, allowed_cost,
+  cost}`. `cad_batch` is judged per step: one refused step refuses the whole
+  batch, `cad_batch refused all N steps - nothing was executed`. A tool
+  hidden by the profile is still refused by name, never "unknown tool". The
+  defaults are 1.7's: every tool runs. `system_status` and `system_about`
+  report `policy` (`read_only`, `max_tool_cost`, `ceiling`, `allowlist`,
+  `denylist`; `system_about` adds `unmatched` and an `http` block).
+- **Write-path policy (1.8-17).** `security.validate_path(path, *,
+  allow_write=False, kinds=None)`: every writer passes its extensions -
+  `drawing_save` / `drawing_save_as` / `drawing_finalize(save_path)`
+  `.dxf/.dwg/.dwt`; `drawing_export_dxf` `.dxf`; `drawing_export_pdf` and
+  each `batch_plot` file `.pdf`; `drawing_export_dwg` `.dwg`;
+  `drawing_template_save` `.dxf/.dwt`; `data_extract`, `pipe_takeoff`,
+  `cable_takeoff` `.csv/.xlsx`; the P&ID lists' `csv_path` `.csv`;
+  `drawing_finalize(screenshot_path)` `.png/.jpg`;
+  `drawing_verify_requirements(report_path)` `.json/.md`; `drawing_deliver`
+  and `batch_plot` take a directory. A file write is `mutate`-class whatever
+  its tool's label, so under a ceiling below `mutate` (`READ_ONLY`,
+  `MAX_TOOL_COST=read|safe`, a read-only token) every writer is refused
+  `policy_refused` with cost `mutate`.
+- **HTTP transport guard (1.8-17, `http_guard.py`).** A request whose Origin
+  is not in `HTTP_ALLOWED_ORIGINS` is refused 403 (default: none listed); a
+  Host that is not the bound host:port (loopback names always) or in
+  `HTTP_ALLOWED_HOSTS` 421; a body over `MAX_HTTP_BODY_BYTES` (8 MiB; `0`
+  disables) 413, by Content-Length and counted on a chunked body; two
+  different Origin or Host headers 400. `*` in either list allows all. The
+  refusal body is `{ok: false, error, message}`. Bearer tokens are compared
+  in constant time against every configured token. `MCP_AUTH_TOKEN_READONLY`
+  issues a token with only the `mcp:read` scope: its requests run under the
+  `read` ceiling and its `tools/list` shows only what that ceiling allows.
+  stdio is unaffected.
+- **The AutoLISP read tier (1.8-18, F08).** `system_run_lisp` reads its
+  expression (`security_lisp.py`: escaped strings, `;` and `;| |;`
+  comments, quote, numbers, symbols, dotted pairs) and walks it. The read
+  tier: arithmetic and geometry (`angle`, `distance`, `polar`, `inters`,
+  `trans`), lists and control (`car` / `cdr`, `cons`, `list`, `mapcar`,
+  `foreach`, `if`, `cond`, `progn`, `lambda`, `setq`), strings (`strcat`,
+  `substr`, `rtos`, `vl-string-*`) and database reads (`entget`,
+  `entnext`, `entlast`, `handent`, `tblsearch`, `tblnext`, `getvar`,
+  `dictsearch`, `namedobjdict`, `sslength`, `ssname`, `ssget` with a literal
+  `_X` / `_W` / `_C` / `_CP` mode, `vlax-ename->vla-object`, `vla-get-*`,
+  `vlax-get-property`, `vlax-curve-get*`). All of these were refused by the
+  1.7 denylist. `while`, `repeat` and `defun` are outside the tier, so a
+  read-tier form always terminates; a higher-order function takes only a
+  literal function. The docstring example is now
+  `(vla-get-Area (vlax-ename->vla-object (handent "2A")))`. COM only: the
+  headless engine still answers that it has no LISP.
+- **Session metrics (1.8-14).** `system_status(metrics=True)` adds
+  `metrics.session` - this connection's `calls`, `by_tool`, `result_bytes`,
+  `errors_by_kind`, `p50_ms`, `p95_ms` - and, on the live engine,
+  `metrics.com_run`: each COM job's queue / guard / work / refresh /
+  counter ms. In memory and bounded (64 connections, 2,048 latencies). Off
+  by default, so the status payload and the idle catalog are unchanged; no
+  tool is added.
+- **Token and call budgets (1.8-14, 1.8-13).** `benchmarks/token_budget.json`
+  fixes the 1.8.0 ceilings, written before W2, each with a gate (`ci` or
+  `release`) and an owner. `python -m benchmarks.token_suite --budget
+  benchmarks/token_budget.json` exits 1 on a breached `ci` ceiling or an idle
+  row grown more than 5 % over `benchmarks/results/published/token-cost.json`;
+  `--release` also fails a release-gated cell over its ceiling or
+  unmeasured. token_suite has a fourth lane, `task`: five scripted jobs
+  (`sketch_20_entities`, `layer_cleanup_300`, `dimension_plate`,
+  `inspect_foreign`, `history_value_lookup`), each run naive (one tool per
+  entity, labelled as such) and batched (the least-call oracle in the new
+  `benchmarks/call_budget.py`), with calls, characters and the modelled
+  session input cached and uncached. An oracle whose verb is not on the tree
+  reports `pending_tool`, never a pass. A new CI job, `token-budget`, runs
+  the idle and task lanes against the budget and `python -m
+  benchmarks.call_budget` on every PR. The H4 (`layer_cleanup_300`), H5
+  (`dimension_plate`) and H1 (`history_value_lookup`, 1.8-10: 2 calls,
+  `drawing_open` + `drawing_history(handle=, detail="args")`) oracles are
+  measured and gated in CI.
+- **Durable checkpoints (1.8-08, `backends/checkpoints.py`).** Every save
+  keeps the bytes it just wrote, gzip level 1, at
+  `<ACADMCP_STATE_DIR>/docs/<lineage_id>/cp/cp-<seq>.dxf.gz` - no second
+  serialisation. `drawing_new` / `drawing_open` (S0, taken after the
+  engineering bootstrap; a never-saved drawing writes nothing until its first
+  checkpoint), every rollback-mode `cad_batch` / transaction boundary and the
+  new `checkpoint_create(label)` add one; a checkpoint is never taken per
+  call. Three new tools (core pack, `transaction` group, not in lean):
+  - `checkpoint_create(label=None)` (cost `safe`) stores the drawing as it is
+    now (`granularity: "label"` for the undo that lands on it) and returns
+    `{cp, seq, tool, rev, kb, label}`;
+  - `checkpoint_list(limit=10)` (`read`, 1-200) lists the active drawing's
+    checkpoints newest first, across restarts:
+    `{cp, seq, tool, rev, kb, label, evicted}`;
+  - `checkpoint_restore(checkpoint, expected_revision=None,
+    mode="in_place"|"new_document")` (`destructive`) takes an id (`cp-3`), a
+    seq or a label (the newest with it). `in_place` first stores the current
+    drawing (`checkpoint_before`), so the restore is itself undoable by
+    `drawing_undo`; `new_document` opens the checkpoint as `<stem>-cp<seq>`
+    and makes it the active document.
+
+  Refused by kind: `checkpoint_not_found` (category `input`; the message
+  names the newest ones), `checkpoint_evicted` (category `file`),
+  `stale_revision`, and capability `checkpoints` (unsupported) when there is
+  no state folder. Two capability keys in both maps: `checkpoints` (ezdxf
+  mode `state_dir`) and `checkpoint_restore_in_place` (ezdxf mode
+  `snapshot`). Live, a checkpoint is a `Document.Export`, taken at
+  `checkpoint_create`, at `transaction_begin` (every rollback boundary and the
+  `*_from_spec` transactions) and before `entity_delete_many`,
+  `drawing_purge` and `text_find_replace`; `mode="new_document"` opens
+  `<stem>-cp<seq>.dxf` and binds it, and `mode="in_place"` is refused with
+  capability `checkpoint_restore_in_place` (ActiveX cannot replace a
+  database's contents). Journal rows carry `checkpoint_before` /
+  `checkpoint_after`, omitted when there is none.
+- **A literal-handle pre-check (1.8-09, `engineering/changes/precheck.py`).**
+  `cad_batch`, `entity_delete_many` and `entity_batch_modify` read every
+  literal handle in a handle parameter with one `entity_fingerprints` call
+  before anything runs. A handle that names no entity refuses the whole call
+  with kind `unknown_handle` (`missing`: `[{i, tool, handle}]` per batch step,
+  `[{index, handle}]` per list item; `executed` / `deleted` / `modified` 0),
+  under every `on_error`, before any checkpoint opens. A literal handle after
+  a step that opens, closes, switches or restores a document (`drawing_new`,
+  `drawing_open`, `drawing_close`, `document_activate`, `document_close`,
+  `checkpoint_restore`, `drawing_undo`, `drawing_redo`,
+  `transaction_rollback`) is checked when its step runs (`not_found`). A dry
+  run marks such a step invalid with kind `unknown_handle`.
+- **Value history (1.8-10).** A new read tool, `drawing_history(limit=10,
+  since_seq=None, tool=None, query=None, handle=None, label=None,
+  detail="row"|"args"|"changes")` (core pack, `transaction` group, not in
+  lean), reads the durable journal of the open drawing's lineage, including
+  the calls of a server that has since restarted (reopen the file first).
+  Rows are `{seq, op, tool, state, rev, cp, label, t}`; `args` adds the
+  stored bounded arguments, `changes` each call's change summary and, for
+  the first three rows, the checkpoint diff around it. `query` is
+  case-insensitive over the tool, the label, the arguments and the
+  `ACADMCP_*` feature tokens. A label no row carries is refused
+  `invalid_args`, naming the labels there are. With it:
+  - **labels:** `_meta.label` on any call, `cad_batch(label=)` and
+    `checkpoint_create(label)` (1-200 printable characters; anything else is
+    refused `invalid_args`, on a batch before anything runs);
+  - **change summaries:** every mutating journal row and every `cad_batch`
+    result carries `changes: {added, deleted, counts, complete}`, plus
+    `features` (up to 20 `key=value` tokens of the `ACADMCP_MECH` / `ARCH` /
+    `PID` payloads it drew). Headless it is a handle-set diff per layout and
+    named block, once per call; live it is built from the handles the call
+    returned (`complete: false`). A failed batch reports `partial_changes`,
+    a rolled-back one `changes: {rolled_back: true}`;
+  - **`drawing_diff(old_checkpoint=, new_checkpoint=)`** compares checkpoints
+    by id, seq or label, and every diff now reports `feature` (a JSON-path
+    diff of `ACADMCP_MECH` / `ARCH` / `PID` payloads, e.g.
+    `{"features[2].d": {"from": 12, "to": 16}}`) and, for a DIMENSION,
+    `measurement` from -> to. An exact geometric match whose payload moved
+    counts as changed.
+
+  The plugin eval case `history-round2` is written (not yet run with a real
+  model).
+- **Search by default, pinned tools, one instruction builder (1.8-11).**
+  - `DISCOVERY_PINNED` (comma list, default `cad_batch,drawing_info,
+    entity_list`; empty pins nothing): in search mode these are listed beside
+    `search_tools` / `call_tool` / `describe_tool` as shortened cards (the full
+    input schema, the first paragraph of the description plus "Full
+    description: describe_tool."). A pin the profile or packs hide is not
+    listed; an unregistered name is warned about at startup.
+  - `describe_tool(names=[...])` returns up to 25 tool cards in one call.
+  - `discovery/instructions.py` builds the server instructions per surface
+    (`server._server_instructions(mode, profile, packs)`, at most 250 tokens,
+    batch first). They name only tools the surface advertises - in search
+    mode the three synthetic tools and the pins it lists.
+  - The canonical skill gains a "Call budget" section (more than three
+    consecutive calls to one tool is a missed batch tool, and a task -> one
+    call table).
+  - Two recipes, `autocad://recipes/layer_cleanup` and
+    `autocad://recipes/dimension_part`, each one `cad_batch` (seven recipes).
+  - Two plugin eval cases, `layer-cleanup-budget` and `dimension-budget`,
+    which fail above 6 server calls after their setup.
+- **Matrix v9 (registered, not the default).** `benchmarks/tasks_v9.py` adds
+  eight W2 tasks to v8's 31 in the one `MATRICES` registry; `DEFAULT_MATRIX`
+  stays `v8`: `dimension_lie_detect`, `policy_read_only`, `lisp_read_tier`
+  (COM; headless `environment_blocked`), `layer_cleanup_budget`,
+  `call_count_dimension_part`, `undo_across_restart` (draw, save, move, save,
+  kill; a new process's one `drawing_undo` puts the line back; unsaved twin:
+  the file untouched and `lost_since_save.count` 1), `atomic_batch_default`
+  (move + delete of a missing handle with no `on_error`: `unknown_handle`,
+  nothing executed; run-time twin rolled back, verified) and
+  `history_value_lookup` (the round-2 diameter in at most two calls after a
+  restart). In search mode the reference adapter's in-process MCP-client
+  tasks reach every non-synthetic tool through `call_tool`, and the adapter
+  reports `discovery_mode` and `proxied_calls` in its metadata, so a
+  search-mode pass is visibly not vacuous.
+- **Twelve W2 correctness checks** (each imports its 1.8.0 modules inside the
+  check): `qa_coverage_not_checked`, `dimension_truth_focus` and
+  `property_override_focus` (Quality gate), `dimension_display_truth` and
+  `dimension_auto_one_call_part` (Dimensions), `policy_read_only_batch` and
+  `write_path_autoload_refused` (Security),
+  `search_default_lists_pins_and_batch_first` (Discovery), and
+  `undo_after_restart`, `atomic_batch_default`, `delete_many_all_or_nothing`
+  and `history_round2_value` (Durability): 67 → 79 checks.
+  `property_override_focus` is the plan's section-8 check W1 did not add: a
+  line on GEOMETRY given colour 1 and lineweight 30 is named by exactly two
+  issues listing only its handle (`lineweight_not_bylayer` error,
+  `color_not_bylayer` warning), a clean drawing yields none, and
+  `drawing_refine` applies one repair per issue and leaves the line at
+  colour 256 and lineweight ByLayer. The five later ones: the default
+  surface lists exactly the three synthetic tools and the three pins, a tool
+  it does not list still runs on a direct call, `describe_tool(names=)`
+  answers two cards and the instructions teach `cad_batch` and name nothing
+  unlisted; undo after a killed and restarted server lands on the saved state
+  with `granularity: "save"`, and a killed unsaved session reports
+  `lost_since_save.count == 1`; `[entity_move(L), entity_delete("DEAD")]`
+  with no `on_error` is `unknown_handle` with L unchanged, and its run-time
+  twin is rolled back, verified; `entity_delete_many([A, "DEAD"])` keeps A,
+  and a delete that fails mid-call leaves A, B and C in the drawing; the
+  round-2 diameter (12) is read back after a restart in two calls, labelled
+  or from the checkpoint diff. All twelve pass here; eleven were run against
+  a v1.7.0 tree by their items and fail or miss there, and the A/B report
+  the numbers pass regenerates covers all of them.
+- **Environment variables:** `READ_ONLY` (false), `TOOL_ALLOWLIST` /
+  `TOOL_DENYLIST` (empty), `MAX_TOOL_COST` (`escape`), `LISP_POLICY`
+  (`read`; an unknown value falls back to `read` with a warning),
+  `HTTP_ALLOWED_ORIGINS` / `HTTP_ALLOWED_HOSTS` (empty),
+  `MAX_HTTP_BODY_BYTES` (8 MiB), `MCP_AUTH_TOKEN_READONLY` (empty),
+  `DISCOVERY_PINNED` (`cad_batch,drawing_info,entity_list`).
+
+### W2: Changed
+
+- **A lane the critique did not check is named (1.8-16).** The live
+  engine's dimension-legibility lane reports `not_checked`
+  (`engine_live_document_template`) instead of a silent `[]` that read as
+  checked and clean. A check that writes no ledger row is recorded
+  `check_unreported`.
+- **A dimension is read as the sheet shows it (1.8-15).** A count prefix
+  (`4x Ø13.5`, `4x M8`) is not the claimed size; `40x20` stays a size. A
+  dimension measured to a point on an edge (not at its end) binds to that
+  edge, which changes requirement verification only for dimensions that
+  were `unknown`. A dimension text's MTEXT codes (`<>\PTYP`, `<>\XTYP`,
+  `{\H0.7x;<>}`) are formatting: the displayed text is read through the same
+  reader as the `*D` block. A headless redraw is all or nothing: a DIMPOST
+  without `<>` renders as a suffix, as AutoCAD shows it, and a dimension the
+  renderer cannot redraw is refused (kind `refused`) with the style, the
+  scale or the edit put back and the revision unmoved.
+- **`dimstyle_modify(rerender=True, force=False)` (1.8-15).** Headless, it
+  redraws every dimension using the style (`rerendered`, `text_kept`). Live,
+  each such dimension is `Update()`d and its `*D` text read back
+  (`rerendered`, `already_current`, `stale`); the read costs two
+  `Document.Export` reads per modify of a style in use. `rerender_required`
+  now means a dimension still shows the old style: `rerender=False`, or a
+  live redraw the read-back did not confirm.
+- **`LISP_POLICY=read` (1.8-18).** A form outside the read tier goes to the
+  1.7 denylist unchanged, and the denylist also re-scans every read-tier
+  verdict: a match outside a symbol the reader approved is refused
+  `denylist_second_pass`. Refused whatever the tier: interactive `get*`
+  (all but `getvar`, `getenv`, `getcfg`, `getpropertyvalue`), `entsel`,
+  `grread`, a mode-less or interactive `ssget` (they hold AutoCAD's single
+  COM thread), `load` / `autoload` / `arxload`, `startapp`, `dos_*`,
+  `vl-file-*`, `read`, a non-literal `eval` / `apply` / `mapcar` function,
+  `vlax-create-object`, `vla-SendCommand`, `vlr-*`, `defun`, `c:*`, and
+  unreadable text: unbalanced parentheses, an unterminated string or
+  comment, a trailing `;` comment, a comment holding a parenthesis or a
+  quote, a control character other than tab / CR / LF, nesting deeper than
+  200. A refusal is `policy_refused` with `policy` (`lisp_allowlist`, or
+  `lisp_denylist` under `LISP_POLICY=denylist`), `symbol`, `line` and
+  `column` (1-based), `tier_needed` (`write` / `none` / `unclassified`;
+  `read` when only the denylist mode refused a read form), `reason`
+  (`never_runs`, `unreadable`, `outside_read_tier`, `denylist_second_pass`,
+  `denylist`), `symbols`, `verbs` and `alternatives`. Refused symbols map to
+  typed tools: `entdel` / `vla-delete` → ERASE, `entmod` / `vla-put-*` /
+  `vlax-put-property` → PROPERTIES, `setvar` → SETVAR, `getpoint` /
+  `getcorner` → ID (`user_pick_point`), `entsel` / `nentsel` / `ssget` →
+  SELECT (`user_select`). The write tier is 1.8.1.
+- **`TOOL_PROFILE=lean` gains `entity_modify_where`:** 67 tools (57 with
+  `TOOL_PACKS=core`). `layer_rename` and `layer_merge` are full-profile, and
+  so are the four W2 history tools.
+- **Headless `drawing_undo` works without `EZDXF_UNDO_DEPTH` and after a
+  restart (1.8-08).** It restores the newest checkpoint below the current
+  revision and reports `granularity` (`save` / `batch` / `label`) and
+  `checkpoint`; repeated undos walk back, never forward onto a state an undo
+  replaced. With `EZDXF_UNDO_DEPTH` > 0 the in-memory per-call steps are used
+  first, then the store. `drawing_redo` restores what an undo replaced -
+  across the memory / store boundary too, within the session; redo across a
+  restart is not kept. Capability `undo_history` on ezdxf is supported with
+  mode `checkpoint`. Without a state folder (`JOURNAL_DURABLE=off`) and
+  without `EZDXF_UNDO_DEPTH` the 1.7 `undo_history` refusal stays.
+- **`drawing_open` reports `lost_since_save` (1.8-08)** `{count,
+  last_operation}`: the committed calls a reopened file no longer holds
+  because the server ended before they were saved (headless; a killed server
+  loses nothing of a live document). `CHECKPOINT_KEEP` (20),
+  `CHECKPOINT_BUDGET_MB` (512) and `CHECKPOINT_MAX_DOC_MB` (32), read but
+  unused in W1, are enforced: per lineage the newest `CHECKPOINT_KEEP` rows
+  besides S0 and at most `CHECKPOINT_MAX_DOC_MB`; across lineages the least
+  recently written first, never the row just written, so the disk stays at
+  or below the budget plus one checkpoint. An evicted row stays listed with
+  `evicted: true`.
+- **`cad_batch` defaults to `on_error="auto"` (1.8-09).** A batch with a
+  mutating step and no document switch runs as `rollback` (headless: a
+  document snapshot; live: an UNDO judged by the before/after fingerprints
+  while CMDACTIVE is 0); a read-only batch, and one with a
+  `transaction_begin` / `transaction_commit` / `transaction_rollback` step or
+  a document switch, runs as `stop` and opens no checkpoint. If auto cannot
+  open its checkpoint it runs as `stop` and says why (`atomicity.note`); it
+  never refuses a batch 1.7 ran. The response's `on_error` echoes `auto`;
+  `atomicity.mode` is what ran, with the new keys `default_applied`,
+  `cmdactive`, `handles_checked` and `handles_changed`. Headless rollback
+  evidence checks the pre-checked handles' presence; live it compares them
+  exactly, and an AutoCAD that is busy or whose CMDACTIVE cannot be read
+  gives `verified: None` with a "ROLLBACK NOT VERIFIED" note, never a claim.
+  An explicit `on_error="rollback"` is unchanged.
+- **`entity_delete_many` is all or nothing (1.8-09).** Every handle is
+  pre-checked; the deletes run inside `transaction_begin` (live, that begin
+  also takes the 1.8-08 checkpoint, so no second export); a failure rolls the
+  others back and answers `ok: false`, `deleted: 0`, `rolled_back`,
+  `verified`. A handle listed twice is deleted once (`duplicates_ignored`).
+  Inside a transaction the caller opened on a live seat (the begin is
+  declined) it answers `transaction: false` and a note that the deletes that
+  ran stay applied. `entity_batch_modify` gets the pre-check only and stays
+  non-transactional.
+- **`system_status` is thin (1.8-10).** `operations` is `{count, last: {op,
+  tool, state, rev}, unknown_commit}`: with 1,000 journal rows the output is
+  at most 300 bytes larger than with none (a test holds it).
+  `system_status(detail="operations")` returns the 1.7 list of the last 20
+  records, for this release only. The durable journal pages its history
+  reads newest first (no full-lineage read). `drawing_history(limit=10)`
+  stays under 400 tokens (a test holds it).
+- **`DISCOVERY_MODE` defaults to `search` (1.8-11).** A client lists
+  `search_tools`, `call_tool`, `describe_tool` and the `DISCOVERY_PINNED`
+  tools, and every tool stays directly callable by name (spike S1); the v8
+  matrix passed 31 / 31 under the new default with its MCP-client tasks going
+  through `call_tool`. `DISCOVERY_MODE=off` restores the 1.7.0 full catalog.
+  The plugin starts the server with
+  `DISCOVERY_MODE=${AUTOCAD_MCP_DISCOVERY:-search}`.
+- **The server instructions are built per surface (1.8-11).** On the full
+  catalog they teach batching first (`cad_batch` with `$name` references,
+  `entity_batch_create`, `entity_modify_where`, `dimension_auto`, the
+  `*_from_spec` tools); in search mode they point the client at those tools
+  through `search_tools`. They name only tools the client can see and no
+  longer the stale `titleblock_apply_iso_a3`. The
+  three search tools' texts are one line each, 922 characters together, with
+  lean wire schemas. The `system_status` docstring says operator object
+  edits are counted.
+- **Tests that read the whole catalog take the `full_catalog` fixture**
+  (`tests/conftest.py`, `DISCOVERY_MODE=off` for that test, applied to both
+  imported server modules); the rest of the suite runs under the search
+  default.
+- **token_suite's idle headline is the prompt payload (1.8-14)** - the tools
+  array a client forwards to the model. The tools/list wire payload, the
+  basis of 1.7.0's 89,226 and 503, is the `wire` column beside it. The idle
+  lane gains `packs_core` and `instructions` rows (report schema
+  `token/2.0`). `docs/tool-inventory.json` is schema 2 and carries `acad` /
+  `synonyms` per row.
+- **`perf_compare.py --base` defaults to `auto` (1.8-14):** the previous
+  release tag (`git describe --tags --abbrev=0`, from `HEAD^` when a tag
+  points at HEAD), refused by name when no tag is reachable, instead of a
+  fixed v1.6.0.
+- **The wheel and the Docker image ship `policy.py`, `http_guard.py` and
+  `security_lisp.py`.**
+
+### W2: Fixed
+
+- **`data_extract` checked no extension (1.8-17).** It, and `drawing_save_as`,
+  could write `acaddoc.lsp` or `acad.lsp`. No tool writes a file AutoCAD or
+  Windows loads or runs - `*.lsp` (`acad*.lsp`, `acaddoc*.lsp`), `.fas`,
+  `.vlx`, `.mnl`, `.scr`, `.arx`, `.dbx`, `.dll`, `.exe`, `.bat`, `.cmd`,
+  `.ps1`, `.vbs`, `.js` and `acad.pgp` - even inside `ALLOWED_PATHS`
+  (`path_refused`, reason `executable_name`); trailing dots and spaces are
+  stripped first, and a `:` in the name (an NTFS alternate data stream) is
+  refused. Reads of these names are not affected.
+- **The LISP denylist could be escaped (1.8-18).** In 1.7, `1)) ERASE ALL
+  ((` broke out of the server's `progn` wrapper and reached the command
+  line, because the denylist knows only LISP symbols; the reader refuses
+  unbalanced input. The denylist's `vla[xr]?-` pattern never matched
+  `vlr-*`, so 1.7 ran reactors; the read tier refuses them
+  (`LISP_POLICY=denylist` keeps the 1.7 gap, as the migration requires).
+- **A dimension's reported text was not the sheet's (1.8-15).** On a DIMDEC
+  0 sheet a 19.6 mm dimension was reported as showing "19.6" while it shows
+  "20", and v1.7.0 scaled an angle by DIMLFAC.
+- **No undo survived a restart (1.8-08).** In 1.7 the headless
+  `drawing_undo` was refused (`undo_history`) unless `EZDXF_UNDO_DEPTH` was
+  set, and its in-memory steps died with the process.
+- **A batch that named a missing handle kept its earlier steps (1.8-09).**
+  `[entity_move(L), entity_delete("DEAD")]` moved L, failed the delete and
+  kept the move under 1.7's default; it is now refused before anything runs.
+  `entity_delete_many([A, "DEAD"])` deleted A and answered `ok: true`.
+- **`system_status` grew with every call (1.8-10):** it carried the last 20
+  full operation records.
+- **The server instructions taught one call per entity (1.8-11)** and named
+  `titleblock_apply_iso_a3`; they never mentioned batching.
+
+### W2: Breaking - migration table
+
+| Change | 1.7.0 | 1.8.0 | Old behaviour |
+|---|---|---|---|
+| `strict_critique=True` (`drawing_finalize` opt-in, `drawing_deliver` default) | passes when the critique is empty | also fails on every `not_checked` lane except `domain_absent`, each a gate row with code `not_checked` (`critique_gate_failed`); on the live engine a default delivery is now `failed_validation`, because the legibility lane is `engine_live_document_template` | `strict_critique=False` |
+| `drawing_topology_check(limit=)` default | `200` | `None`: still 200 rows per list without `summary`; 5 rows with `summary=True` | `limit=200` |
+| `LISP_POLICY` | the 1.7 denylist | `read` (+ the denylist as a second pass) | `LISP_POLICY=denylist`; `LISP_POLICY=off` checks nothing |
+| `system_status` | no policy | always carries `policy` (`system_about` too, with `unmatched` and `http`) | ignore the key |
+| `meta["cad"]` on each tool | `summary`, `cost`, `acad`, `synonyms` | `summary`, `cost` (full-catalog tools/list 91,683 → 83,486 wire tokens, 1.8-14's measurement) | `describe_tool`, `docs/tool-inventory.json` (schema 2) |
+| Headless `dimstyle_modify` | `rerender_required: true`, dimensions left stale | redraws (`rerendered`, `text_kept`); `rerender_required` only when a dimension still shows the old style | `rerender=False` |
+| `dimension_auto` tool answer | a list of entity rows; a rerun duplicates | `{ok, created: [handles], skipped_existing, omitted, redundant?, layer, dim_overlap}`; `skip_existing=True` by default (the backend method still returns the list of drawn entities) | `skip_existing=False` for a rerun; `entity_get` on `created` for the rows |
+| HTTP bearer tokens | one token, every tool | `MCP_AUTH_TOKEN` carries `mcp:read` + `mcp:write`; `MCP_AUTH_TOKEN_READONLY` only `mcp:read` (the `read` ceiling); if both are the same string that token is read-only, with a warning | leave `MCP_AUTH_TOKEN_READONLY` unset |
+| HTTP Origin | not checked | a request with an Origin not in `HTTP_ALLOWED_ORIGINS` is 403 - a browser-based MCP inspector included | `HTTP_ALLOWED_ORIGINS=http://localhost:6274` (its origin), or `*` |
+| HTTP Host | not checked | not the bound host:port and not in `HTTP_ALLOWED_HOSTS` → 421; a wildcard bind (`0.0.0.0` / `::`) serves only `HTTP_ALLOWED_HOSTS` and the loopback names | `HTTP_ALLOWED_HOSTS=<host:port>`, or `*` |
+| Non-loopback HTTP bind | `ALLOW_REMOTE_HTTP=true` + a token | also requires `ALLOWED_PATHS` | set `ALLOWED_PATHS` |
+| A writer's output path | any extension, or none | only the tool's own extensions; none, another or a loadable name → `path_refused` (`extension_not_allowed`, `executable_name`) | name the file with the tool's extension |
+| `cad_batch(on_error=)` default (1.8-09) | `stop`: a failure keeps the steps before it | `auto`: a batch with a mutating step is all or nothing (rolled back on a run-time failure); a read-only batch, one with its own `transaction_*` step and one that switches documents run as `stop`; `atomicity.default_applied` says which | `on_error="stop"` |
+| A literal handle that names no entity, in `cad_batch` (1.8-09) | the steps before it ran, then that step failed | the whole batch refused `unknown_handle` before any step (`missing`, `executed: 0`), under every `on_error` | fix the handles in `missing` |
+| `entity_delete_many` (1.8-09) | deletes what it can; `ok: true` with an `errors` list | all or nothing: a missing handle refuses `unknown_handle` with nothing deleted, a delete that fails rolls the others back; `ok: false` whenever `errors` is non-empty; a duplicate handle is deleted once (`duplicates_ignored`) | read `ok`; send only live handles |
+| `entity_batch_modify` with a handle that names no entity (1.8-09) | the other operations applied, an error row for it | refused `unknown_handle`, `modified: 0` | fix the handle |
+| Headless `drawing_undo` without `EZDXF_UNDO_DEPTH` (1.8-08) | refused `undo_history` | steps back to the newest checkpoint below the current revision (`granularity`, `checkpoint`), also after a restart | `JOURNAL_DURABLE=off` keeps the refusal |
+| `system_status.operations` (1.8-10) | a list of the last 20 records | `{count, last: {op, tool, state, rev}, unknown_commit}`; `drawing_history` lists the calls | `system_status(detail="operations")` (this release only) |
+| `drawing_diff(old_path)` (1.8-10) | required | optional: `old_checkpoint=` / `new_checkpoint=` instead (id, seq or label) | pass `old_path` as before |
+| Server `DISCOVERY_MODE` default (1.8-11) | `off`: the full catalog | `search`: `search_tools` / `describe_tool` / `call_tool` and the `DISCOVERY_PINNED` tools; every tool still callable by name | `DISCOVERY_MODE=off` |
+| Plugin discovery mode (1.8-11) | no env (the server default, `off`) | `DISCOVERY_MODE=${AUTOCAD_MCP_DISCOVERY:-search}` | `AUTOCAD_MCP_DISCOVERY=off` |
+
+### W2: measurements
+
+Measured on this tree (`release/1.8.0` at `1d42556`, headless), unless a
+report is named:
+
+- **`python -m benchmarks.call_budget`** (exit 0): `sketch_20_entities` 20 →
+  1 call, `layer_cleanup_300` 311 → 2 (ceiling 3; 1.7.0 124, the rival
+  11), `dimension_plate` 23 → 2 (ceiling 2; 1.7.0 89, the rival 10),
+  `inspect_foreign` 5 → 1; `history_value_lookup` is `pending_tool`
+  (`drawing_history`, 1.8-10).
+- **`python -m benchmarks.token_suite --lanes idle,task --budget
+  benchmarks/token_budget.json`**, prompt basis: default 246 tools 67,230
+  tokens (wire 86,021), lean 67 tools 19,629 (wire 24,627), `TOOL_PACKS=core`
+  187 tools 46,661 (wire 60,805), search 3 tools 455 (wire 503), server
+  instructions 461. Task lane, modelled 30-turn session input:
+  `layer_cleanup_300` naive 27,961,921 uncached against batched 204,821
+  uncached / 99,344 cached; `dimension_plate` 1,657,975 against 203,297 /
+  98,312. **The budget exits 1 on this tree:** `idle.default` (67,230) is
+  over its `ci` ceiling of 65,594, and `packs_core` grew 5.24 % over the
+  published report (limit 5 %). `lean`, `packs_core`, `search` and
+  `instructions` are over their release-gated ceilings (owners W3 and
+  1.8-11), and the result-lane cells and `search_pinned` are not yet
+  measured. The integration decides the `idle.default` cell.
+- **QA answers** (1.8-16's report, `tests/test_qa_coverage.py`): a
+  500-issue `drawing_critique(summary=True)` is 747 characters against
+  79,096 for the full list (ceiling 2,500); finalize's `qa_coverage` is 136
+  tokens on a clean sheet and 216 with three not-checked layouts (ceiling
+  300).
+- **Dimension truth at 2,000 dimensions** (1.8-15's review): snapshot
+  0.68 s, `dimension_truth` 0.72 s, a `dimstyle_modify` redraw of all 2,000
+  0.73 s, `drawing_critique(focus=None)` 1.79 s.
+- **Correctness:** 74 checks here, each of the seven W2 checks failing or
+  missing on a v1.7.0 worktree and passing on this tree. The published
+  `ab-v1.7.0-vs-v1.8.0.json` is still over 67 checks.
+
+Measured by the second-pass items on their own branches (their reports),
+before the numbers pass retakes the tree:
+
+- **Checkpoints (1.8-08):** on a 2,000-entity drawing the median
+  `drawing_save` was 54.0 ms without the store and 53.7 ms with it (30 saves
+  each, a new revision before every save); the gzip-1 copy itself is 0.6 ms
+  (233 KB DXF -> 23 KB). The review measured a rollback-mode
+  `transaction_commit` (290 KB snapshot) at 13.5-14.6 ms with the store on
+  against 0.4-0.5 ms off - the item's "about 1 ms" did not reproduce.
+- **Change summaries (1.8-10):** `perf_compare --aa` against the branch base
+  `ok: true` (A/A spread 0.167, bound 1.335; `server_create_lines_2k`
+  1.023), so the handle-set diff stays on every mutating call.
+  `call_budget`'s `history_value_lookup` is 2 calls.
+- **Search default (1.8-11):** token_suite's idle lane, prompt / wire:
+  `search` 220 / 230 tokens (922 characters), `search_pinned` 1,003 / 1,277
+  (6 tools), `instructions` 199 tokens (832 characters); the three cells moved
+  from `release` to `ci`. The v8 matrix passed 31 / 31 under the new default
+  (`proxied_calls` 9) and v9 33 / 33 on that branch (`proxied_calls` 41). The
+  plugin eval cases, one real-model run each twice (sonnet, `--no-publish`,
+  `--max-cost-usd 3`): `layer-cleanup-budget` 3 and 6 server calls (pass),
+  `dimension-budget` 9 and 12 (over its 6 - the model re-read
+  `dimension_auto`'s result handle by handle), so `real_model.plugin_eval`
+  stays release-gated.
+
+### W2: not in this pass, or not yet
+
+- **1.8-15:** headless, ezdxf 1.4.4 draws a two-line angular dimension's
+  reflex angle (315° for 45°); `dimension_truth` reports it
+  `dim_render_stale` with `repairable: false` and `reflex_render: true`
+  ("redraw it in AutoCAD"); a fix is proposed for 1.8.1. A DIMENSION inside
+  a block definition is not checked, and no `not_checked` row says so yet.
+  The live `dimstyle_modify` writes the style, then `Update()`s each
+  dimension in one job with no rollback if one fails. Redrawing after
+  move / rotate / mirror / copy / array, and inside block definitions, is
+  1.8.1.
+- **1.8-13:** `skip_existing` cannot match an existing DIMENSION that
+  `bind_dimension` cannot bind (a 1.7 ordinate dimension to a point on no
+  feature); a rerun duplicates such a one.
+- **1.8-08:** redo across a restart is not kept (a restore after a restart
+  goes through `checkpoint_restore`). Left from the review: the checkpoint
+  index has no lock across processes (two servers on one state folder can
+  take the same seq); a kill between an eviction's unlink and the index write
+  leaves a kept row with no file, which `drawing_undo` refuses
+  `checkpoint_evicted` instead of falling back; the budget scan reads every
+  lineage on every add; a `new_document` restore's temporary folder is never
+  removed; `checkpoint_restore`'s `mode` is a plain string (a bad one is
+  `failed`, not a schema error) and its `expected_revision` check is not
+  atomic with the restore; a live unsaved document's lineage is per session;
+  a failed checkpoint is only logged.
+- **1.8-09:** batch lease, `confirm_large` and batch budgets are 1.8.1.
+  `system_launch(open_path=)` is neither a pre-check barrier nor a document
+  switch for auto; a literal handle nested inside a step's arguments
+  (`entity_batch_modify` `operations[].handle` in a batch) is checked by the
+  inner tool at run time, so `executed` is not 0 then (auto still rolls the
+  earlier steps back); the pre-check runs before `expected_revision`, so a
+  stale client naming a deleted handle gets `unknown_handle`;
+  `entity_delete_many` does not guard a `transaction_begin` that raises, and
+  inside a live auto batch its "stay applied" note is wrong (the outer batch
+  rolls them back).
+- **1.8-10:** the plugin eval `history-round2` is written, not yet run with a
+  real model; `call_budget`'s history oracle counts the two calls in one
+  in-process client (the restart half is proven by the v9 task and the
+  correctness check, which kill real server processes).
+- **1.8-11:** `dimension-budget` measured 9 and 12 real-model calls against
+  its ceiling of 6, and the trimmed skill row ("never `entity_get` per
+  handle") was not re-evaluated. `describe_tool` refusals carry no typed kind
+  (more than 25 names is a raw validation error), and `system_about` does not
+  report `discovery_mode` or the pins. The `Details:` split of long
+  docstrings was planned for 1.8.1; W3 did it (see *W3: Changed*).
+
+**W2 live evidence pending.** AutoCAD 2026 was not running on 2026-11-03.
+Written, not run: the `scripts/smoke_settings_com.py` stages `set edits`
+(the ssget group codes, a proxy from a deleted SelectionSet staying
+writable, a rename rewriting no entity, a merge reaching a sheet and a block
+definition), `dimension truth` (whether a `*D` block is redrawn after DIMDEC
+changes and by `Update()`, `entity_scale`, `%%c<>` printing ØØ, the
+ExtLine1Point / ExtLine2Point read-back) and `dimension auto` (12 dimensions
+in one call, the ellipse omitted, a second call drawing nothing); and
+`scripts/smoke_lisp_com.py` (the LISP corpus in AutoCAD, `vla-get-Area`
+against `analysis_measure_entity`, `getvar` CLAYER / INSUNITS / LTSCALE
+against `system_get_variable`, no call left with CMDACTIVE set, the
+`(command "_ERASE" ...)` twin refused). The COM `metrics.com_run`
+breakdown, `dimension_rerender`, the live `dimstyle_modify` read-back and the
+set-edit COM paths are covered by fake-COM tests only; `READ_ONLY` and a
+read-only token on a live seat are unverified; the v9 `lisp_read_tier` COM
+lane has not run. Also written and not run: `scripts/smoke_durability_com.py`
+(1.8-08: `checkpoint_create` / `checkpoint_list`, `mode="in_place"` refused,
+the transaction and pre-destructive checkpoints, a `new_document` restore).
+The live `cad_batch` auto rollback (fingerprints while CMDACTIVE is 0), the
+pre-check through `Document.Export`, the transactional `entity_delete_many`,
+and the COM side of `drawing_history`, `drawing_diff(old_checkpoint=)` and
+the live change summaries are covered by fake-COM tests only.
+
+1.8.0, third phase (W3, "the named promises"): 1.8-19 to 1.8-24 and K1. A
+drawn part is revised by its parameters in place, keeping its handles, and
+refuses over a hand edit. A P&ID line goes round the vessels between its
+ports, and a project of several sheet files is checked as one. A DWG opens
+headlessly where AutoCAD's console is installed. The live engine refreshes
+the display once per job and runs a bulk call as one job where the deadline
+allows. The B40 feature tables get their double-entry pipeline but no row,
+and the native .NET worker is deferred by a measured rule. Two tools are
+added (`mech_part_revise`, `pid_project`) and one resource
+(`autocad://pid/project/last`); `system_about` is the authority for the
+counts. The correctness suite has 83 checks and matrix v9 had 44 tasks at the
+end of W3; 1.8-25 added the last five section-8 rows (49) and made v9 the
+default (see *Gate numbers* above).
+
+### W3: Added
+
+- **`mech_part_revise` (1.8-19, pack `mech`).**
+  `mech_part_revise(part_id, changes, overwrite=False, dry_run=False,
+  expected_revision=None, preconditions=None, verify=True)` changes a drawn
+  part's model by path edits (`{"segments[1].length": 50,
+  "features.bore.diameter": 24, "features.r1": null, "features+": {...}}`)
+  and rebuilds its views in place in one transaction
+  (`engineering/mech/revise.py`, through generic contract members only, so
+  both engines). Tagged LINE / CIRCLE / ARC keep their handles (edited
+  through `entity_edit_geometry`); a changed LWPOLYLINE / TEXT / HATCH is
+  redrawn and listed in `handle_map: [{old, new, reason}]`, and a layer,
+  colour, linetype or lineweight set by hand is carried onto the new entity
+  (`handle_map[].kept`). Dimensions are deleted and placed again with the
+  style, threshold and fits recorded on each view, so their handles change;
+  a fit that no longer applies is in `dimensions.dropped_fits`, never
+  re-applied silently. The hole table is rewritten and a balloon whose
+  target was redrawn is re-linked. `verify=True` measures the stored
+  `ACADMCP_REQUIREMENTS`; `model_is_current` in the result is read back with
+  one drift read after the commit. Before anything is written every tagged
+  entity's real geometry is compared with the stored model: a hand edit
+  (moved, copied or deleted) refuses the call with
+  `hand_edited_tagged_entity` naming the handles, a part drawn before 1.8.0
+  (no `gen` stamp) or whose views the engine no longer reproduces with
+  `model_drift`; `overwrite=True` replaces both with the model. A layer or
+  colour edit is not drift. On a part drawn before 1.8.0, `overwrite=True`
+  finds its untagged dimensions by the two points the old model measures and
+  the hole table by the box its rows lay out; any other untagged dimension on
+  a dimensioned view stays on the sheet and is listed in
+  `dimensions.legacy.left`. Refused before anything is written: a bad path
+  or value (`invalid_args`), a moved preview (`stale_revision`), and a detail
+  view, a repeated view tag, a payload with no view or a stored model that no
+  longer builds (kind `refused` with a `reason`). Not in lean.
+- **Model history and drift (1.8-19).** Each revision appends `{rev, at,
+  operation_id, changes: {path: [old, new]}}` to the part's XRECORD in the
+  `ACADMCP_MODEL_HISTORY` dictionary (newest 200 kept), which travels with
+  the file. `mech_part_inspect(drift=True)` adds `drift: [{feature, view,
+  expected, measured, status}]` and `model_is_current`; `history=True` and
+  `param="features.bore.diameter"` read the history (both together). New
+  critique focus **`model_drift`** (mech domain, after
+  `mech_bom_balloon_mismatch`): silent (`domain_absent`) without a part
+  anchor; a part drawn before 1.8.0 is an `unstamped` info issue. New error
+  kinds `hand_edited_tagged_entity` (category `geometry`) and `model_drift`
+  (category `spec`), neither retryable.
+- **Obstacle-aware P&ID routing (1.8-20).** `pid_line_draw(route="avoid",
+  clearance=2.0, keep_out=[[xmin, ymin, xmax, ymax], ...],
+  on_blocked="refuse"|"cross")` searches an orthogonal route that keeps
+  `clearance` from every symbol that is not one of its ends and from every
+  `keep_out` box (`engineering/pid/router.py::route_avoiding`, pure: A* over
+  a sparse Hanan grid with escape lines beside each stub and a frame around
+  the sheet; a bend and a crossing with an existing P&ID line each add cost;
+  ties break by coordinate, so the result is deterministic). Two ports on
+  one row or column always find a route on an open sheet; a route never runs
+  back over its own stub or through its own port, and it goes round its own
+  end symbols when it can (they are priced, never refused or reported). No
+  route: kind `no_route` naming the tags of the enclosing symbols, or
+  `on_blocked="cross"`, which runs along as few blocked grid edges as it can
+  (not always the fewest boxes) and lists every box it enters. A search over
+  its 50,000-node budget is `routing_budget_exceeded`. Both kinds are
+  category `geometry`. `pid_from_spec` takes `sheet.routing: "auto"|"avoid"`
+  (default `auto`, so no geometry moves); its dry run routes over the
+  catalogue boxes with the same router, so the preview's vertices are the
+  applied ones. Every route of either tool reports `obstacle_hits: [{handle,
+  tag}]` and `label_hits` for a line-number label that overlaps a symbol
+  (reported, never moved; `pid_from_spec` reports it on apply).
+- **The `pid_line_through_symbol` focus (1.8-20).** A P&ID line segment that
+  enters the box of a symbol which is not its end is an error; it runs under
+  `focus=None` and inside `drawing_finalize` and is silent without P&ID
+  symbols (`domain_absent`). Seven `pid_*` focuses now.
+- **`pid_project` (1.8-21, pack `pid`).** `pid_project(action="check"|"index",
+  sheets=None, manifest=None, write=None, include_current=True)` reads every
+  sheet of a P&ID project with the `pid_graph` reader and never modifies a
+  drawing (manifest `{project, sheets: [{path, number, title}]}`). `check`
+  returns `links` per LINK id (`matched` / `orphan` / `direction_mismatch` /
+  `duplicate`, each connector with its sheet and handle), cross-sheet
+  `duplicate_tags` (a continuation connector's TAG never counts) and
+  `line_continuity` (the line number on both sides of every matched off-page
+  pair), plus `summary` and `clean`; `index` returns the instrument index,
+  line list and equipment list merged with a `sheet` column. Sheet files are
+  read on a private, pathless headless engine and cached by sha256; a
+  `.dwg` sheet is read only on the live engine (opened read-only, exported,
+  closed) and refused headlessly with capability `dwg`; the active document
+  is read as it stands and replaces its own file when listed. More than 50
+  sheets are refused `invalid_args` by name, and a missing sheet file
+  `file_not_found`, before anything is read. `write=` (`.json` / `.csv` /
+  `.xlsx`) is the only file written; `.xlsx` without openpyxl is refused with
+  `xlsx_write`. Cost `safe`, so `READ_ONLY` hides it. New resource
+  **`autocad://pid/project/last`**: the last result of this server process,
+  or `available: false`.
+- **The B40 double-entry pipeline (1.8-22).** Rows for DIN 471/472, DIN 509
+  (forms E / F), DIN 332-1 (A / B) and ISO 3601-2 are typed twice into
+  `engineering/mech/standards/data/<std>.a.json` and `.b.json`, and
+  `scripts/build_standards.py` generates `engineering/mech/standards/_rows.py`
+  from them. The build refuses any disagreement between the entries by path,
+  a filled table without two different named people (`TRANSCRIBED_BY` /
+  `CHECKED_BY`) or a complete `ROW_SOURCE` (edition, table, page), an
+  edition other than the one the module's `SOURCE` names, and a broken
+  physical invariant (DIN 471 d2 < d1 with m non-decreasing, DIN 472 d2 > d1,
+  DIN 509 depth > 0 and a monotone profile, DIN 332 d2 > d1 and t > 0, O-ring
+  h < cord and b > cord); `--check` fails while `_rows.py` and the data
+  disagree. **No row is transcribed in 1.8.0** (see *Not in 1.8.0*).
+- **Headless DWG read (K1, `backends/dwg_read.py`).** `drawing_open` on a
+  `.dwg` converts it to DXF through the ODA File Converter, then AutoCAD's
+  `accoreconsole.exe` (`ACCORECONSOLE_PATH`: unset means AutoCAD 2026's
+  installed console when it exists, `off` disables the route;
+  `ACCORECONSOLE_TIMEOUT_S`, default 60 s, kept inside `EZDXF_CALL_TIMEOUT`).
+  The result carries `dwg_read {route, seconds, exit_code, log,
+  dxf_version}`; a route that fails falls through to the next, and a success
+  after a failed one reports `failed_routes`. The console writes DXF 2018
+  (AC1032). It runs on a copy in an ASCII staging folder under
+  `<ACADMCP_STATE_DIR>/accore`, from a script of only generated `_`-prefixed
+  commands - nothing from the caller enters the script or the command line -
+  with its UTF-16LE log read back and its process tree killed on an overrun;
+  the folder is removed on every path and stale ones are swept after an
+  hour. The opened document keeps its `.dwg` path, so a save onto it is
+  still refused (`dwg`); save it as `.dxf`. `recover=True` on a `.dwg` stays
+  `recover_unsupported`. Capability `dwg_read` in both maps: ezdxf per call
+  `odafc` | `accoreconsole` | unsupported, COM native. New error kind
+  `dwg_conversion_failed` (category `dependency`, not retryable, record
+  `refused`) with `attempts[]` (route, reason, exit code, `timed_out`, log
+  tail).
+- **ADR 0001, the native .NET worker (1.8-24).** `docs/adr/` (index in
+  `docs/adr/README.md`) holds the architecture decisions;
+  `docs/adr/0001-native-worker.md` defers the worker to 1.9.0 under a rule
+  fixed before any measurement (see *Not in 1.8.0*). It records no
+  measurement.
+- **`benchmarks/perf_com.py` (1.8-23).** Measures the live engine against a
+  v1.7.0 checkout (`--base`), each side in its own child process, one untimed
+  warm-up per workload, on a document seeded with 5,000 lines:
+  `create_circle_singles`, `batch_create_200`, `delete_singles_200`,
+  `delete_many_200`, `cad_batch_50`, `fillet_50_n5000` and
+  `fillet_50_n10000`. Its targets were fixed before the run: the bulk tools
+  at least 5× faster than v1.7.0's 200 singles, the single
+  `entity_create_circle` median at least 30 % lower, and `entity_fillet` at
+  10,000 lines at most 1.2× its time at 5,000.
+  `benchmarks/results/live/perf_com.json` is the `--pending` skeleton
+  (`status: "pending"`, every verdict `pass: null`) until that run.
+- **Matrix v9, W3 tasks:** `pid_project_offpage` (three sheet files: one
+  orphan, one direction mismatch, one cross-sheet duplicate tag and one
+  line-number mismatch, each once with sheet and handle; a missing sheet and
+  51 sheets refused by name), `std_tables_b40` (one size per filled B40
+  table, a between-rows size refused by name; with no table filled it is
+  `not_run` naming the deferred tables, never a pass),
+  `dwg_headless_roundtrip` (the bundled `templates/iso_a3_mech.dwt` under a
+  `.dwg` name opened through a converter and saved as DXF with its DXF twin's
+  layers, blocks and entity counts; no converter: `environment_blocked`),
+  `parametric_revise_keeps_handles` (a dimensioned three-view flange revised
+  in one call, in-place handles kept, signatures equal to a fresh draw; its
+  twin `revise_hand_edit_refused` is checked inside the task) and
+  `pid_routing_obstacles` (zero `pid_line_through_symbol` and dangling ends
+  with `sheet.routing: "avoid"`; a walled-in pump refused `no_route` naming
+  the four vessels). v9 holds 44 tasks; `pid_roundtrip` (v4) is pinned to
+  `sheet.routing: "auto"`.
+- **Four W3 correctness checks:** `pid_project_links` and
+  `pid_avoid_no_symbol_crossing` (P&ID), `b40_between_rows_refused` and
+  `mech_revise_keeps_handles` (Mechanical): 79 → 83 checks.
+  `b40_between_rows_refused` proves the pipeline on a synthetic double entry
+  (round numbers, not DIN values) and every empty table's refusal by name.
+- **Environment variables:** `ACCORECONSOLE_PATH` (unset: AutoCAD 2026's
+  console when installed; `off`), `ACCORECONSOLE_TIMEOUT_S` (60),
+  `COM_REFRESH_UPDATE_MAX` (1, minimum 0), `COM_REFRESH_MODE` (`auto` |
+  `regen`, default `auto`; an unknown value falls back to `auto` with a
+  warning).
+
+### W3: Changed
+
+- **Part payloads drawn by 1.8.0 carry `gen` and a per-view `sha`
+  (1.8-19)**; `mech_view_add` records its `gap` and `mech_dimension_part`
+  each view's `dim` settings, which is what a revision re-places.
+- **ISO 3601-2 is two tables (1.8-22),** keyed by cord diameter with their
+  own coverage: radial static (`ISO 3601-2`, the unchanged name
+  `std_feature_draw` uses) and axial (`ISO 3601-2-axial`);
+  `oring_groove_dims(cord, kind)` reads the table of its kind.
+  `autocad://standards/coverage` lists the axial table ("no rows
+  transcribed"). DIN 509 rows are r, t1, f, g (t2 for form F), and
+  `undercuts.profile_from_dims` builds the relief profile from them by a
+  documented construction that refuses anything else by name. DIN 471 and
+  DIN 472 have their own `SOURCE` lines.
+- **One display refresh per COM job (1.8-23).** A live path records a
+  refresh with `_regen(<the entity it wrote>)`; the job flushes once in its
+  `finally` (`_flush_refresh`, also after a failure): `Update()` on the last
+  entity when the job asked at most `COM_REFRESH_UPDATE_MAX` times and every
+  request named an entity, otherwise one `Regen(acActiveViewport)`.
+  `COM_REFRESH_UPDATE_MAX` defaults to 1 while spike S4 (does `Update()` of
+  the last entity paint the earlier ones?) is unmeasured, so a single create
+  is one `Update()` and anything more one Regen; `COM_REFRESH_MODE=regen` is
+  the fallback for a graphics setup where `Update()` does not paint.
+- **`entity_batch_create` and `entity_delete_many` are contract methods
+  (1.8-23).** Headless they are the 1.7 server loops (results unchanged; a
+  non-string `type` is now an `Unknown type` row instead of a crash). On a
+  live seat each runs in as few STA jobs as `COM_CALL_TIMEOUT` allows: a job
+  takes items until it has spent a quarter of the deadline (at least one
+  item each), with one bound-document guard, one operator-counter begin /
+  end and one refresh per job; a list that fits is one job, and the call is
+  one revision step (both are in `_MUTATING_METHODS`, 103 -> 105). Each
+  item's error row carries its kind (`unknown_handle`, `invalid_args` for a
+  spec refused before anything was drawn); a lost connection ends the call.
+  A bulk call can be cancelled between jobs, not inside one. The tool-level
+  rules are unchanged: `entity_delete_many` is still pre-checked and all or
+  nothing (1.8-09), `entity_batch_create` leaves earlier items written when
+  one fails (atomicity is `cad_batch`'s).
+- **Corner operations read only the target block (1.8-23).** `entity_trim` /
+  `entity_extend` / `entity_fillet` / `entity_chamfer` pass `owner=` to
+  `_safe_send_command`, which reads that block's count and last handle
+  before the command and its new tail after, so their cost no longer grows
+  with the drawing; a paper-layout target also reads model space's tail, so
+  an entity written there is still `created_outside_target_space`.
+  `system_run_command` reads each layout block from its end.
+- **Long descriptions are listed short, the whole text one call away (W3
+  token ceiling).** `discovery/descriptions.py` lists a tool description over
+  800 characters as its leading whole paragraphs plus `Details:
+  describe_tool.` (47 of 257 tools) on the full catalog, `TOOL_PROFILE=lean`
+  and every `TOOL_PACKS` surface; the registered tool keeps its docstring and
+  `describe_tool` returns it whole. `DISCOVERY_MODE=off` now lists
+  `describe_tool` as well (`DetailsTransform`), so the pointer leads somewhere
+  on every surface; search mode is byte-identical and is indexed on the full
+  text. `lean` (16,182 prompt tokens) and `packs_core` (40,722) meet their
+  ceilings and flip to `ci`; the default `off` surface is 59,138.
+- **`drawing_finalize`'s docstring and the P&ID prompt template name
+  `pid_line_through_symbol` (1.8-20);** the prompt's step 5 routes with
+  `route="avoid"` and expects `obstacle_hits` empty.
+
+### W3: Breaking - migration table
+
+| Change | 1.7.0 | 1.8.0 | Old behaviour |
+|---|---|---|---|
+| Headless `drawing_open` of a `.dwg` (K1) | a `ToolError` sentence | converted through ODA, then accoreconsole; no converter: a typed capability refusal (kind `unsupported`, capability `dwg_read`, naming both converters); every route failed: `dwg_conversion_failed` with `attempts[]` | `ACCORECONSOLE_PATH=off` (and no ODA) keeps the refusal |
+| Live display refresh (1.8-23) | a Regen after each created entity | one refresh per COM job: `Update()` of the entity for a single create, one `Regen` for anything more | `COM_REFRESH_MODE=regen` (one Regen per job); there is no per-entity mode |
+| Live `entity_batch_create` / `entity_delete_many` (1.8-23) | one STA job and one revision step per item, each item its own `COM_CALL_TIMEOUT` | jobs sliced at a quarter of `COM_CALL_TIMEOUT`, one revision step per call, cancellable only between jobs | — |
+| `drawing_critique(focus=None)` on a part drawn before 1.8.0 (1.8-19) | no such focus | one `model_drift` info issue (`unstamped`) per part, so "zero issues" needs the part revised | `mech_part_revise(part_id, changes, overwrite=True)` redraws it with the 1.8.0 stamp (`changes` may not be empty; restating a current value is accepted and recorded as a no-op pair) |
+
 ## [1.7.0] — 2026-10-26
 
 1.6 taught the server to draw whole sheets and to read other people's

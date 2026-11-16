@@ -378,6 +378,57 @@ async def test_another_com_error_is_not_retried(seat, tmp_path):
     assert any(row["status"] == "error" for row in result["checks"])
 
 
+def _writes_then_refused(fake, attempts: list[int]):
+    """A job that held the Application, wrote, then had a later call refused once."""
+
+    def job():
+        cb._acad_app()
+        fake.added[0].SetVariable("USERI1", len(attempts))
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise com_error(RPC_E_CALL_REJECTED, "Call was rejected by callee.", None, None)
+        return "done"
+
+    return job
+
+
+@pytest.mark.asyncio
+async def test_a_mutating_job_refused_after_it_wrote_is_not_run_twice(seat, tmp_path):
+    """Live smoke ``arch`` (AutoCAD 2026, 2026-11-04): a whole-job retry of a
+    write whose later call was refused drew a LINE twice. Inside a ``_mutating``
+    call, a job that held the Application is not retried."""
+    fake, client = seat
+    attempts: list[int] = []
+
+    async def body(h):
+        await h.new_document()
+        token = cb._MUTATION_PROBE.set({"reached": False})
+        try:
+            await h.backend._run(_writes_then_refused(fake, attempts))
+        finally:
+            cb._MUTATION_PROBE.reset(token)
+
+    code, result = await _run(body, client, tmp_path)
+    assert code == 1 and result["summary"]["rpc_retries"] == 0
+    assert attempts == [1], "the write ran once"
+    assert fake.added[0].writes == [("USERI1", 0)]
+
+
+@pytest.mark.asyncio
+async def test_a_read_refused_mid_job_is_still_retried(seat, tmp_path):
+    fake, client = seat
+    attempts: list[int] = []
+
+    async def body(h):
+        await h.new_document()
+        value = await h.backend._run(_writes_then_refused(fake, attempts))
+        h.check("the job ran again", value == "done")
+
+    code, result = await _run(body, client, tmp_path)
+    assert code == 0, result
+    assert result["summary"]["rpc_retries"] == 1 and len(attempts) == 2
+
+
 @pytest.mark.asyncio
 async def test_a_seat_that_keeps_rejecting_gives_up_after_its_patience(seat, tmp_path):
     fake, client = seat
@@ -492,6 +543,10 @@ SMOKES = (
     "smoke_verify_com.py",
     "smoke_document_com.py",
     "smoke_operator_edits_com.py",
+    "smoke_render_com.py",
+    "smoke_edit_com.py",
+    "smoke_lisp_com.py",
+    "smoke_durability_com.py",
 )
 
 
@@ -513,6 +568,15 @@ def test_every_smoke_runs_on_the_harness(name):
     assert callable(module.body) and callable(module.assess)
 
 
+_AVOID_CLEAN = {
+    "auto_handle": "2A",
+    "auto_hits": ["V-301"],
+    "avoid_hits": [],
+    "avoid_vertices": [[8.0, -220.0], [20.0, -220.0], [20.0, -240.0], [147.0, -240.0]],
+    "through": ["2A"],
+}
+
+
 def _pid_report(**overrides):
     report = {
         "graph_stats": {
@@ -526,6 +590,8 @@ def _pid_report(**overrides):
         "handles": {"P-101": "1A", "V-201": "1B", "FCV-101": "1C", "FIC-101": "1D", "OP-1": "1E"},
         "critique": [],
         "xdata_chunks": 3,
+        # 1.8-20: the auto control line hits the vessel, the avoid line does not.
+        "avoid": _AVOID_CLEAN,
     }
     report["reference_stats"] = dict(report["graph_stats"])
     for key, value in overrides.items():
@@ -545,6 +611,9 @@ def _pid_report(**overrides):
         {"unclassified": 1},
         {"handles": {"P-101": "1A"}},
         {"edges_by_class": {"process_major": 3}},
+        {"avoid": {**_AVOID_CLEAN, "avoid_hits": ["V-301"]}},
+        {"avoid": {**_AVOID_CLEAN, "auto_hits": []}},
+        {"avoid": {**_AVOID_CLEAN, "through": ["2A", "2F"]}},
     ],
 )
 def test_the_pid_smoke_fails_on_more_than_a_dangling_end(overrides):

@@ -42,11 +42,10 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from fastmcp import Client
-from fastmcp.exceptions import ToolError
 from fastmcp.server.transforms import Transform
 
 import server
-from backends.base import CapabilityMap, FeatureCapability
+from backends.base import CapabilityMap, FeatureCapability, UnsupportedCapabilityError
 from discovery.aliases import aliases_for
 from discovery.serialize import MAX_SUMMARY_CHARS
 
@@ -119,6 +118,10 @@ async def test_tool_groups_unaffected_by_a_transform(truncating_transform):
     # leave a single "drawing" bucket.
     assert len(groups) > 5
     assert groups["transactions"] == [
+        "checkpoint_create",
+        "checkpoint_list",
+        "checkpoint_restore",
+        "drawing_history",
         "transaction_begin",
         "transaction_commit",
         "transaction_rollback",
@@ -201,14 +204,19 @@ async def test_drawing_open_refuses_a_dwg_the_backend_cannot_read(backend, tmp_p
     file (exactly what pre-1.5.0 drawing_save produced) and the tool then
     answers ``{"ok": True, "name": "part.dwg"}`` — a document that does not
     exist in that format.
+
+    K1 (1.8.0): with no DWG converter (conftest switches accoreconsole off,
+    and no ODA File Converter is installed) it is a ``dwg_read`` capability
+    refusal - the typed boundary, not a ToolError sentence.
     """
     dxf = await _saved_dxf(backend, tmp_path)
     disguised = tmp_path / "part.dwg"
     shutil.copy(dxf, disguised)
 
-    with pytest.raises(ToolError) as excinfo:
+    with pytest.raises(UnsupportedCapabilityError) as excinfo:
         await server.drawing_open(str(disguised), ctx=_Ctx(backend))
 
+    assert excinfo.value.capability == "dwg_read"
     message = str(excinfo.value).lower()
     assert "dwg" in message
     # Blames the backend's missing capability and names the escape hatch,
@@ -221,7 +229,7 @@ async def test_drawing_open_refuses_a_real_dwg_without_leaking_a_parser_error(ba
     real_dwg = tmp_path / "real.dwg"
     real_dwg.write_bytes(b"AC1032" + b"\x00" * 256)
 
-    with pytest.raises(ToolError) as excinfo:
+    with pytest.raises(UnsupportedCapabilityError) as excinfo:
         await server.drawing_open(str(real_dwg), ctx=_Ctx(backend))
 
     assert "is not a DXF file" not in str(excinfo.value)
@@ -234,7 +242,7 @@ async def test_drawing_open_refusal_leaves_the_current_document_untouched(backen
 
     disguised = tmp_path / "other.dwg"
     shutil.copy(dxf, disguised)
-    with pytest.raises(ToolError):
+    with pytest.raises(UnsupportedCapabilityError):
         await server.drawing_open(str(disguised), ctx=ctx)
 
     info = await backend.drawing_info()
@@ -298,22 +306,29 @@ async def test_cad_tool_publishes_discovery_meta(name):
 
 
 @pytest.mark.parametrize("name", CAD_TOOL_SECTION)
-async def test_cad_tool_pulls_aliases_from_the_discovery_corpus(name):
-    """The corpus is the single source of truth; server.py must not restate it."""
+async def test_cad_tool_leaves_the_aliases_in_the_discovery_corpus(name):
+    """1.8-14: the card is {summary, cost}; acad/synonyms stay in the corpus.
+
+    The corpus is the single source of truth, read by the ranker,
+    describe_tool and the inventory generator through aliases_for - never
+    copied onto every tools/list entry.
+    """
     record = aliases_for(name)
     cad = (_component(name).meta or {})["cad"]
-    assert cad["acad"] == list(record.acad)
-    assert cad["synonyms"] == list(record.synonyms)
-    assert cad["synonyms"], "the transaction tools do carry synonyms"
+    assert set(cad) == {"summary", "cost"}
+    assert record.synonyms, "the transaction tools do carry synonyms"
 
 
-async def test_cad_tool_meta_reaches_the_wire(monkeypatch):
+async def test_cad_tool_meta_reaches_the_wire(full_catalog, monkeypatch):
     monkeypatch.setenv("AUTOCAD_MCP_BACKEND", "ezdxf")
     async with Client(server.mcp) as client:
         tools = {tool.name: tool for tool in await client.list_tools()}
     cad = tools["transaction_rollback"].meta["cad"]
-    assert cad["cost"] == "destructive"
-    assert "rollback" in cad["synonyms"]
+    assert cad == {
+        "summary": (_component("transaction_rollback").meta or {})["cad"]["summary"],
+        "cost": "destructive",
+    }
+    assert "rollback" in aliases_for("transaction_rollback").synonyms
 
 
 async def test_cad_tool_rejects_an_unknown_cost():
@@ -418,17 +433,19 @@ async def test_only_the_raw_passthroughs_are_costed_escape():
     assert escapes == ["system_run_command", "system_run_lisp"]
 
 
-async def test_no_tool_restates_its_aliases_in_server_py():
-    """@cad_tool copies the corpus; server.py must never hand-write acad/synonyms."""
-    bad: list[str] = []
-    for tool in await server._registered_tools():
-        cad = _cad(tool) or {}
-        record = aliases_for(tool.name)
-        expected_acad = list(record.acad) if record else []
-        expected_synonyms = list(record.synonyms) if record else []
-        if cad.get("acad") != expected_acad or cad.get("synonyms") != expected_synonyms:
-            bad.append(tool.name)
-    assert not bad, f"cad metadata out of step with discovery.aliases: {bad}"
+async def test_no_tool_carries_its_aliases_in_the_meta_card():
+    """1.8-14: the card is {summary, cost} on every tool - no acad/synonyms copy.
+
+    The aliases cost every full-catalog client tokens on each tools/list and
+    only a search reads them; describe_tool and docs/tool-inventory.json carry
+    them from discovery.aliases instead.
+    """
+    bad = sorted(
+        tool.name
+        for tool in await server._registered_tools()
+        if set(_cad(tool) or {}) != {"summary", "cost"}
+    )
+    assert not bad, f"cad cards with keys beyond summary/cost: {bad}"
 
 
 # ── tags are load-bearing: _tool_groups() feeds system_about ────────────────
@@ -495,7 +512,7 @@ async def test_tool_groups_is_byte_identical_to_the_source_declared_grouping():
 
 
 async def test_tool_group_sizes_are_unchanged():
-    """Frozen snapshot of the surface (248 tools, 28 groups).
+    """Frozen snapshot of the surface (251 tools, 28 groups).
 
     Taken before @cad_tool landed at 131 tools; `batch` moved 2 -> 3 when
     v1.5.0's `cad_batch` joined `entity_batch_create`/`entity_batch_modify`, and
@@ -606,6 +623,18 @@ async def test_tool_group_sizes_are_unchanged():
     (B22: requirements measured on the CAD geometry, pass / fail / unknown with
     the evidence) joined SECTION 26. It is tagged `understand` first, which
     outranks its `analysis` and `validation` tags, so it files there.
+
+    v1.8.0's 1.8-12 adds `entity_modify_where` to `entity_modification` (16 ->
+    17) and `layer_rename` / `layer_merge` to `layers` (14 -> 16): 251 tools.
+    1.8-21 adds `pid_project` (the read-only multi-sheet P&ID check) to `pid`
+    (9 -> 10): 252. 1.8-19 adds `mech_part_revise` to `mechanical` (14 -> 15):
+    253 tools.
+
+    `transactions` moved 3 -> 6 when 1.8.0's durable checkpoints
+    (`checkpoint_create` / `checkpoint_list` / `checkpoint_restore`, 1.8-08)
+    joined SECTION 10, tagged `transaction` beside the rollback tools, and 6 -> 7
+    when `drawing_history` (1.8-10, the journal read as a value history) joined
+    them, tagged `transaction` too: 257 tools.
     """
     sizes = {label: len(names) for label, names in (await server._tool_groups()).items()}
     assert sizes == {
@@ -618,14 +647,14 @@ async def test_tool_group_sizes_are_unchanged():
         "drawing": 11,
         "engineering": 10,
         "entity_creation": 18,
-        "entity_modification": 16,
+        "entity_modification": 17,  # + entity_modify_where (1.8-12)
         "entity_query": 9,
         "environment": 22,
-        "layers": 14,
+        "layers": 16,  # + layer_rename, layer_merge (1.8-12)
         "layouts": 12,
-        "mechanical": 14,
+        "mechanical": 15,  # + mech_part_revise (1.8-19)
         "page_setup": 6,
-        "pid": 9,
+        "pid": 10,  # + pid_project (1.8-21)
         "plant": 2,
         "premium": 12,
         "sheet": 11,
@@ -633,9 +662,9 @@ async def test_tool_group_sizes_are_unchanged():
         "styles": 10,
         "system": 7,
         "templates": 2,
-        "transactions": 3,
+        "transactions": 7,
         "understanding": 5,
         "validation": 1,
         "view": 4,
     }
-    assert sum(sizes.values()) == 248
+    assert sum(sizes.values()) == 257

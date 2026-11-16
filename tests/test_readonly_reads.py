@@ -30,6 +30,7 @@ pytestmark = pytest.mark.asyncio
 #: headless engine refuses by capability. Each is a reason, not a convenience.
 NO_DOCUMENT_READ = {
     "system_status": "process state, answered without the lock on purpose",
+    "drawing_history": "the durable journal (detail='row'); only detail='changes' reads a drawing",
     "system_capabilities": "the engine's capability map",
     "system_about": "the server's own surface",
     "system_variable_describe": "the static SYSVAR_CATALOG",
@@ -67,7 +68,9 @@ async def _handle(client, tool: str, args: dict) -> str:
     return data.get("handle") or data.get("result", {}).get("handle")
 
 
-async def test_every_read_cost_tool_reaches_the_engine_readonly(client, monkeypatch, tmp_path):
+async def test_every_read_cost_tool_reaches_the_engine_readonly(
+    full_catalog, client, monkeypatch, tmp_path
+):
     calls: list[tuple[str, str, bool]] = []
     current = {"tool": "setup"}
     real_async = ezdxf_backend.EzdxfBackend._async

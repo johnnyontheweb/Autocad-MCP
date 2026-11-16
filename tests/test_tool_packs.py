@@ -26,6 +26,12 @@ Lean gains `drawing_understand` and reaches 65.
 
 v1.7.0 adds `drawing_verify_requirements` to SECTION 26 (core) and to lean,
 which reaches 66 (56 with TOOL_PACKS=core).
+
+v1.8.0 (1.8-12) adds `entity_modify_where` (core) to lean: 67 (57 with
+TOOL_PACKS=core).
+
+v1.8.0 (1.8-19) adds `mech_part_revise` to the `mech` pack (15 tools); it is
+not a lean tool, so lean is unchanged.
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ PID_TOOLS = {
     "pid_line_list",
     "pid_equipment_list",
     "pid_from_spec",
+    "pid_project",  # 1.8-21
 }
 
 STYLE_TOOLS = {
@@ -104,6 +111,7 @@ MECH_TOOLS = {
     "mech_hole_pattern",
     "mech_part_from_spec",
     "mech_part_inspect",
+    "mech_part_revise",
     "std_part_list",
     "std_part_insert",
     "std_feature_draw",
@@ -202,7 +210,7 @@ def test_pack_registry_names_real_tools_and_only_them():
     assert server.PACK_TOOL_NAMES["arch"] == frozenset(ARCH_TOOLS)
     assert server.PACK_TOOL_NAMES["plant"] == frozenset(PLANT_TOOLS)
     assert len(SETTINGS_TOOLS) == 22
-    assert len(MECH_TOOLS) == 14
+    assert len(MECH_TOOLS) == 15  # + mech_part_revise (1.8-19)
     assert len(ARCH_TOOLS) == 12
     assert len(PLANT_TOOLS) == 2
     assert not (server.PACK_TOOL_NAMES["settings"] & server.PACK_TOOL_NAMES["pid"])
@@ -317,14 +325,14 @@ async def test_lean_carries_the_five_settings_essentials_and_nothing_from_the_se
     assert server.LEAN_TOOL_NAMES & UNDERSTAND_TOOLS == LEAN_UNDERSTAND_ESSENTIALS
     assert not (PLANT_TOOLS & server.LEAN_TOOL_NAMES)
     assert not (SETTINGS_TOOLS & server.LEAN_TOOL_NAMES)
-    assert len(server.LEAN_TOOL_NAMES) == 66
+    assert len(server.LEAN_TOOL_NAMES) == 67  # + entity_modify_where (1.8-12)
     monkeypatch.setattr(config.settings, "tool_packs", "core")
     info = await server._apply_tool_profile("lean")
     disabled = set(info["disabled_tools"])
     assert not (LEAN_SETTINGS_ESSENTIALS & disabled)
     assert not ({"sheet_frame", "titleblock_apply"} & disabled), "sheet tools are core"
     assert "drawing_understand" not in disabled, "the one-call report is core"
-    assert info["enabled_count"] == 66 - 10, (
+    assert info["enabled_count"] == 67 - 10, (
         "lean minus the three pid, three mech and four arch tools"
     )
 

@@ -6,7 +6,9 @@ non-blocking use in the FastMCP async context.
 
 DXF only: ezdxf has no DWG writer, so every save path that would put DXF bytes
 behind a ``.dwg`` name refuses instead (capability ``dwg``). Real DWG I/O needs
-the live COM backend.
+the live COM backend; ``drawing_open`` reads a DWG by converting it to DXF
+first, through the ODA File Converter or AutoCAD's accoreconsole (capability
+``dwg_read``, ``backends/dwg_read.py``, K1).
 """
 
 from __future__ import annotations
@@ -29,8 +31,10 @@ from typing import Any
 
 import config
 from engineering import measure
+from engineering.errors import DimensionRenderError, EntityNotFoundError
 
-from . import ocs
+from . import dwg_read, lineage, ocs
+from .atomic_write import atomic_write_dxf, file_sha256, resolve_pending
 from .base import (
     AutoCADBackend,
     BlockInfo,
@@ -41,9 +45,11 @@ from .base import (
     LayerInfo,
     UnsupportedCapabilityError,
     _unsupported,
-    normalize_lineweight,
+    lineweight_name,
+    parse_lineweight,
     shoelace_area,
 )
+from .change_sets import EzdxfChangeSets
 from .contracts.entity_modification import TEXT_SEARCH_SCOPE
 from .contracts.settings import (
     SUMMARY_FIELDS,
@@ -52,13 +58,16 @@ from .contracts.settings import (
     scale_value,
     validate_drawing_properties,
 )
+from .dxf_recover import read_dxf, recover_dxf, recovered_source_refusal
 from .entity_fields import (
+    DIMTYPE_NAMES,
     dimension_fields,
     dimension_props,
     hatch_loops,
     hatch_props,
     nesting_depths,
 )
+from .ezdxf_checkpoints import EzdxfCheckpoints
 from .operations import CURRENT_OPERATION
 from .quarantine import (
     AbandonedCall,
@@ -70,6 +79,15 @@ from .quarantine import (
     is_marked_readonly,
     quarantine_refusal,
     real_call_name,
+)
+from .region_render import DEFAULT_MAX_PX, check_max_px, normalize_region, render_layout
+from .vertices import (
+    edit_geometry_route,
+    prepare_bulges,
+    prepare_points,
+    prepare_position,
+    prepare_vertices,
+    resolved_bulges,
 )
 from .xdata_specs import prepare_xdata
 
@@ -1085,6 +1103,190 @@ def _dimensions_using(doc, style_name: str) -> list[str]:
     return handles
 
 
+#: DXF group 70 bit: the dimension text sits where its author put it.
+_DIMTYPE_USER_TEXT = 128
+
+
+def _dimension_geometry_counts(doc) -> collections.Counter:
+    """How many DIMENSIONs (any layout, any block) reference each ``*D`` block."""
+    counts: collections.Counter = collections.Counter()
+    for entity in doc.entitydb.values():
+        if entity.is_alive and entity.dxftype() == "DIMENSION":
+            name = entity.dxf.get("geometry")
+            if name:
+                counts[str(name)] += 1
+    return counts
+
+
+def _text_inserts(block) -> list:
+    return [e for e in block if e.dxftype() in ("MTEXT", "TEXT")] if block is not None else []
+
+
+#: DXF attributes a staged redraw never rewrites, so never restores.
+_DIM_FIXED_ATTRIBS = frozenset({"handle", "owner"})
+
+
+def _render_override(ent):
+    """The DIMENSION's ``DimStyleOverride``, neutralised for ezdxf's renderer.
+
+    On this render only - the entity's DSTYLE override is not rewritten
+    (``renderer.render`` / ``finalize`` never commit it; only
+    ``DimStyleOverride.render`` does):
+
+    * ``DIMRND`` stored as 0 means "no rounding" (AutoCAD); ezdxf's renderer
+      would round to an integer.
+    * ``DIMPOST`` without ``<>`` is a suffix in AutoCAD (and in
+      ``engineering/dimtext.py``); ezdxf raises ``DXFValueError('Invalid
+      dimpost string')`` on it, so it renders as ``<>`` + the suffix. Braces
+      are doubled because ezdxf substitutes the value with ``str.format``.
+    """
+    from ezdxf.entities import DimStyleOverride
+
+    override = DimStyleOverride(ent)
+    stored_rnd = override.get("dimrnd", None)
+    if stored_rnd is not None and not float(stored_rnd):
+        override.dimstyle_attribs["dimrnd"] = None
+    post = override.get("dimpost", None)
+    if post:
+        post = str(post)
+        escaped = post.replace("{", "{{").replace("}", "}}")
+        override.dimstyle_attribs["dimpost"] = escaped if "<>" in post else "<>" + escaped
+    return override
+
+
+def _stage_rerender(doc, ent, *, force: bool) -> dict:
+    """Draw one DIMENSION's new ``*D`` block and point the entity at it (1.8-15).
+
+    * Group 42 (``actual_measurement``) is written with the measurement the
+      new block shows (an angle in radians, as AutoCAD stores it).
+    * A text its author placed (group 70 bit 128) stays where it was: the new
+      block's text is moved back onto the old position and ``text_midpoint``
+      restored - unless ``force``, which lets the renderer place it.
+
+    The old block is left in place: :func:`_commit_rerender` deletes it,
+    :func:`_revert_rerender` points the entity back at it. A render that raises
+    is reverted here before the exception leaves.
+    """
+    dxf = ent.dxf
+    old_name = dxf.get("geometry")
+    old_block = doc.blocks.get(old_name) if old_name else None
+    user_text = bool(int(dxf.get("dimtype", 0)) & _DIMTYPE_USER_TEXT)
+    keep_text = user_text and not force
+    old_texts = [t.dxf.insert for t in _text_inserts(old_block)]
+    old_midpoint = dxf.get("text_midpoint")
+    staged = {
+        "entity": ent,
+        "old_name": old_name,
+        "new_name": None,
+        "attribs": {k: v for k, v in ent.dxfattribs().items() if k not in _DIM_FIXED_ATTRIBS},
+        "mode": "full",
+    }
+    try:
+        renderer = _render_override(ent).get_renderer(None)
+        block = doc.blocks.new_anonymous_block(type_char="D")
+        staged["new_name"] = block.name
+        dxf.geometry = block.name
+        renderer.render(block)
+        renderer.finalize()
+
+        new_texts = _text_inserts(block)
+        if keep_text and old_texts and len(old_texts) == len(new_texts):
+            delta = old_texts[0] - new_texts[0].dxf.insert
+            for text in new_texts:
+                text.translate(delta.x, delta.y, delta.z)
+            if old_midpoint is not None:
+                dxf.text_midpoint = old_midpoint
+            staged["mode"] = "text_kept"
+
+        try:
+            measured = ent.get_measurement()
+            if isinstance(measured, (int, float)):
+                value = float(measured)
+                if (int(dxf.get("dimtype", 0)) & 0x0F) in (2, 5):
+                    value = math.radians(value)
+                dxf.actual_measurement = value
+        except Exception:  # noqa: BLE001 - an ordinate measures no scalar; group 42 stays
+            pass
+    except Exception:
+        _revert_rerender(doc, staged)
+        raise
+    return staged
+
+
+def _revert_rerender(doc, staged: dict) -> None:
+    """Undo :func:`_stage_rerender`: every DXF attribute back, the new block gone."""
+    ent = staged["entity"]
+    saved = staged["attribs"]
+    for name in list(ent.dxfattribs()):
+        if name not in saved and name not in _DIM_FIXED_ATTRIBS:
+            ent.dxf.discard(name)
+    for name, value in saved.items():
+        ent.dxf.set(name, value)
+    new_name = staged["new_name"]
+    if new_name and doc.blocks.get(new_name) is not None:
+        doc.blocks.delete_block(new_name, safe=False)
+
+
+def _commit_rerender(doc, staged: dict, references: collections.Counter) -> dict:
+    """Delete the old ``*D`` block once no other DIMENSION references it
+    (``references`` is the caller's running count; a copied dimension may share
+    its block). Returns ``{handle, mode}`` (``full`` / ``text_kept``)."""
+    old_name, new_name = staged["old_name"], staged["new_name"]
+    if old_name and old_name != new_name:
+        references[str(old_name)] -= 1
+        if references[str(old_name)] <= 0 and doc.blocks.get(old_name) is not None:
+            doc.blocks.delete_block(old_name, safe=False)
+    references[new_name] += 1
+    return {"handle": str(staged["entity"].dxf.handle), "mode": staged["mode"]}
+
+
+def _dimension_checkpoint(doc, ent):
+    """A restore function for one DIMENSION about to be edited and redrawn.
+
+    It puts back every DXF attribute and the content of its current ``*D``
+    block (a transform moves that content in place). An edit that is followed
+    by a redraw the renderer refuses (:class:`DimensionRenderError`) calls it,
+    so the tool fails with the drawing as it was, never half-changed.
+    """
+    saved = {k: v for k, v in ent.dxfattribs().items() if k not in _DIM_FIXED_ATTRIBS}
+    name = ent.dxf.get("geometry")
+    block = doc.blocks.get(name) if name else None
+    content = [e.copy() for e in block] if block is not None else None
+
+    def restore() -> None:
+        for attr in list(ent.dxfattribs()):
+            if attr not in saved and attr not in _DIM_FIXED_ATTRIBS:
+                ent.dxf.discard(attr)
+        for attr, value in saved.items():
+            ent.dxf.set(attr, value)
+        if content is not None and doc.blocks.get(name) is not None:
+            target = doc.blocks.get(name)
+            target.delete_all_entities()
+            for item in content:
+                target.add_entity(item)
+
+    return restore
+
+
+def _rerender_dimensions(doc, targets, *, force: bool) -> list[dict]:
+    """Redraw ``targets`` all or nothing: every new block is drawn first, and a
+    DIMENSION that cannot be redrawn reverts the ones drawn before it and
+    raises :class:`DimensionRenderError` - the drawing is as it was."""
+    references = _dimension_geometry_counts(doc)  # before any entity is re-pointed
+    staged: list[dict] = []
+    for ent in targets:
+        try:
+            staged.append(_stage_rerender(doc, ent, force=force))
+        except Exception as exc:
+            for done in reversed(staged):
+                _revert_rerender(doc, done)
+            raise DimensionRenderError(
+                f"dimension_rerender: DIMENSION {ent.dxf.handle} cannot be redrawn by the "
+                f"headless renderer ({type(exc).__name__}: {exc}); nothing was changed"
+            ) from exc
+    return [_commit_rerender(doc, done, references) for done in staged]
+
+
 def _style_table_references(doc) -> tuple[set[str], set[str]]:
     """``(block names, text-style names)`` the style tables and header reference.
 
@@ -1193,6 +1395,20 @@ _OCS_ENTITY_TYPES = frozenset(
 )
 
 
+def _paper_space_of(ent) -> str | None:
+    """The paper layout ``ent`` lives on, or None (model space, a block, no document)."""
+    doc = getattr(ent, "doc", None)
+    owner = ent.dxf.get("owner")
+    if doc is None or not owner:
+        return None
+    try:
+        if owner == doc.modelspace().layout_key:
+            return None
+        return str(doc.layouts.get_layout_by_key(owner).name)
+    except KeyError:  # DXFKeyError: a block definition's member, not a layout
+        return None
+
+
 def _entity_info_dxf(ent, *, detail: bool = False) -> EntityInfo:
     """Convert an ezdxf entity to EntityInfo. Coordinates out are always WCS.
 
@@ -1208,6 +1424,11 @@ def _entity_info_dxf(ent, *, detail: bool = False) -> EntityInfo:
     visible = ent.dxf.get("invisible", False) is False
 
     props: dict = {}
+    # 1.8-05: an entity on a paper layout names its space (the live engine's
+    # creation results do the same); model space is the default, never said.
+    space = _paper_space_of(ent)
+    if space is not None:
+        props["space"] = space
 
     # T0.4 — everything leaving this function is WCS. CIRCLE/ARC/LWPOLYLINE/TEXT/
     # INSERT and a dimension's text position are stored in the entity's own frame,
@@ -1423,6 +1644,11 @@ def _entity_info_dxf(ent, *, detail: bool = False) -> EntityInfo:
         linetype=linetype,
         visible=visible,
         properties=props,
+        lineweight_name=(
+            lineweight_name(ent.dxf.get("lineweight", -1))
+            if ent.dxf.is_supported("lineweight")
+            else None
+        ),
     )
 
 
@@ -1478,13 +1704,40 @@ class _DocState:
     document_id: str = ""
     # The content revision: `_DirtyField` moves it on every `_dirty = True`.
     revision: int = 0
+    # 1.8-04: the lineage this document carries across processes (minted at
+    # its first save or open; backends/lineage.py), its parent on a fork, and
+    # the damaged source a `drawing_open(recover=True)` read it from - a save
+    # onto that source needs `overwrite_source=True`.
+    lineage_id: str = ""
+    lineage_parent: str | None = None
+    recovered_from: str | None = None
+    # 1.8-08 (backends/ezdxf_checkpoints.py): the newest checkpoint id, a
+    # drawing_new S0 not written yet, the sha256 of the content at
+    # `content_sha_rev`, the revision an undo steps back from while the content
+    # is one an undo reached, the states an undo replaced (redo), the revision
+    # each in-memory undo snapshot holds, and each open transaction's
+    # (revision, undo base) at its begin.
+    latest_cp: str | None = None
+    s0: dict | None = None
+    content_sha: str | None = None
+    content_sha_rev: int | None = None
+    undo_base: int | None = None
+    undo_base_rev: int | None = None
+    store_redo: list[str] = field(default_factory=list)
+    # The in-memory redo branch an undo that crossed into the store set aside,
+    # keyed by the `store_redo` entry whose redo brings it back.
+    parked_redo: dict[str, list[Path]] = field(default_factory=dict)
+    snapshot_revs: dict[str, int] = field(default_factory=dict)
+    transaction_revs: dict[str, tuple] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
         return Path(self.path).name if self.path else self.key
 
     def discard_snapshots(self) -> None:
-        for stack in (self.undo_stack, self.redo_stack, self.transaction_stack):
+        parked = [path for branch in self.parked_redo.values() for path in branch]
+        self.parked_redo.clear()
+        for stack in (self.undo_stack, self.redo_stack, self.transaction_stack, parked):
             while stack:
                 try:
                     stack.pop().unlink()
@@ -1534,7 +1787,7 @@ class _DirtyField(_ActiveField):
 # ---------------------------------------------------------------------------
 
 
-class EzdxfBackend(AutoCADBackend):
+class EzdxfBackend(EzdxfCheckpoints, EzdxfChangeSets, AutoCADBackend):
     """File-based ezdxf backend – no live AutoCAD needed."""
 
     # Old per-backend attributes, now routed to the active document (v1.6).
@@ -1576,6 +1829,15 @@ class EzdxfBackend(AutoCADBackend):
         self.call_outcomes: collections.deque = collections.deque(maxlen=_MAX_CALL_OUTCOMES)
         self._leases: set[_Lease] = set()
         self._in_flight: dict[concurrent.futures.Future, str] = {}
+        # 1.8-04: the highest revision issued per document_id by an entry that
+        # has since left the registry (reloaded or closed), so a reopen never
+        # issues a revision twice; the lifespan adds the journal's view through
+        # ``revision_high_lookup(document_id)``.
+        self._issued_high: dict[str, int] = {}
+        self.revision_high_lookup = None
+        # 1.8-08: the journal's count of calls a reopened file no longer holds
+        # (``lost_since_save(document_id, saved_revision)``), wired by the lifespan.
+        self.lost_since_save_lookup = None
 
     @property
     def _state(self) -> _DocState:
@@ -1738,6 +2000,7 @@ class EzdxfBackend(AutoCADBackend):
             if render_available
             else FeatureCapability(False, reason="optional_dependency_missing:matplotlib")
         )
+        checkpoints_on = self._cp_store() is not None
         return CapabilityMap(
             backend="ezdxf",
             features={
@@ -1774,8 +2037,27 @@ class EzdxfBackend(AutoCADBackend):
                 "undo_history": (
                     FeatureCapability(True, "snapshot")
                     if config.settings.ezdxf_undo_depth > 0
-                    else FeatureCapability(False, reason="set_EZDXF_UNDO_DEPTH_to_enable")
+                    else FeatureCapability(
+                        True,
+                        "checkpoint",
+                        reason="save_batch_and_label_checkpoints;"
+                        "set_EZDXF_UNDO_DEPTH_for_per_operation_steps",
+                    )
+                    if checkpoints_on
+                    else FeatureCapability(
+                        False,
+                        reason="set_EZDXF_UNDO_DEPTH_to_enable;or_a_state_folder_for_checkpoints",
+                    )
                 ),
+                # 1.8-08: save-anchored checkpoints in the state folder.
+                "checkpoints": (
+                    FeatureCapability(True, "state_dir", reason="save_batch_and_label_anchored")
+                    if checkpoints_on
+                    else FeatureCapability(
+                        False, reason="no_state_folder:JOURNAL_DURABLE_off_or_STATE_DIR_refused"
+                    )
+                ),
+                "checkpoint_restore_in_place": FeatureCapability(True, "snapshot"),
                 "measure_area_acis": FeatureCapability(
                     False, reason="acis_evaluation_requires_live_autocad"
                 ),
@@ -1876,6 +2158,9 @@ class EzdxfBackend(AutoCADBackend):
                     False,
                     reason="reload_and_bind_need_a_live_seat;list_detach_path_are_headless",
                 ),
+                # K1 (1.8.0): drawing_open converts a DWG to DXF - the ODA File
+                # Converter first, then accoreconsole - re-evaluated per call.
+                "dwg_read": dwg_read.capability(_odafc_available()),
                 "xlsx_write": (
                     FeatureCapability(True, "openpyxl")
                     if find_spec("openpyxl") is not None
@@ -1943,8 +2228,13 @@ class EzdxfBackend(AutoCADBackend):
 
     # ── document registry (v1.6) ──────────────────────────────────────────────
 
-    def _register_document(self, doc, path: str | None) -> tuple[str, bool]:
+    def _register_document(
+        self, doc, path: str | None, *, document_id: str | None = None
+    ) -> tuple[str, bool]:
         """Add ``doc`` to the registry and make it active.
+
+        ``document_id`` continues a saved file's lineage (1.8-04,
+        ``backends/lineage.py``); None mints a new id.
 
         Returns ``(key, reloaded)``. A path that is already open is *reloaded*:
         its old entry (and its snapshots) is dropped and the fresh read takes
@@ -1964,13 +2254,100 @@ class EzdxfBackend(AutoCADBackend):
             previous_key = self._path_holder(key)
             reloaded = previous_key is not None
             if previous_key is not None:
-                self._docs.pop(previous_key).discard_snapshots()
+                dropped = self._docs.pop(previous_key)
+                self._note_issued(dropped)
+                dropped.discard_snapshots()
                 if self._active_key == previous_key:
                     self._active_key = None
-        # B11: a registration is a document of its own - a reopened file too.
-        self._docs[key] = _DocState(key=key, doc=doc, path=path, document_id=uuid.uuid4().hex)
+        # B11: a registration is a document of its own; 1.8-04: unless the
+        # file's lineage record continues one (an unchanged reopen).
+        self._docs[key] = _DocState(
+            key=key, doc=doc, path=path, document_id=document_id or uuid.uuid4().hex
+        )
         self._activate_key(key)
         return key, reloaded
+
+    # ── the save protocol and lineage (1.8-04) ───────────────────────────────
+
+    def _note_issued(self, state: _DocState) -> None:
+        """Remember the revision an entry leaving the registry had reached."""
+        if state.document_id:
+            known = self._issued_high.get(state.document_id, -1)
+            self._issued_high[state.document_id] = max(known, state.revision)
+
+    def _revision_high(self, document_id: str) -> int | None:
+        """The highest revision known to have been issued for ``document_id``."""
+        highs = [s.revision for s in self._docs.values() if s.document_id == document_id]
+        if document_id in self._issued_high:
+            highs.append(self._issued_high[document_id])
+        lookup = self.revision_high_lookup
+        if lookup is not None:
+            try:
+                found = lookup(document_id)
+            except Exception as exc:  # the journal is evidence, never a reason to fail
+                log.debug("revision_high_lookup(%s): %s", document_id, exc)
+                found = None
+            if found is not None:
+                highs.append(int(found))
+        return max(highs) if highs else None
+
+    def _lineage_open_elsewhere(self, lineage_id: str, path: str) -> bool:
+        """Is ``lineage_id`` open in this registry under a file other than ``path``."""
+        return any(
+            state.lineage_id == lineage_id
+            and not (state.path and self._same_file(state.path, path))
+            for state in self._docs.values()
+        )
+
+    def _write_dxf(
+        self,
+        state: _DocState,
+        op: str,
+        target: str,
+        *,
+        repoint: bool,
+        overwrite_source: bool = False,
+    ) -> dict:
+        """One DXF write of ``state``'s document through the atomic protocol.
+
+        ``repoint`` makes it a save (path, saved flag, lineage record); an
+        export writes a copy and records nothing. A save onto the damaged
+        source of a recovered document is refused unless ``overwrite_source``.
+        """
+        if repoint and state.recovered_from and not overwrite_source:
+            if self._same_file(state.recovered_from, target):
+                raise recovered_source_refusal(op, state.label, state.recovered_from)
+        # 1.8-08: a save keeps the bytes it wrote for its checkpoint.
+        written = atomic_write_dxf(state.doc, target, keep_data=repoint)
+        if not repoint:
+            return written
+        state.doc.filename = str(target)
+        if state.recovered_from and self._same_file(state.recovered_from, target):
+            state.recovered_from = None  # the caller chose to replace the damaged source
+        if not state.lineage_id:
+            state.lineage_id = lineage.new_lineage_id()
+        lineage.write_record(
+            target,
+            {
+                "lineage_id": state.lineage_id,
+                "document_id": state.document_id,
+                "last_saved_sha256": written["sha256"],
+                "revision": state.revision,
+                "lineage_parent": state.lineage_parent,
+                "engine": "ezdxf",
+            },
+        )
+        written["checkpoint"] = self._cp_on_save(state, written, op)
+        return written
+
+    @staticmethod
+    def _saved_fields(written: dict) -> dict:
+        out = {"sha256": written["sha256"], "bytes": written["bytes"]}
+        if written.get("backup"):
+            out["backup"] = written["backup"]
+        if written.get("checkpoint"):
+            out["checkpoint"] = written["checkpoint"]
+        return out
 
     def _activate_key(self, key: str) -> None:
         self._activation_counter += 1
@@ -2098,7 +2475,7 @@ class EzdxfBackend(AutoCADBackend):
                 # save onto a file another entry holds would leave that
                 # entry claiming ``saved: True`` over someone else's bytes.
                 self._refuse_shared_path(label, state)
-                state.doc.saveas(state.path)
+                self._write_dxf(state, "document_close", state.path, repoint=True)
                 state.dirty = False
                 saved = True
             elif not discard:
@@ -2109,6 +2486,7 @@ class EzdxfBackend(AutoCADBackend):
                 )
         discarded = state.dirty
         state.discard_snapshots()
+        self._note_issued(state)
         del self._docs[key]
         result = {"ok": True, "closed": key, "saved": saved, "discarded_changes": discarded}
         if closing_active:
@@ -2785,6 +3163,8 @@ class EzdxfBackend(AutoCADBackend):
             key, _ = self._register_document(doc, None)
             self._reset_document_state()
             self._reset_history_baseline()
+            # 1.8-08: S0, written only when the lineage writes its first checkpoint.
+            self._cp_on_new(self._state, template)
             result = {
                 "ok": True,
                 "name": "untitled.dxf",
@@ -2797,8 +3177,32 @@ class EzdxfBackend(AutoCADBackend):
 
         return await self._async(_sync, quarantine_exit=True)
 
-    async def drawing_open(self, path: str) -> dict:
+    async def drawing_open(self, path: str, recover: bool = False) -> dict:
+        """Open a DXF; with ``recover=True`` through ezdxf's recover reader (B09).
+
+        1.8-04: a save of this path a dead process left half done is resolved
+        first (``save_recovery``); the file's lineage record decides whether
+        this continues a document (same ``document_id`` and revision when the
+        bytes are the ones last saved, ``external_change: true`` and one
+        revision more when they are not) or starts one (``lineage``). A file
+        ezdxf cannot parse is refused by name (``damaged_drawing``) and the
+        open document is kept; ``recover=True`` reports ``recovered: {fixes,
+        errors, messages, entities_read}`` and starts a new lineage with
+        ``recovered_from`` - a later save onto the source needs
+        ``overwrite_source=True``.
+
+        K1: a ``.dwg`` path is converted to DXF first (``backends/dwg_read.py``:
+        the ODA File Converter, then accoreconsole) and the result carries
+        ``dwg_read: {route, seconds, ...}`` - the console's exit code and its
+        log's last lines on that route. No converter is a ``dwg_read``
+        capability refusal; every route failing is ``dwg_conversion_failed``.
+        The document keeps the ``.dwg`` path, so a save onto it is still refused
+        (``dwg``) - save it as a ``.dxf``.
+        """
+
         def _sync():
+            if not recover and _is_dwg_path(path) and not os.path.isfile(path):
+                raise FileNotFoundError(f"drawing_open: {path} does not exist")
             max_bytes = config.settings.max_dxf_bytes
             if max_bytes > 0:
                 try:
@@ -2810,15 +3214,64 @@ class EzdxfBackend(AutoCADBackend):
                         f"DXF file exceeds MAX_DXF_BYTES limit "
                         f"({size} > {max_bytes}). Set MAX_DXF_BYTES env var to override."
                     )
-            doc = ezdxf.readfile(path)
+            # Before the read: a finished replace changes the bytes read below.
+            save_recovery = resolve_pending(path)
+            recovered = None
+            converted = None
+            if recover:
+                doc, recovered = recover_dxf(path)
+            elif _is_dwg_path(path):
+                doc, converted = dwg_read.read_dwg(path, odafc=_odafc_available(), read=read_dxf)
+            else:
+                doc = read_dxf(path)
+            sha = file_sha256(path)
+            # 1.8-08: the revision the file was saved at, before the open moves it.
+            saved_record = None if recover else lineage.read_record(path)
             _normalise_dimstyle_rounding(doc)
+            if recover:
+                line = {
+                    "lineage_id": lineage.new_lineage_id(),
+                    "document_id": None,
+                    "revision": 0,
+                    "continued": False,
+                    "external_change": False,
+                    "recovered_from": path,
+                }
+            else:
+                line = lineage.resolve_open(
+                    path,
+                    sha,
+                    open_elsewhere=lambda lid: self._lineage_open_elsewhere(lid, path),
+                    revision_high=self._revision_high,
+                )
             # R32: only reached if the read succeeded. Reopening the very path a
             # runaway doc.saveas is writing either fails loudly here (acceptable)
             # or hands back a truncated document (not) — _clear_quarantine
             # compares the two paths and says so.
             self._evict_quarantined_document()
             released = self._clear_quarantine("drawing_open", path)
-            key, reloaded = self._register_document(doc, path)
+            key, reloaded = self._register_document(doc, path, document_id=line["document_id"])
+            state = self._state
+            state.revision = int(line["revision"])
+            state.lineage_id = line["lineage_id"]
+            state.lineage_parent = line.get("lineage_parent")
+            state.recovered_from = path if recover else None
+            # A recovered document is not what its file holds: unsaved, so
+            # document_close asks first (set on the state: not a content edit).
+            state.dirty = bool(recover)
+            if not recover:
+                # The damaged source keeps no record: it is not this document.
+                lineage.write_record(
+                    path,
+                    {
+                        "lineage_id": state.lineage_id,
+                        "document_id": state.document_id,
+                        "last_saved_sha256": sha,
+                        "revision": state.revision,
+                        "lineage_parent": state.lineage_parent,
+                        "engine": "ezdxf",
+                    },
+                )
             try:
                 self._current_layer = doc.header.get("$CLAYER", "0")
             except Exception as exc:
@@ -2826,13 +3279,46 @@ class EzdxfBackend(AutoCADBackend):
                 self._current_layer = "0"
             self._reset_document_state()
             self._reset_history_baseline()
+            # 1.8-08: S0 of the opened file (skipped when the lineage's newest
+            # checkpoint holds these bytes), and what the last save lost.
+            self._cp_on_open(
+                state,
+                path,
+                sha,
+                doc=doc if recover else None,
+                unchanged=bool(line.get("continued"))
+                and not line.get("external_change")
+                and line.get("revision_floor") is None,
+            )
+            lost = self._lost_since_save(state, line, saved_record)
             result = {
                 "ok": True,
                 "name": Path(path).name,
                 "path": path,
                 "document": key,
                 "open_documents": len(self._docs),
+                "document_id": state.document_id,
+                "revision": state.revision,
+                "external_change": bool(line["external_change"]),
+                "lineage": {
+                    key_: line[key_]
+                    for key_ in ("lineage_id", "continued", "lineage_parent", "revision_floor")
+                    if line.get(key_) is not None
+                },
+                "sha256": sha,
             }
+            if line["external_change"]:
+                result["previous_sha256"] = line.get("previous_sha256")
+            if recovered is not None:
+                result["recovered"] = recovered
+                result["recovered_from"] = path
+                result["lineage"]["recovered_from"] = path
+            if converted is not None:
+                result["dwg_read"] = converted
+            if save_recovery:
+                result["save_recovery"] = save_recovery
+            if lost is not None:
+                result["lost_since_save"] = lost
             if reloaded:
                 result["reloaded"] = True
             if released is not None:
@@ -2841,22 +3327,54 @@ class EzdxfBackend(AutoCADBackend):
 
         return await self._async(_sync, quarantine_exit=True)
 
-    async def drawing_save(self, path: str | None = None) -> dict:
+    def _lost_since_save(self, state: _DocState, line: dict, record: dict | None) -> dict | None:
+        """``{count, last_operation}``: calls the reopened file no longer holds (1.8-08).
+
+        Only when the open continues a saved document and the server wired the
+        journal in (``lost_since_save_lookup``): every call on that
+        ``document_id`` past the revision the file was saved at - committed, or
+        left ``unknown_commit`` by a server that died - is work the file lacks.
+        """
+        lookup = getattr(self, "lost_since_save_lookup", None)
+        if lookup is None or not line.get("continued") or record is None:
+            return None
+        try:
+            return lookup(
+                state.document_id, int(record.get("revision") or 0), record.get("recorded")
+            )
+        except Exception as exc:  # the journal is evidence, never a reason to fail an open
+            log.debug("lost_since_save(%s): %s", state.document_id, exc)
+            return None
+
+    async def drawing_save(self, path: str | None = None, overwrite_source: bool = False) -> dict:
+        """Save through the atomic protocol (1.8-04, ``backends/atomic_write.py``).
+
+        The result adds the written file's ``sha256`` and ``bytes`` (and
+        ``backup`` with ``SAVE_BACKUP=1``). A document opened with
+        ``recover=True`` is refused onto its damaged source unless
+        ``overwrite_source=True``.
+        """
         save_path = path or self._doc_path
-        # `doc.saveas` derives the format from the extension and ezdxf can only
-        # write DXF, so a .dwg destination here would silently mislabel the file.
+        # ezdxf can only write DXF, so a .dwg destination here would silently
+        # mislabel the file.
         if save_path and _is_dwg_path(save_path):
             raise _refuse_dwg("drawing_save", save_path)
 
         def _sync():
-            doc = self._require_doc()
+            self._require_doc()
             if not save_path:
                 raise RuntimeError("No path specified and no current file path.")
             self._refuse_path_held_elsewhere("drawing_save", save_path)
-            doc.saveas(save_path)
+            written = self._write_dxf(
+                self._state,
+                "drawing_save",
+                save_path,
+                repoint=True,
+                overwrite_source=overwrite_source,
+            )
             self._doc_path = save_path
             self._dirty = False
-            return {"ok": True, "path": save_path}
+            return {"ok": True, "path": save_path, **self._saved_fields(written)}
 
         return await self._async(_sync)
 
@@ -2867,12 +3385,12 @@ class EzdxfBackend(AutoCADBackend):
             raise _refuse_dwg("drawing_save_as", path)
 
         def _sync():
-            doc = self._require_doc()
+            self._require_doc()
             self._refuse_path_held_elsewhere("drawing_save_as", path)
-            doc.saveas(path)
+            written = self._write_dxf(self._state, "drawing_save_as", path, repoint=True)
             self._doc_path = path
             self._dirty = False
-            return {"ok": True, "path": path, "format": "dxf"}
+            return {"ok": True, "path": path, "format": "dxf", **self._saved_fields(written)}
 
         return await self._async(_sync)
 
@@ -2885,6 +3403,8 @@ class EzdxfBackend(AutoCADBackend):
         this method opens, with ``Drawing.save``'s own encoding rule
         (``output_encoding``, errors ``dxfreplace``). Not a content change:
         the revision does not move. A ``.dwg`` name is refused (``dwg``).
+        1.8-04: the stream is the atomic protocol's tmp, so a target that
+        already exists is replaced whole or not at all.
         """
         if _is_dwg_path(path):
             raise _refuse_dwg("drawing_export_dxf", path)
@@ -2892,9 +3412,9 @@ class EzdxfBackend(AutoCADBackend):
         def _sync():
             doc = self._require_doc()
             self._refuse_path_held_elsewhere("drawing_export_dxf", path)
-            with open(path, "w", encoding=doc.output_encoding, errors="dxfreplace") as stream:
-                doc.write(stream)
+            written = self._write_dxf(self._state, "drawing_export_dxf", path, repoint=False)
             return {
+                "sha256": written["sha256"],
                 "ok": True,
                 "path": path,
                 "format": "dxf",
@@ -5077,6 +5597,10 @@ class EzdxfBackend(AutoCADBackend):
         return await self._async(_sync, quarantine_exit=True)
 
     async def drawing_undo(self) -> dict:
+        """Step back: ``EZDXF_UNDO_DEPTH``'s in-memory steps first, then the
+        checkpoint store (1.8-08) - the newest checkpoint below the current
+        revision, after a restart as well as in the session, reported with its
+        ``granularity`` (``save`` / ``batch`` / ``label``)."""
         self._require_undo_history("drawing_undo")
 
         # NEW-undo-1: read+mutate _undo_stack under self._lock (via _async) so
@@ -5085,6 +5609,8 @@ class EzdxfBackend(AutoCADBackend):
             # Two entries minimum: the top is the current state, and undo means
             # restoring the one below it.
             if len(self._undo_stack) < 2:
+                if self._cp_store() is not None:
+                    return self._cp_undo_sync()
                 return {
                     "ok": False,
                     "error": "Nothing to undo — this is the oldest state in the history.",
@@ -5092,8 +5618,12 @@ class EzdxfBackend(AutoCADBackend):
                 }
             self._redo_stack.append(self._undo_stack.pop())
             self._restore_snapshot(self._undo_stack[-1])
+            self._note_snapshot_base(self._undo_stack[-1])
             return {
                 "ok": True,
+                # 1.8-05 parity with the live engine: a snapshot restore is the
+                # previous state by construction, so the step is verified.
+                "verified": True,
                 "message": "Stepped back one operation.",
                 "undo_depth": len(self._undo_stack) - 1,
                 "redo_depth": len(self._redo_stack),
@@ -5106,6 +5636,8 @@ class EzdxfBackend(AutoCADBackend):
 
         def _sync():
             if not self._redo_stack:
+                if self._cp_store() is not None:
+                    return self._cp_redo_sync()
                 return {
                     "ok": False,
                     "error": "Nothing to redo — nothing has been undone, or a "
@@ -5115,8 +5647,10 @@ class EzdxfBackend(AutoCADBackend):
             snapshot = self._redo_stack.pop()
             self._undo_stack.append(snapshot)
             self._restore_snapshot(snapshot)
+            self._note_snapshot_base(snapshot)
             return {
                 "ok": True,
+                "verified": True,  # 1.8-05: the snapshot restore is the evidence
                 "message": "Reapplied the operation you undid.",
                 "undo_depth": len(self._undo_stack) - 1,
                 "redo_depth": len(self._redo_stack),
@@ -5198,6 +5732,9 @@ class EzdxfBackend(AutoCADBackend):
         snapshot = self._snapshot_doc()
         if snapshot is None:
             return
+        # 1.8-08: the revision this step holds, so an undo that exhausts the
+        # in-memory steps continues in the checkpoint store from below it.
+        self._state.snapshot_revs[str(snapshot)] = self._state.revision
         self._undo_stack.append(snapshot)
         # A mutation after an undo abandons the branch the user stepped off.
         # Keeping it would let redo restore a state that never existed: geometry
@@ -5217,6 +5754,14 @@ class EzdxfBackend(AutoCADBackend):
         self._current_layer = str(self._doc.header.get("$CLAYER", "0"))
         self._dirty = True
 
+    def _note_snapshot_base(self, path: Path) -> None:
+        """After an in-memory undo / redo: the content is the revision ``path`` held."""
+        state = self._state
+        held = state.snapshot_revs.get(str(path))
+        state.undo_base = held
+        state.undo_base_rev = state.revision if held is not None else None
+        self._cp_drop_redo(state)
+
     def _reset_history_baseline(self) -> None:
         """Start the history at the document as opened or created.
 
@@ -5228,12 +5773,15 @@ class EzdxfBackend(AutoCADBackend):
         self._push_undo_snapshot()
 
     def _require_undo_history(self, operation: str) -> None:
-        if config.settings.ezdxf_undo_depth > 0:
+        if config.settings.ezdxf_undo_depth > 0 or self._cp_store() is not None:
             return
         raise UnsupportedCapabilityError(
             "undo_history",
-            f"{operation}: the headless backend keeps no history by default. ezdxf "
-            "has no journal, so every step is a full DXF snapshot — measured at "
+            f"{operation}: the headless backend has no history here. Its default "
+            "history is the checkpoint store (states at saves, batches and "
+            "checkpoint_create, 1.8.0), which lives in the state folder - and there "
+            "is none (JOURNAL_DURABLE=off, or ACADMCP_STATE_DIR was refused). ezdxf "
+            "has no journal, so a per-call step is a full DXF snapshot — measured at "
             "3 ms for 10 entities but 130 ms and 658 KB at 5000, paid on every "
             "mutating call. Set EZDXF_UNDO_DEPTH to the number of steps you want "
             "(e.g. 10) to switch it on, or use transaction_begin/rollback for a "
@@ -5327,13 +5875,24 @@ class EzdxfBackend(AutoCADBackend):
         layer=None,
         color=None,
         xdata=None,
+        bulges=None,
     ) -> EntityInfo:
         prepared = prepare_xdata(xdata)
+        checked_bulges = None
+        if bulges is not None:
+            pts, checked_bulges = prepare_vertices(points, bulges, "entity_create_polyline")
 
         def _sync():
             msp = self._msp()
-            pts_2d = [(float(p[0]), float(p[1])) for p in points]
-            ent = msp.add_lwpolyline(pts_2d, close=closed)
+            if checked_bulges is None:
+                pts_2d = [(float(p[0]), float(p[1])) for p in points]
+                ent = msp.add_lwpolyline(pts_2d, close=closed)
+            else:
+                ent = msp.add_lwpolyline(
+                    [(x, y, b) for (x, y), b in zip(pts, checked_bulges, strict=True)],
+                    format="xyb",
+                    close=closed,
+                )
             self._apply_attrs(ent, layer, color)
             self._attach_xdata(ent, prepared)
             self._mark_dirty()
@@ -5413,9 +5972,11 @@ class EzdxfBackend(AutoCADBackend):
         text_height=2.5,
         title=None,
         layer="TEXT",
+        xdata=None,
     ) -> EntityInfo:
         from engineering.annotation import prepare_table_layout
 
+        prepared = prepare_xdata(xdata)
         layout = prepare_table_layout(rows, headers, column_widths, row_height, text_height, title)
 
         def _sync():
@@ -5469,6 +6030,9 @@ class EzdxfBackend(AutoCADBackend):
                     self._apply_attrs(text_entity, layer, None)
                     children.append(text_entity)
 
+            # the composite has no one entity to carry a tag: every child does
+            for child in children:
+                self._attach_xdata(child, prepared)
             self._mark_dirty()
             child_handles = [str(entity.dxf.handle) for entity in children]
             group_id = f"table:{uuid.uuid4().hex}"
@@ -5587,8 +6151,11 @@ class EzdxfBackend(AutoCADBackend):
 
         def _sync():
             msp = self._msp()
-            hatch = msp.add_hatch()
-            hatch.set_pattern_fill(pattern, scale=float(scale), angle=float(angle))
+            # ByLayer (256), as ActiveX AddHatch leaves it: ezdxf's add_hatch and
+            # set_pattern_fill both default to an explicit ACI 7, which the
+            # property_override focus would rightly report on every hatch.
+            hatch = msp.add_hatch(color=256)
+            hatch.set_pattern_fill(pattern, color=256, scale=float(scale), angle=float(angle))
             pts = [(float(p[0]), float(p[1])) for p in boundary_points]
             hatch.paths.add_polyline_path(pts, is_closed=True)
             self._apply_attrs(hatch, layer, color)
@@ -5982,7 +6549,10 @@ class EzdxfBackend(AutoCADBackend):
         tol_lower=None,
         tol_mode="none",
         text_override=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             from engineering.tolerances import build_dim_override
 
@@ -6002,6 +6572,7 @@ class EzdxfBackend(AutoCADBackend):
             ent = dim.dimension
             if layer:
                 ent.dxf.layer = layer
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
@@ -6016,7 +6587,10 @@ class EzdxfBackend(AutoCADBackend):
         dim_x,
         dim_y,
         layer=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             msp = self._msp()
             dim = msp.add_aligned_dim(
@@ -6032,6 +6606,7 @@ class EzdxfBackend(AutoCADBackend):
             ent = dim.dimension
             if layer:
                 ent.dxf.layer = layer
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
@@ -6081,7 +6656,10 @@ class EzdxfBackend(AutoCADBackend):
         tol_lower=None,
         tol_mode="none",
         text_override=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             from engineering.tolerances import build_dim_override
 
@@ -6109,6 +6687,7 @@ class EzdxfBackend(AutoCADBackend):
             ent = dim.dimension
             if layer:
                 ent.dxf.layer = layer
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
@@ -6126,7 +6705,10 @@ class EzdxfBackend(AutoCADBackend):
         tol_lower=None,
         tol_mode="none",
         text_override=None,
+        xdata=None,
     ) -> EntityInfo:
+        prepared = prepare_xdata(xdata)
+
         def _sync():
             from engineering.tolerances import build_dim_override
 
@@ -6167,8 +6749,40 @@ class EzdxfBackend(AutoCADBackend):
             ent = dim.dimension
             if layer:
                 ent.dxf.layer = layer
+            self._attach_xdata(ent, prepared)
             self._mark_dirty()
             return _entity_info_dxf(ent)
+
+        return await self._async(_sync)
+
+    def _rerender_sync(self, handles, force: bool) -> dict:
+        """Redraw the DIMENSIONs ``handles`` (every DIMENSION when None); in a job."""
+        doc = self._require_doc()
+        if handles is None:
+            targets = [e for layout in doc.layouts for e in layout.query("DIMENSION") if e.is_alive]
+        else:
+            targets = []
+            for handle in handles:
+                ent = self._get_entity(str(handle))
+                if ent.dxftype() != "DIMENSION":
+                    raise ValueError(
+                        f"dimension_rerender: {handle} is a {ent.dxftype()}, not a DIMENSION"
+                    )
+                targets.append(ent)
+        rerendered: list[str] = []
+        text_kept: list[str] = []
+        for done in _rerender_dimensions(doc, targets, force=force):
+            rerendered.append(done["handle"])
+            if done["mode"] == "text_kept":
+                text_kept.append(done["handle"])
+        return {"ok": True, "rerendered": rerendered, "text_kept": text_kept, "verified": True}
+
+    async def dimension_rerender(self, handles=None, force: bool = False) -> dict:
+        def _sync():
+            result = self._rerender_sync(handles, bool(force))
+            if result["rerendered"]:
+                self._mark_dirty()
+            return result
 
         return await self._async(_sync)
 
@@ -6181,7 +6795,8 @@ class EzdxfBackend(AutoCADBackend):
         # handle from a deleted layout used to pass this guard and then die on
         # the first attribute access with an AttributeError.
         if ent is None or not ent.is_alive:
-            raise RuntimeError(f"Entity with handle '{handle}' not found.")
+            # 1.8-02: typed (kind not_found), still a RuntimeError with this text.
+            raise EntityNotFoundError(handle)
         return ent
 
     async def entity_move(self, handle, dx, dy, dz=0.0) -> dict:
@@ -6227,12 +6842,27 @@ class EzdxfBackend(AutoCADBackend):
 
             s = float(factor)
             bx, by = float(base_x), float(base_y)
+            is_dim = ent.dxftype() == "DIMENSION"
+            restore = _dimension_checkpoint(self._require_doc(), ent) if is_dim else None
             self._transform(
                 ent,
                 Matrix44.translate(-bx, -by, 0)
                 @ Matrix44.scale(s, s, s)
                 @ Matrix44.translate(bx, by, 0),
             )
+            if is_dim:
+                # 1.8-15: the transform scaled the *D block's picture, not its
+                # number - "40" over 80. Redrawn from the new defpoints; the
+                # other transforms follow in 1.8.1. A redraw the renderer
+                # refuses undoes the scale: the tool fails, the drawing is as
+                # it was.
+                try:
+                    done = self._rerender_sync([handle], False)
+                except DimensionRenderError:
+                    restore()
+                    raise
+                self._mark_dirty()
+                return {"ok": True, "handle": handle, "rerendered": done["rerendered"]}
             self._mark_dirty()
             return {"ok": True, "handle": handle}
 
@@ -6471,6 +7101,8 @@ class EzdxfBackend(AutoCADBackend):
         lineweight=None,
         visible=None,
     ) -> dict:
+        code = parse_lineweight(lineweight)  # refused by name before any write
+
         def _sync():
             ent = self._get_entity(handle)
             if layer is not None:
@@ -6480,8 +7112,8 @@ class EzdxfBackend(AutoCADBackend):
             if linetype is not None:
                 _ensure_linetype_loaded(self._require_doc(), linetype)
                 ent.dxf.linetype = linetype
-            if lineweight is not None:
-                ent.dxf.lineweight = normalize_lineweight(lineweight)
+            if code is not None:
+                ent.dxf.lineweight = code
             if visible is not None:
                 ent.dxf.invisible = not bool(visible)
             self._mark_dirty()
@@ -6495,10 +7127,15 @@ class EzdxfBackend(AutoCADBackend):
         text=None,
         height=None,
         rotation=None,
+        x=None,
+        y=None,
     ) -> EntityInfo:
         def _sync():
             ent = self._get_entity(handle)
             et = ent.dxftype()
+            if et in ("TEXT", "MTEXT"):
+                # refused (tilted plane) before anything else is written
+                self._move_text(ent, handle, x, y, "entity_edit_text")
             if et == "TEXT":
                 if text is not None:
                     ent.dxf.text = str(text)
@@ -6707,10 +7344,71 @@ class EzdxfBackend(AutoCADBackend):
         y2=None,
         start_angle=None,
         end_angle=None,
+        points=None,
+        bulges=None,
+        x=None,
+        y=None,
     ) -> EntityInfo:
+        classic = {
+            "cx": cx,
+            "cy": cy,
+            "radius": radius,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "start_angle": start_angle,
+            "end_angle": end_angle,
+        }
+        if points is not None:
+            prepare_points(points, "entity_edit_geometry")  # refused before the job
+
         def _sync():
             ent = self._get_entity(handle)
             et = ent.dxftype()
+            route = edit_geometry_route(et, classic, points, bulges, x, y)
+            if route == "vertices":
+                if points is None:
+                    current = _entity_info_dxf(ent).properties.get("points") or []
+                    pts = prepare_points(current, "entity_edit_geometry")
+                else:
+                    pts = prepare_points(points, "entity_edit_geometry")
+                checked = prepare_bulges(bulges, len(pts), "entity_edit_geometry")
+                self._write_vertices(ent, handle, pts, checked, None, "entity_edit_geometry")
+                self._mark_dirty()
+                return _entity_info_dxf(ent)
+            if route == "text":
+                self._move_text(ent, handle, x, y, "entity_edit_geometry")
+                self._mark_dirty()
+                return _entity_info_dxf(ent)
+            if route == "dimension":
+                kind = int(ent.dxf.get("dimtype", 0)) & 0x0F
+                if kind not in (0, 1):
+                    raise RuntimeError(
+                        f"entity_edit_geometry: DIMENSION {handle} is "
+                        f"{DIMTYPE_NAMES.get(kind, kind)}; only a linear or aligned "
+                        "dimension's measured points (x1, y1, x2, y2) can be edited."
+                    )
+                restore = _dimension_checkpoint(self._require_doc(), ent)
+                for name, px, py in (("defpoint2", x1, y1), ("defpoint3", x2, y2)):
+                    if px is None and py is None:
+                        continue
+                    old = ent.dxf.get(name)
+                    ent.dxf.set(
+                        name,
+                        (
+                            float(px) if px is not None else old[0],
+                            float(py) if py is not None else old[1],
+                            old[2] if len(old) > 2 else 0.0,
+                        ),
+                    )
+                try:
+                    self._rerender_sync([handle], False)
+                except DimensionRenderError:
+                    restore()  # the points go back with the refused redraw
+                    raise
+                self._mark_dirty()
+                return _entity_info_dxf(ent)
             # cx/cy arrive in WCS, because that is what entity_get reports. For a
             # mirrored entity the stored attribute is not WCS, so the value has to
             # be mapped back into the entity's own frame before it is written.
@@ -6774,12 +7472,90 @@ class EzdxfBackend(AutoCADBackend):
                     ent.dxf.end_angle = float(end_angle)
             else:
                 raise RuntimeError(
-                    f"entity_edit_geometry: {et} not supported (use CIRCLE, LINE, or ARC)."
+                    f"entity_edit_geometry: {et} not supported "
+                    "(use CIRCLE, LINE, ARC, LWPOLYLINE, TEXT or MTEXT)."
                 )
             self._mark_dirty()
             return _entity_info_dxf(ent)
 
         return await self._async(_sync)
+
+    async def entity_set_vertices(self, handle, points, bulges=None, closed=None) -> EntityInfo:
+        pts, checked = prepare_vertices(points, bulges, "entity_set_vertices")
+
+        def _sync():
+            ent = self._get_entity(handle)
+            self._write_vertices(ent, handle, pts, checked, closed, "entity_set_vertices")
+            self._mark_dirty()
+            return _entity_info_dxf(ent)
+
+        return await self._async(_sync)
+
+    @staticmethod
+    def _write_vertices(ent, handle, pts, bulges, closed, where: str) -> None:
+        """Rewrite an LWPOLYLINE's vertices in its own frame: same entity, same handle.
+
+        ``pts`` / ``bulges`` are WCS (validated by ``backends/vertices.py``). A
+        mirrored frame stores x unnegated and reverses every arc's sense, so
+        both are translated through ``backends/ocs.py`` - the inverse of what
+        ``entity_get`` does on the way out. A tilted frame is refused before
+        anything is written.
+        """
+        et = ent.dxftype()
+        if et != "LWPOLYLINE":
+            raise RuntimeError(
+                f"{where}: handle {handle} is {et}, expected LWPOLYLINE (a lightweight "
+                "polyline); edit a LINE / CIRCLE / ARC with entity_edit_geometry."
+            )
+        extrusion = tuple(ent.dxf.get("extrusion", _IDENTITY_EXTRUSION))
+        framed = not ocs.is_wcs_frame(extrusion)
+        if framed and not ocs.is_flat_frame(extrusion):
+            raise UnsupportedCapabilityError(
+                "ocs_tilted_plane",
+                f"{where}: polyline {handle} lies in a plane tilted out of WCS XY "
+                f"(normal={tuple(round(float(v), 4) for v in extrusion)}). WCS [x, y] "
+                "vertices do not determine points in that plane, so writing them would "
+                "move the polyline out of its own plane by an amount this server cannot "
+                "infer. Use entity_move, or edit it in AutoCAD.",
+            )
+        stored = [float(b) for _x, _y, b in ent.get_points(format="xyb")]
+        old = [ocs.wcs_bulge(extrusion, b) for b in stored] if framed else stored
+        final = resolved_bulges(bulges, len(pts), old)
+        if framed:
+            rows = [
+                (*ocs.from_wcs(extrusion, px, py)[:2], ocs.wcs_bulge(extrusion, b))
+                for (px, py), b in zip(pts, final, strict=True)
+            ]
+        else:
+            rows = [(px, py, b) for (px, py), b in zip(pts, final, strict=True)]
+        ent.set_points(rows, format="xyb")
+        if closed is not None:
+            ent.closed = bool(closed)
+
+    @staticmethod
+    def _move_text(ent, handle, x, y, where: str) -> None:
+        """Translate a TEXT / MTEXT so its reported ``insertion`` lands on (x, y).
+
+        A translation of the whole entity, not a write of ``insert``: an aligned
+        TEXT keeps its alignment point in step, and the frame (a mirrored TEXT's
+        OCS) is ezdxf's ``transform`` business. A TEXT in a tilted plane is
+        refused by the repository rule - an xy is never written into one.
+        """
+        tx, ty = prepare_position(x, y, where)
+        if tx is None and ty is None:
+            return
+        extrusion = tuple(ent.dxf.get("extrusion", _IDENTITY_EXTRUSION))
+        if ent.dxftype() == "TEXT" and not ocs.is_flat_frame(extrusion):
+            raise UnsupportedCapabilityError(
+                "ocs_tilted_plane",
+                f"{where}: text {handle} lies in a plane tilted out of WCS XY "
+                f"(normal={tuple(round(float(v), 4) for v in extrusion)}); an (x, y) does "
+                "not determine a point in it. Use entity_move, which keeps the plane.",
+            )
+        current = _entity_info_dxf(ent).properties["insertion"]
+        dx = tx - float(current[0]) if tx is not None else 0.0
+        dy = ty - float(current[1]) if ty is not None else 0.0
+        ent.translate(dx, dy, 0.0)
 
     # ── selection filters (M8 / F1) ──────────────────────────────────────────
 
@@ -7000,6 +7776,10 @@ class EzdxfBackend(AutoCADBackend):
         linetype="Continuous",
         lineweight=-3,
     ) -> LayerInfo:
+        code = parse_lineweight(lineweight, target="layer")
+        if code is None:
+            code = -3
+
         def _sync():
             doc = self._require_doc()
             _ensure_linetype_loaded(doc, linetype)
@@ -7007,7 +7787,7 @@ class EzdxfBackend(AutoCADBackend):
                 name,
                 color=int(color),
                 linetype=linetype,
-                lineweight=normalize_lineweight(lineweight),
+                lineweight=code,
             )
             self._mark_dirty()
             return _layer_info_dxf(lyr, self._current_layer)
@@ -7046,6 +7826,8 @@ class EzdxfBackend(AutoCADBackend):
         linetype=None,
         lineweight=None,
     ) -> LayerInfo:
+        code = parse_lineweight(lineweight, target="layer")
+
         def _sync():
             doc = self._require_doc()
             lyr = doc.layers.get(name)
@@ -7056,8 +7838,8 @@ class EzdxfBackend(AutoCADBackend):
             if linetype is not None:
                 _ensure_linetype_loaded(doc, linetype)
                 lyr.dxf.linetype = linetype
-            if lineweight is not None:
-                lyr.dxf.lineweight = normalize_lineweight(lineweight)
+            if code is not None:
+                lyr.dxf.lineweight = code
             self._mark_dirty()
             return _layer_info_dxf(lyr, self._current_layer)
 
@@ -7126,6 +7908,164 @@ class EzdxfBackend(AutoCADBackend):
                 lyr.on()
                 self._mark_dirty()
             return {"ok": True, "layer": name, "visible": True}
+
+        return await self._async(_sync)
+
+    # ── set-based edits (1.8-12; the grammar is backends/set_edits.py) ──────────
+
+    async def entity_select_where(self, where, set_, space="model") -> dict:
+        from backends import set_edits as se
+
+        query, base, scope = se.parse_where(where), se.parse_set(set_), se.parse_space(space)
+
+        def _sync():
+            doc = self._require_doc()
+            spec, _missing = se.resolve_layer(base, [lyr.dxf.name for lyr in doc.layers])
+            found, skipped = se.ezdxf_select(doc, query, scope)
+            handles = [str(e.dxf.handle) for e in found]
+            return {
+                "ok": True,
+                "dry_run": True,
+                "space": scope,
+                "where": query.to_dict(),
+                "set": spec.to_dict(),
+                "count": len(found),
+                "would_change": sum(1 for e in found if se.ezdxf_differs(e, spec)),
+                "handles": handles[: se.HANDLE_SAMPLE],
+                "truncated": len(handles) > se.HANDLE_SAMPLE,
+                "skipped_locked": se.skipped_payload(skipped),
+            }
+
+        return await self._async(_sync, readonly=True)
+
+    async def entity_modify_where(self, where, set_, space="model", expect_count=None) -> dict:
+        from backends import set_edits as se
+        from engineering.changes.preview import StaleRevisionError
+
+        query, base, scope = se.parse_where(where), se.parse_set(set_), se.parse_space(space)
+
+        def _sync():
+            doc = self._require_doc()
+            spec, missing = se.resolve_layer(base, [lyr.dxf.name for lyr in doc.layers])
+            found, skipped = se.ezdxf_select(doc, query, scope)
+            if expect_count is not None and len(found) != int(expect_count):
+                raise StaleRevisionError(
+                    f"stale_revision: expect_count={int(expect_count)} but where now matches "
+                    f"{len(found)} entities; nothing was changed. Run the dry run again.",
+                    changed=[
+                        {"count": "where", "expected": int(expect_count), "actual": len(found)}
+                    ],
+                )
+            changing = [e for e in found if se.ezdxf_differs(e, spec)]
+            created = []
+            if missing and changing:
+                doc.layers.add(spec.layer)
+                created.append(spec.layer)
+            if spec.linetype is not None and changing:
+                _ensure_linetype_loaded(doc, spec.linetype)
+            for entity in changing:
+                se.ezdxf_write(entity, spec)
+            if changing:
+                self._mark_dirty()
+            handles = [str(e.dxf.handle) for e in changing]
+            return {
+                "ok": True,
+                "space": scope,
+                "where": query.to_dict(),
+                "set": spec.to_dict(),
+                "matched": len(found),
+                "changed": len(changing),
+                "unchanged": len(found) - len(changing),
+                "handles": handles[: se.HANDLE_SAMPLE],
+                "truncated": len(handles) > se.HANDLE_SAMPLE,
+                "skipped_locked": se.skipped_payload(skipped),
+                "layers_created": created,
+                "changes": se.changes_payload(modified=len(changing)),
+            }
+
+        return await self._async(_sync)
+
+    async def layer_rename(self, old, new) -> dict:
+        from backends import set_edits as se
+
+        def _sync():
+            doc = self._require_doc()
+            stored, target = se.rename_checks(old, new, [lyr.dxf.name for lyr in doc.layers])
+            references = list(se.ezdxf_layer_references(doc, {stored.lower()}))
+            by_space, blocks = se.tally(doc, references, se.ezdxf_containers(doc))
+            # ezdxf renames the table entry, every entity's dxf.layer and the
+            # viewport frozen lists in one pass over the entity database.
+            doc.layers.get(stored).rename(target)
+            current = self._current_layer
+            if str(current).lower() == stored.lower():
+                self._current_layer = target
+                doc.header["$CLAYER"] = target
+            self._mark_dirty()
+            return {
+                "ok": True,
+                "old": stored,
+                "new": target,
+                "entities": len(references),
+                "by_space": by_space,
+                "blocks_touched": blocks,
+                "note": se.block_note(blocks),
+                "current_layer": self._current_layer,
+                "changes": se.changes_payload(modified=len(references), layers_renamed=1),
+            }
+
+        return await self._async(_sync)
+
+    async def layer_merge(self, sources, target, delete_sources=True) -> dict:
+        from backends import set_edits as se
+
+        target = se.merge_target(target)
+        names = se.merge_sources(sources, target)
+
+        def _sync():
+            doc = self._require_doc()
+            table = {str(lyr.dxf.name).lower(): str(lyr.dxf.name) for lyr in doc.layers}
+            missing = [n for n in (*names, target) if n.lower() not in table]
+            se.refuse_missing("layer_merge", missing, table.values())
+            stored = tuple(table[n.lower()] for n in names)
+            goal = table[target.lower()]
+            keys = {n.lower() for n in stored}
+            references = list(se.ezdxf_layer_references(doc, keys))
+            by_space, blocks = se.tally(doc, references, se.ezdxf_containers(doc))
+            for entity in references:
+                entity.dxf.layer = goal
+            moved_current = str(self._current_layer).lower() in keys
+            if moved_current:
+                self._current_layer = goal
+                doc.header["$CLAYER"] = goal
+            deleted = []
+            if delete_sources:
+                for viewport in list(doc.entitydb.values()):
+                    if not viewport.is_alive or viewport.dxftype() != "VIEWPORT":
+                        continue
+                    frozen = list(viewport.frozen_layers or [])
+                    kept = [n for n in frozen if str(n).lower() not in keys]
+                    if len(kept) != len(frozen):
+                        viewport.frozen_layers = kept
+                for name in stored:
+                    doc.layers.remove(name)
+                    deleted.append(name)
+            if references or deleted or moved_current:
+                self._mark_dirty()
+            return {
+                "ok": True,
+                "sources": list(stored),
+                "target": goal,
+                "reassigned": len(references),
+                "by_space": by_space,
+                "blocks_touched": blocks,
+                "note": se.block_note(blocks),
+                "layers_deleted": deleted,
+                "layers_not_deleted": [],
+                "current_layer": self._current_layer,
+                "changes": se.changes_payload(
+                    modified=len(references), layers_deleted=len(deleted)
+                ),
+            }
 
         return await self._async(_sync)
 
@@ -7733,10 +8673,11 @@ class EzdxfBackend(AutoCADBackend):
                     log.debug("resolving %s for block %s: %s", handle, name, exc)
                     skipped.append(str(handle))
             if not entities:
-                raise RuntimeError(
+                raise EntityNotFoundError(
+                    ", ".join(skipped),
                     f"block_create_from_entities: none of the handles resolved "
                     f"({', '.join(skipped) or 'no handles given'}), so there is nothing "
-                    f"to put in block {name!r}. No definition was created."
+                    f"to put in block {name!r}. No definition was created.",
                 )
 
             blk = doc.blocks.new(name=name)
@@ -8262,7 +9203,12 @@ class EzdxfBackend(AutoCADBackend):
                 key = str(raw or "").strip().upper()
                 entity = doc.entitydb.get(key)
                 if entity is None or not entity.is_alive:
-                    return {"ok": False, "error": f"Entity handle not found: {raw}"}
+                    return {
+                        "ok": False,
+                        "error": f"Entity handle not found: {raw}",
+                        "kind": "not_found",  # 1.8-02: typed for the callers that raise
+                        "handle": str(raw),
+                    }
                 if not edgesmith.is_pure_2d_entity(entity):
                     return {
                         "ok": False,
@@ -8439,11 +9385,51 @@ class EzdxfBackend(AutoCADBackend):
     async def view_zoom_window(self, x1, y1, x2, y2) -> dict:
         # R26/N9: window region is ignored (no viewport). Consistent shape with
         # view_zoom_extents; applied=False signals the framing was not honored.
+        # A picture of the window is view_render(region=...) (1.8-07).
         return {
             "ok": True,
             "applied": False,
-            "message": "Zoom window not applicable for ezdxf backend (no display/viewport)",
+            "message": (
+                "Zoom window not applicable for ezdxf backend (no display/viewport); "
+                "view_screenshot(region=[x0, y0, x1, y1]) renders that window"
+            ),
         }
+
+    async def view_render(
+        self,
+        region: list[float] | None = None,
+        max_px: int = DEFAULT_MAX_PX,
+        overlay_handles: bool = False,
+    ) -> dict:
+        """The current space drawn at a stated scale, the window applied (1.8-07)."""
+        wanted = normalize_region(region)
+        size = check_max_px(max_px)
+
+        def _sync():
+            doc = self._require_doc()
+            space = self._msp()
+            try:
+                report = render_layout(
+                    doc,
+                    space,
+                    region=wanted,
+                    max_px=size,
+                    overlay_handles=overlay_handles,
+                    max_labels=DEFAULT_MAX_HANDLE_LABELS,
+                    label_anchor=_label_anchor,
+                )
+            except ImportError:
+                log.warning("matplotlib not installed - region render unavailable")
+                return {
+                    "png": None,
+                    "applied": False,
+                    "source": "headless",
+                    "error": "matplotlib is not installed (pip install autocad-mcp-pro[pdf])",
+                }
+            report["source"] = "headless"
+            return report
+
+        return await self._async(_sync, readonly=True)
 
     async def view_screenshot(self, overlay_handles: bool = False) -> bytes | None:
         """Render drawing to PNG using matplotlib."""
@@ -8557,9 +9543,13 @@ class EzdxfBackend(AutoCADBackend):
                     pass
                 raise
             self._transaction_stack.append(Path(tmp_path))
+            # 1.8-08: the revision the snapshot holds; it becomes a checkpoint
+            # when the transaction closes.
+            self._cp_transaction_opened(self._state, Path(tmp_path))
             max_stack = config.settings.max_undo_stack
             while len(self._transaction_stack) > max_stack:
                 old = self._transaction_stack.pop(0)
+                self._state.transaction_revs.pop(str(old), None)
                 try:
                     old.unlink()
                 except OSError:
@@ -8575,11 +9565,16 @@ class EzdxfBackend(AutoCADBackend):
             if not self._transaction_stack:
                 return {"ok": False, "error": "No active transaction"}
             p = self._transaction_stack.pop()
-            try:
-                p.unlink()
-            except OSError:
-                pass
-            return {"ok": True, "message": "Transaction committed (snapshot discarded)"}
+            # 1.8-08: the begin's snapshot is kept as a checkpoint (the batch
+            # boundary drawing_undo steps back to), not deleted.
+            row = self._cp_transaction_closed(self._state, p, "transaction_commit")
+            if row is None:
+                return {"ok": True, "message": "Transaction committed (snapshot discarded)"}
+            return {
+                "ok": True,
+                "message": "Transaction committed (the begin's snapshot kept as a checkpoint)",
+                "checkpoint": row["cp"],
+            }
 
         return await self._async(_sync)
 
@@ -8590,16 +9585,32 @@ class EzdxfBackend(AutoCADBackend):
             if not self._transaction_stack:
                 return {"ok": False, "error": "No active transaction to rollback"}
             p = self._transaction_stack.pop()
+            state = self._state
             try:
                 self._doc = ezdxf.readfile(str(p))
                 _normalise_dimstyle_rounding(self._doc)
                 self._current_layer = str(self._doc.header.get("$CLAYER", "0"))
                 self._dirty = True
-            finally:
+            except BaseException:
+                state.transaction_revs.pop(str(p), None)
                 try:
                     p.unlink()
                 except OSError:
                     pass
+                raise
+            # 1.8-08: the snapshot is kept as a checkpoint; the content is its
+            # revision again, so an undo steps back from below it.
+            _rev, base = state.transaction_revs.get(str(p), (None, None))
+            row = self._cp_transaction_closed(state, p, "transaction_rollback")
+            if row is not None:
+                self._cp_note_content(state, row.get("sha256"))
+                state.undo_base, state.undo_base_rev = base, state.revision
+                self._cp_drop_redo(state)
+                return {
+                    "ok": True,
+                    "message": "Transaction rolled back to snapshot",
+                    "checkpoint": row["cp"],
+                }
             return {"ok": True, "message": "Transaction rolled back to snapshot"}
 
         return await self._async(_sync)
@@ -8818,7 +9829,9 @@ class EzdxfBackend(AutoCADBackend):
 
         return await self._async(_sync)
 
-    async def dimstyle_modify(self, name: str, values: dict) -> dict:
+    async def dimstyle_modify(
+        self, name: str, values: dict, rerender: bool = True, force: bool = False
+    ) -> dict:
         from engineering.standards.dimstyles import validate_overrides
 
         typed = validate_overrides(values)
@@ -8840,12 +9853,35 @@ class EzdxfBackend(AutoCADBackend):
                 )
             _require_arrowhead_blocks(doc, typed)
             before = _read_dimstyle_values(style, tuple(typed))
+            raw_before = {
+                var.lower(): style.dxf.get(var.lower())
+                for var in typed
+                if style.dxf.hasattr(var.lower())
+            }
             _write_dimstyle_values(style, typed)
             after = _read_dimstyle_values(style, tuple(typed))
             changed = {var: [before[var], after[var]] for var in typed if before[var] != after[var]}
+            using = _dimensions_using(doc, style.dxf.name)
+            rerendered: list[str] = []
+            text_kept: list[str] = []
+            if changed and using and rerender:
+                # 1.8-15: a headless DIMENSION carries its rendered block and
+                # shows the old style until redrawn - so it is redrawn here,
+                # all or nothing: a dimension that cannot be redrawn puts the
+                # style back too, so a refusal leaves the drawing as it was.
+                try:
+                    done = self._rerender_sync(using, bool(force))
+                except DimensionRenderError:
+                    for var in typed:
+                        attr = var.lower()
+                        if attr in raw_before:
+                            style.dxf.set(attr, raw_before[attr])
+                        else:
+                            style.dxf.discard(attr)
+                    raise
+                rerendered, text_kept = done["rerendered"], done["text_kept"]
             if changed and style.dxf.name == _current_dimstyle_name(doc):
                 _sync_header_to_dimstyle(doc, style)
-            using = _dimensions_using(doc, style.dxf.name)
             if changed:
                 self._mark_dirty()
             return {
@@ -8853,9 +9889,10 @@ class EzdxfBackend(AutoCADBackend):
                 "name": style.dxf.name,
                 "changed": changed,
                 "dimensions_using_style": using,
-                # A headless DIMENSION carries its rendered block; it shows the
-                # old style until redrawn. Stated, not silent.
-                "rerender_required": bool(changed and using),
+                "rerendered": rerendered,
+                "text_kept": text_kept,
+                # Only rerender=False (the 1.7 behaviour) leaves them stale.
+                "rerender_required": bool(changed and using and not rerender),
             }
 
         return await self._async(_sync)

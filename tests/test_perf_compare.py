@@ -75,12 +75,85 @@ def test_without_aa_the_bound_is_five_percent():
 
 def test_the_parser_defaults_are_the_gate_s():
     args = pc.build_parser().parse_args([])
-    assert (args.base, args.warmup, args.rounds, args.aa) == ("v1.6.0", 5, 20, False)
+    assert (args.base, args.warmup, args.rounds, args.aa) == ("auto", 5, 20, False)
     assert args.workloads.split(",") == list(pc.WORKLOADS)
     assert pc.WORKLOADS[-1] == "server_create_lines_2k"
+
+
+def _fake_git(tags_at_head: str, describe: dict[str, str]):
+    calls: list[tuple[str, ...]] = []
+
+    def git(*args: str) -> str:
+        calls.append(args)
+        if args[:2] == ("tag", "--points-at"):
+            return tags_at_head
+        if args[0] == "describe":
+            return describe[args[-1]]
+        raise AssertionError(args)
+
+    return git, calls
+
+
+def test_base_auto_is_the_previous_release_tag():
+    """1.8-14: no more hard-coded v1.6.0 - a branch compares with its last release."""
+    git, _calls = _fake_git("", {"HEAD": "v1.7.0"})
+    assert pc.resolve_base("auto", git) == "v1.7.0"
+
+
+def test_base_auto_on_a_tagged_release_skips_the_tag_itself():
+    git, calls = _fake_git("v1.8.0", {"HEAD^": "v1.7.0"})
+    assert pc.resolve_base("auto", git) == "v1.7.0"
+    assert ("describe", "--tags", "--abbrev=0", "HEAD^") in calls
+
+
+def test_an_explicit_base_is_used_as_given():
+    def git(*_args):
+        raise AssertionError("an explicit ref needs no git call")
+
+    assert pc.resolve_base("v1.6.0", git) == "v1.6.0"
+
+
+def test_base_auto_with_no_tag_is_refused_by_name():
+    import subprocess
+
+    def git(*args):
+        if args[0] == "describe":
+            raise subprocess.CalledProcessError(128, ["git", *args])
+        return ""
+
+    with pytest.raises(SystemExit, match="no release tag"):
+        pc.resolve_base("auto", git)
 
 
 def test_one_measurement_in_this_tree(tmp_path):
     measured = pc.run_in_tree(REPO, ["create_lines_2k", "server_create_lines_2k"], tmp_path)
     assert set(measured) == {"create_lines_2k", "server_create_lines_2k"}
     assert all(value > 0 for value in measured.values())
+
+
+def test_a_measurement_runs_in_a_fresh_state_folder_of_its_own(monkeypatch, tmp_path):
+    """MEASURED 2026-11-05: the machine's default state folder - a 213 MB journal
+    and 656 checkpoint lineages left by earlier gate runs - put 6 % on the
+    server workload and 41 ms on every open; the gate measures the code, not
+    that residue, so each worker gets an empty folder the journal accepts
+    (outside the checkout), removed with whatever the worker wrote into it."""
+    import subprocess
+
+    from backends.journal_store import check_state_dir
+
+    seen: dict[str, Path] = {}
+
+    def fake_run(args, *, cwd, env, **_kwargs):
+        folder = Path(env["ACADMCP_STATE_DIR"])
+        assert folder.is_dir() and not any(folder.iterdir()), "fresh and empty"
+        assert check_state_dir(folder) == folder.resolve(), "a folder the journal accepts"
+        assert REPO not in folder.resolve().parents, "never inside the checkout"
+        assert REPO != folder.resolve()
+        assert env["DISCOVERY_MODE"] == "off" and env["AUTOCAD_MCP_BACKEND"] == "ezdxf"
+        seen["state"] = folder
+        (folder / "journal.sqlite3").write_bytes(b"what a worker leaves behind")
+        return subprocess.CompletedProcess(args, 0, stdout='{"create_lines_2k": 1.0}\n', stderr="")
+
+    monkeypatch.setattr(pc.subprocess, "run", fake_run)
+    assert pc.run_in_tree(REPO, ["create_lines_2k"], tmp_path) == {"create_lines_2k": 1.0}
+    assert not seen["state"].exists(), "removed with what the worker wrote"

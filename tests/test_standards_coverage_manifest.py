@@ -45,6 +45,8 @@ EMPTY = {
     "DIN 509-E": "DIN 509",
     "DIN 509-F": "DIN 509",
     "ISO 3601-2": "ISO 3601-2",
+    # 1.8-22: the axial housings are their own table, keyed by cord like the radial one.
+    "ISO 3601-2-axial": "ISO 3601-2",
 }
 FIELDS = (
     "standard",
@@ -295,7 +297,7 @@ def test_the_inventory_and_the_readme_count_the_new_resource():
     inventory = json.loads((root / "docs" / "tool-inventory.json").read_text(encoding="utf-8"))
     uris = {row["uri"] for row in inventory["resources"]}
     assert "autocad://standards/coverage" in uris
-    assert inventory["totals"]["resources"] == len(inventory["resources"]) == 11
+    assert inventory["totals"]["resources"] == len(inventory["resources"]) == 13
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "· 11 resources ·" in readme
+    assert "· 13 resources ·" in readme
     assert "<code>standards/coverage</code>" in readme

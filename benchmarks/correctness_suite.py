@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import math
 import os
 import shutil
@@ -1711,6 +1712,1611 @@ async def verify_t36_report_stale_after_file_change():
     )
 
 
+# ── 1.8.0 W1: lineweight truth, one error envelope, durable state, region render ──
+#
+# Every module 1.8.0 added (backends.atomic_write, engineering.errors,
+# backends.base.parse_lineweight ...) is imported INSIDE its check: the A/B
+# runner executes this file against the v1.7.0 tree too, where a module-level
+# import of a new name would break every check instead of failing this one.
+# A check that drives the server resolves ``server.py`` from the tree under
+# test (the working directory / PYTHONPATH the runner sets), never from this
+# file's location, and points ``ACADMCP_STATE_DIR`` at a fresh folder outside
+# every repository so nothing reaches the developer's real journal.
+
+
+@contextlib.contextmanager
+def _environment(**values):
+    """Set (or, with None, remove) environment variables; restore them on exit.
+
+    The test suite runs these checks in-process, so nothing may leak out.
+    """
+    saved = {name: os.environ.get(name) for name in values}
+    try:
+        for name, value in values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextlib.asynccontextmanager
+async def _served_headless():
+    """An in-memory MCP client on ``server.mcp`` over a fresh headless document.
+
+    The backend factory is replaced (as ``verify_t05`` does) so the lifespan can
+    never attach to a running AutoCAD, and the durable journal of 1.8.0 opens in
+    a private temporary folder.
+    """
+    from fastmcp import Client
+
+    import server
+    from backends.ezdxf_backend import EzdxfBackend
+
+    async def make():
+        backend = EzdxfBackend()
+        await backend.connect()
+        await backend.drawing_new()
+        return backend
+
+    original = server._make_backend
+    server._make_backend = make
+    try:
+        with _environment(
+            AUTOCAD_MCP_BACKEND="ezdxf", ACADMCP_STATE_DIR=_scratch_dir("acadmcp_state_")
+        ):
+            async with Client(server.mcp) as client:
+                yield client
+    finally:
+        server._make_backend = original
+
+
+async def lineweight_truth():
+    """-3 is Default, ``"ByLayer"`` is -1, and a layer refuses ByLayer before writing.
+
+    1.7.0's schemas said "-3=ByLayer": an entity set to -3 (DXF Default, the
+    LWDEFAULT setting) was reported to the model as by-layer. Now the entity row
+    names what it carries (``lineweight_name``): -3 reads "Default"; the name
+    ``"ByLayer"`` lands as DXF -1 and reads back "ByLayer". A layer cannot be
+    ByLayer: ``layer_create(lineweight="ByLayer")`` raises the typed
+    ``InvalidLineweightError`` and neither the layer table nor the document
+    revision moves - the refusal comes before any write.
+    """
+    from backends.base import InvalidLineweightError
+
+    b = await _b()
+    line = await b.entity_create_line(0, 0, 10, 0)
+    await b.entity_set_properties(line.handle, lineweight=-3)
+    as_default = getattr(await b.entity_get(line.handle), "lineweight_name", None)
+    default_ok = as_default == "Default" and b._doc.entitydb[line.handle].dxf.lineweight == -3
+
+    await b.entity_set_properties(line.handle, lineweight="ByLayer")
+    as_bylayer = getattr(await b.entity_get(line.handle), "lineweight_name", None)
+    bylayer_ok = as_bylayer == "ByLayer" and b._doc.entitydb[line.handle].dxf.lineweight == -1
+
+    revision = b.document_identity()["revision"]
+    try:
+        await b.layer_create("LW-REFUSED", lineweight="ByLayer")
+        refused = False
+    except InvalidLineweightError:
+        refused = True
+    unwritten = "LW-REFUSED" not in b._doc.layers and b.document_identity()["revision"] == revision
+    return default_ok and bylayer_ok and refused and unwritten
+
+
+async def _step_error(client, tool: str, args: dict) -> dict | None:
+    """The one step row's error of ``cad_batch``; a step the batch refuses before
+    running anything is read off the dry run, where its row is reported.
+
+    1.8.0 (plan 1.8-09) refuses a LITERAL handle that names nothing before any
+    step runs (``unknown_handle``). The step route is then staged so that the
+    handle goes missing while the batch runs - a line created and deleted by
+    two earlier steps, referenced as ``$gone`` - and the last row is read: that
+    is the route on which the step itself meets the missing handle.
+    """
+    steps = [{"tool": tool, "args": args}]
+    result = await client.call_tool(
+        "cad_batch", {"steps": steps, "on_error": "continue"}, raise_on_error=False
+    )
+    refused = result.structured_content if result.is_error else None
+    if isinstance(refused, dict) and refused.get("kind") == "unknown_handle":
+        staged = [
+            {
+                "tool": "entity_create_line",
+                "args": {"x1": 0, "y1": 0, "x2": 1, "y2": 0},
+                "bind": "gone",
+            },
+            {"tool": "entity_delete", "args": {"handle": "$gone"}},
+            {"tool": tool, "args": {**args, "handle": "$gone"}},
+        ]
+        result = await client.call_tool(
+            "cad_batch", {"steps": staged, "on_error": "continue"}, raise_on_error=False
+        )
+        rows = (result.structured_content or {}).get("results") or []
+        last = rows[-1] if len(rows) == 3 else {}
+        return last.get("error") if isinstance(last.get("error"), dict) else None
+    if result.is_error:
+        result = await client.call_tool(
+            "cad_batch", {"steps": steps, "dry_run": True}, raise_on_error=False
+        )
+    rows = (result.structured_content or {}).get("results") or []
+    if len(rows) != 1 or not isinstance(rows[0].get("error"), dict):
+        return None
+    return rows[0]["error"]
+
+
+async def error_envelope_routes_agree():
+    """A refusal has one typed envelope, called directly or as a batch step (1.8-02).
+
+    Two provoked errors through the real tools: ``entity_move`` on a handle
+    that does not exist (``not_found``) and ``drawing_open`` outside
+    ``ALLOWED_PATHS`` (``path_refused``). The direct call must fail with
+    structured content ``{ok: false, kind, category, retryable}`` - 1.7.0 sent
+    prose only - and the same call as a ``cad_batch`` step must carry the same
+    kind, category and retryable. Category is the kind's own row of
+    ``engineering.errors``; neither refusal wrote anything, so neither is
+    retryable-by-accident: both routes must agree whatever the value.
+    """
+    from pathlib import Path
+
+    import config
+    from engineering import errors
+
+    drawings = _scratch_dir()
+    allowed = os.path.join(drawings, "allowed")
+    os.makedirs(allowed)
+    cases = (
+        ("not_found", "entity_move", {"handle": "FFFFFF", "dx": 1.0, "dy": 0.0}),
+        ("path_refused", "drawing_open", {"path": os.path.join(drawings, "elsewhere.dxf")}),
+    )
+    saved_paths = list(config.settings.allowed_paths)
+    config.settings.allowed_paths = [Path(allowed).resolve()]
+    agreed: list[bool] = []
+    try:
+        async with _served_headless() as client:
+            for kind, tool, args in cases:
+                direct = await client.call_tool(tool, args, raise_on_error=False)
+                payload = direct.structured_content
+                if not direct.is_error or not isinstance(payload, dict):
+                    agreed.append(False)
+                    continue
+                step = await _step_error(client, tool, args)
+                if step is None:
+                    agreed.append(False)
+                    continue
+                category = errors.describe(kind).category
+                agreed.append(
+                    payload.get("ok") is False
+                    and payload.get("kind") == kind
+                    and payload.get("category") == category
+                    and isinstance(payload.get("retryable"), bool)
+                    and (step.get("kind"), step.get("category"), step.get("retryable"))
+                    == (kind, category, payload["retryable"])
+                )
+    finally:
+        config.settings.allowed_paths = saved_paths
+    return len(agreed) == len(cases) and all(agreed)
+
+
+class _StdioServer:
+    """``python server.py`` of the tree under test over stdio, raw JSON-RPC lines.
+
+    Raw lines rather than a fastmcp client so that ``Popen.kill()``
+    (TerminateProcess on Windows, SIGKILL elsewhere) is an unannounced death:
+    no shutdown hook of the server runs.
+    """
+
+    def __init__(self, script: str, env: dict, cwd: str, log_path: str, timeout: float):
+        import queue
+        import subprocess
+        import threading
+
+        self._log = open(log_path, "ab")  # noqa: SIM115 - closed in kill()
+        self.proc = subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._log,
+            env=env,
+            cwd=cwd,
+        )
+        self._lines: queue.Queue = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+        self._next_id = 0
+        self._answers: dict[int, dict] = {}
+        self.request(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "correctness-suite", "version": "0"},
+            },
+            timeout,
+        )
+        self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _pump(self) -> None:
+        import json
+
+        for raw in self.proc.stdout:
+            line = raw.strip()
+            if line:
+                try:
+                    self._lines.put(json.loads(line))
+                except ValueError:
+                    continue  # not a JSON-RPC line
+        self._lines.put(None)
+
+    def _write(self, message: dict) -> None:
+        import json
+
+        self.proc.stdin.write(json.dumps(message).encode("utf-8") + b"\n")
+        self.proc.stdin.flush()
+
+    def request(self, method: str, params: dict, timeout: float) -> dict:
+        import time
+
+        self._next_id += 1
+        request_id = self._next_id
+        self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while request_id not in self._answers:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"no answer to {method} within {timeout:.0f}s")
+            message = self._lines.get(timeout=left)
+            if message is None:
+                raise RuntimeError("the server closed its stdout")
+            if "id" in message and ("result" in message or "error" in message):
+                self._answers[message["id"]] = message
+        message = self._answers.pop(request_id)
+        if "error" in message:
+            return {"isError": True, "rpc_error": message["error"]}
+        return message["result"]
+
+    def call(self, name: str, arguments: dict | None = None, timeout: float = 30.0) -> dict:
+        result = self.request("tools/call", {"name": name, "arguments": arguments or {}}, timeout)
+        return {"is_error": bool(result.get("isError")), **(result.get("structuredContent") or {})}
+
+    def kill(self) -> None:
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=30)
+        finally:
+            for stream in (self.proc.stdin, self.proc.stdout, self._log):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def _server_env(state_dir: str) -> dict:
+    """The parent's environment minus every journal / state setting, headless,
+    the full advertised surface, the tree under test first on ``PYTHONPATH``."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("JOURNAL_", "CHECKPOINT_", "ACADMCP_"))
+    }
+    env.update(
+        {
+            "AUTOCAD_MCP_BACKEND": "ezdxf",
+            "ACADMCP_STATE_DIR": state_dir,
+            "PYTHONUTF8": "1",
+            "PYTHONPATH": os.getcwd(),
+            "TOOL_PROFILE": "full",
+            "TOOL_PACKS": "all",
+            "DISCOVERY_MODE": "off",
+        }
+    )
+    return env
+
+
+def _journal_replay_after_kill() -> bool:
+    script = os.path.join(os.getcwd(), "server.py")
+    if not os.path.isfile(script):
+        return False
+    state_dir = _scratch_dir("acadmcp_state_")
+    drawings = _scratch_dir()
+    log_path = os.path.join(drawings, "server.log")
+    path = os.path.join(drawings, "replay.dxf")
+    line = {"x1": 0, "y1": 0, "x2": 10, "y2": 0}
+    batch = {"steps": [{"tool": "entity_create_line", "args": line}], "operation_id": "op-1"}
+    other = {
+        "steps": [{"tool": "entity_create_line", "args": {**line, "x2": 20}}],
+        "operation_id": "op-1",
+    }
+
+    first = _StdioServer(script, _server_env(state_dir), drawings, log_path, timeout=40.0)
+    try:
+        first.call("drawing_new")
+        ran = first.call("cad_batch", batch)
+        saved = first.call("drawing_save", {"path": path})
+    finally:
+        first.kill()
+    if ran.get("ok") is not True or saved["is_error"]:
+        return False
+
+    second = _StdioServer(script, _server_env(state_dir), drawings, log_path, timeout=40.0)
+    try:
+        opened = second.call("drawing_open", {"path": path})
+        count_before = second.call("drawing_info").get("entity_count")
+        replay = second.call("cad_batch", batch)
+        count_after = second.call("drawing_info").get("entity_count")
+        conflict = second.call("cad_batch", other)
+        count_last = second.call("drawing_info").get("entity_count")
+    finally:
+        second.kill()
+    return (
+        opened["is_error"] is False
+        and count_before == 1
+        and replay.get("replayed") is True
+        and replay.get("operation_id") == "op-1"
+        and replay.get("ok") is True
+        and replay.get("succeeded") == ran.get("succeeded") == 1
+        and count_after == 1
+        and conflict["is_error"] is True
+        and conflict.get("kind") == "operation_conflict"
+        and count_last == 1
+    )
+
+
+async def journal_replay_after_kill():
+    """A client operation id survives a killed server (B13, 1.8-03).
+
+    Server A (``python server.py`` of the tree under test, stdio, headless, a
+    fresh ``ACADMCP_STATE_DIR``) runs ``cad_batch(operation_id="op-1")`` - one
+    line - saves and is killed. Server B on the same state folder opens the
+    file (1 entity); the same id with the same steps answers ``replayed: true``
+    with A's ``succeeded`` (1) and draws nothing (still 1 entity); the same id
+    with other steps is ``operation_conflict`` and draws nothing either. On
+    1.7.0 the journal lived in memory, so B ran op-1 again: 2 entities.
+    """
+    return await asyncio.to_thread(_journal_replay_after_kill)
+
+
+async def atomic_save_untouched_on_failure():
+    """A save that cannot replace its target leaves it byte for byte (1.8-04).
+
+    The document is saved once, gains a circle, and is saved again while the
+    target is held: on Windows by an open handle that does not share delete
+    access - what an antivirus scan or a viewer does, and what makes
+    ``os.replace`` fail with a sharing violation; elsewhere by an
+    ``os.replace`` that raises ``PermissionError`` onto the target. The save
+    must be refused with the typed kind ``save_locked``, the target's bytes
+    must be the first save's, and no ``.tmp`` (nor a pending marker) may stay
+    behind. Released, the same document saves (2 entities). 1.7.0 wrote
+    straight into the target - it was rewritten under the reader's handle.
+    """
+    import ezdxf
+
+    state = _scratch_dir("acadmcp_state_")
+    with _environment(ACADMCP_STATE_DIR=state):
+        b = await _b()
+        await b.entity_create_line(0, 0, 10, 0)
+        folder = _scratch_dir()
+        target = os.path.join(folder, "part.dxf")
+        await b.drawing_save_as(target, "dxf")
+        with open(target, "rb") as stream:
+            before = stream.read()
+        await b.entity_create_circle(0, 0, 5)
+
+        if sys.platform == "win32":
+            holder = open(target, "rb")  # noqa: SIM115 - held across the save on purpose
+            release = holder.close
+        else:
+            from backends import atomic_write
+
+            real_replace = atomic_write.os.replace
+
+            def locked(src, dst, *args, **kwargs):
+                if os.path.abspath(dst) == os.path.abspath(target):
+                    raise PermissionError(13, "The process cannot access the file", dst)
+                return real_replace(src, dst, *args, **kwargs)
+
+            atomic_write.os.replace = locked
+
+            def release():
+                atomic_write.os.replace = real_replace
+
+        refusal = None
+        try:
+            await b.drawing_save()
+        except Exception as exc:  # noqa: BLE001 - the refusal's type is what is checked
+            refusal = exc
+        finally:
+            release()
+
+        with open(target, "rb") as stream:
+            after = stream.read()
+        leftovers = [n for n in os.listdir(folder) if n.endswith(".tmp") or ".acadmcp-" in n]
+        pending = os.path.join(state, "pending")
+        markers = os.listdir(pending) if os.path.isdir(pending) else []
+        refused_ok = refusal is not None and getattr(refusal, "kind", None) == "save_locked"
+        if not (refused_ok and after == before and not leftovers and not markers):
+            return False
+        await b.drawing_save()
+        return len(ezdxf.readfile(target).modelspace()) == 2
+
+
+async def lineage_revision_continues():
+    """Reopening an unchanged saved file continues its document and revision (1.8-04).
+
+    A plain DXF is opened, gains three lines (revision 3), is saved and its
+    document closed. A fresh engine opens the same, unchanged file: the
+    ``document_id`` is the one the first engine held and the revision is 3 -
+    it continues, never back to 0. 1.7.0 minted a new id at revision 0 on
+    every open. The lineage lives in ``<ACADMCP_STATE_DIR>/lineage``, never in
+    the DXF.
+    """
+    import ezdxf
+
+    from backends.ezdxf_backend import EzdxfBackend
+
+    folder = _scratch_dir()
+    path = os.path.join(folder, "part.dxf")
+    ezdxf.new("R2010").saveas(path)
+    with _environment(ACADMCP_STATE_DIR=_scratch_dir("acadmcp_state_")):
+        writer = EzdxfBackend()
+        await writer.connect()
+        try:
+            await writer.drawing_open(path)
+            for y in range(3):
+                await writer.entity_create_line(0, y, 10, y)
+            await writer.drawing_save()
+            before = writer.document_identity()
+            await writer.document_close()
+        finally:
+            await writer.disconnect()
+
+        reader = EzdxfBackend()
+        await reader.connect()
+        try:
+            await reader.drawing_open(path)
+            after = reader.document_identity()
+        finally:
+            await reader.disconnect()
+    return (
+        before["revision"] == 3
+        and after["document_id"] == before["document_id"]
+        and after["revision"] == before["revision"]
+    )
+
+
+def _png_size(data: bytes) -> tuple[int, int] | None:
+    """(width, height) from a PNG's IHDR chunk, or None for anything else."""
+    if len(data) < 24 or not data.startswith(b"\x89PNG\r\n\x1a\n") or data[12:16] != b"IHDR":
+        return None
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def _region_report(result, requested: tuple[float, float, float, float]) -> bool:
+    """One applied region image: ``px`` [400, 200] for a 2:1 window at max_px
+    400, the PNG's own size equal to ``px``, one scale on x and y, and the drawn
+    window holding the requested one."""
+    import base64
+
+    report = result.structured_content
+    if result.is_error or not isinstance(report, dict):
+        return False
+    images = [c for c in result.content if getattr(c, "type", None) == "image"]
+    if len(images) != 1 or report.get("applied") is not True:
+        return False
+    region, ppu = report.get("region"), report.get("px_per_unit")
+    if report.get("framing") != "region" or report.get("px") != [400, 200]:
+        return False
+    if not region or len(region) != 4 or not ppu:
+        return False
+    x0, y0, x1, y1 = region
+    rx0, ry0, rx1, ry1 = requested
+    return (
+        _png_size(base64.b64decode(images[0].data)) == (400, 200)
+        and math.isclose(400 / (x1 - x0), ppu, rel_tol=1e-9)
+        and math.isclose(200 / (y1 - y0), ppu, rel_tol=1e-9)
+        and x0 <= rx0
+        and y0 <= ry0
+        and x1 >= rx1
+        and y1 >= ry1
+    )
+
+
+async def region_render_applied():
+    """A window is really drawn, at a stated scale, on both region tools (1.8-07).
+
+    ``view_screenshot(region=[0, 0, 100, 50], max_px=400)`` must answer
+    ``applied: true`` with ``px`` [400, 200] (the PNG's own size; a 2:1 window
+    at a 400 px long side) and ``px_per_unit`` 4 on x and on y.
+    ``view_zoom_and_screenshot`` with the same four corners must do the same
+    headlessly - 1.7.0 passed the window to a no-op zoom and rendered the whole
+    model space, with nothing saying so; ``view_screenshot`` had no region.
+    """
+    requested = (0.0, 0.0, 100.0, 50.0)
+    async with _served_headless() as client:
+        await client.call_tool("entity_create_circle", {"cx": 50, "cy": 25, "radius": 10})
+        await client.call_tool("entity_create_circle", {"cx": 1000, "cy": 0, "radius": 5})
+        shot = await client.call_tool(
+            "view_screenshot", {"region": list(requested), "max_px": 400}, raise_on_error=False
+        )
+        zoomed = await client.call_tool(
+            "view_zoom_and_screenshot",
+            {"x1": 0, "y1": 0, "x2": 100, "y2": 50, "max_px": 400},
+            raise_on_error=False,
+        )
+    return _region_report(shot, requested) and _region_report(zoomed, requested)
+
+
+async def qa_coverage_not_checked():
+    """A lane the critique did not check is named, never read as clean (1.8-16).
+
+    A drawing with a frame line on ``Layout1`` and no viewport onto the model:
+    ``drawing_critique(report=True)`` must report the paper layout's
+    dimension-legibility lane ``not_checked`` with reason ``no_viewport_scale``
+    and ``coverage.complete`` false; ``drawing_finalize`` must pass and carry
+    the same row in ``qa_coverage``; ``strict_critique=True`` must fail
+    ``critique_gate_failed`` with a blocking row of code ``not_checked`` naming
+    it. 1.7.0 returned a bare list in which "nothing found" and "nothing
+    looked" read the same, and had no ``report`` argument at all.
+    """
+    want = {"focus": "iso128", "layout": "Layout1", "reason": "no_viewport_scale"}
+    out = tempfile.mkdtemp(prefix="acadmcp_cov_")
+    try:
+        async with _served_headless() as client:
+            await client.call_tool("drawing_new", {})
+            await client.call_tool(
+                "entity_create_line", {"x1": 0, "y1": 0, "x2": 50, "y2": 0, "layer": "GEOMETRY"}
+            )
+            await client.call_tool("layout_set_current", {"name": "Layout1"})
+            await client.call_tool(
+                "entity_create_line",
+                {"x1": 0, "y1": 0, "x2": 420, "y2": 0, "layer": "TITLEBLOCK"},
+            )
+            await client.call_tool("layout_set_current", {"name": "Model"})
+            critique = await client.call_tool(
+                "drawing_critique", {"report": True}, raise_on_error=False
+            )
+            lenient = await client.call_tool(
+                "drawing_finalize",
+                {"save_path": os.path.join(out, "a.dxf")},
+                raise_on_error=False,
+            )
+            strict = await client.call_tool(
+                "drawing_finalize",
+                {"save_path": os.path.join(out, "b.dxf"), "strict_critique": True},
+                raise_on_error=False,
+            )
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+    if critique.is_error or lenient.is_error or not strict.is_error:
+        return False
+    reported = critique.structured_content or {}
+    reported = reported.get("result", reported)
+    coverage = reported.get("coverage") or {}
+    layouts = {entry.get("layout"): entry for entry in coverage.get("layouts") or []}
+    named = any(
+        row.get("focus") == "iso128" and row.get("reason") == "no_viewport_scale"
+        for row in (layouts.get("Layout1") or {}).get("not_checked") or []
+    )
+    qa_coverage = (lenient.structured_content or {}).get("qa_coverage") or {}
+    carried = [{key: row.get(key) for key in want} for row in qa_coverage.get("not_checked") or []]
+    gate = strict.structured_content or {}
+    blocked = [
+        {key: row.get(key) for key in want}
+        for row in gate.get("blocking") or []
+        if row.get("code") == "not_checked"
+    ]
+    return (
+        coverage.get("complete") is False
+        and named
+        and want in carried
+        and gate.get("kind") == "critique_gate_failed"
+        and want in blocked
+    )
+
+
+async def dimension_display_truth():
+    """A dimension shows what its style formats, and its block shows it too (1.8-15).
+
+    A 19.6 mm dimension drawn under DIMDEC 2, then the style changed to
+    DIMDEC 0: the sheet must show "20" - in the ``*D`` block the drawing
+    carries (the headless ``dimstyle_modify`` redraws) and in what
+    ``bind_dimension`` reports (``displayed_text`` "20", ``display_rounding``
+    0.4, no mismatch: rounding is not a lie). v1.7.0 reported "19.6" and left
+    the block saying "19.6" behind ``rerender_required``.
+    """
+    from engineering.understand.snapshot import records_from_doc
+    from engineering.verification.binding import bind_dimension
+    from engineering.verification.observe import observe
+
+    b = await _b()
+    msp = b._doc.modelspace()
+    msp.add_line((0, 0), (0, 20))
+    msp.add_line((19.6, 0), (19.6, 20))
+    dim = await b.dimension_linear(0, 0, 19.6, 0, 10, -10)
+    await b.dimstyle_modify("Standard", {"DIMDEC": 0})
+    entity = b._doc.entitydb[dim.handle]
+    shown = [e.plain_text() for e in entity.get_geometry_block() if e.dxftype() == "MTEXT"]
+    observed = observe(records_from_doc(b._doc, source="check"))
+    (feature,) = [f for f in observed.features if f.type == "dimension"]
+    result = bind_dimension(feature, observed, epsilon=1e-6)
+    rounding = result.get("display_rounding")
+    return (
+        shown == ["20"]
+        and result["displayed_text"] == "20"
+        and rounding is not None
+        and abs(rounding - 0.4) < 1e-9
+        and result["mismatch"] is False
+    )
+
+
+async def dimension_truth_focus():
+    """Every way a dimension lies is one ``dimension_truth`` finding (1.8-15).
+
+    Three dimensions on real geometry: a "42" override over 40 mm, a diameter
+    whose override ``%%c<>`` doubles the sign, and one whose DSTYLE override
+    says DIMDEC 0 while its ``*D`` block still says "19.6". The focus must
+    report exactly ``dim_override_disagrees``, ``dim_double_prefix`` and
+    ``dim_render_stale`` on those three, and ``drawing_refine`` must redraw
+    the stale one and leave the two lies to a person. v1.7.0 has no such
+    focus (the name is an unknown focus there).
+    """
+    from ezdxf.entities import DimStyleOverride
+
+    from engineering.critique import run_critique
+    from engineering.refiner import refine_drawing
+
+    b = await _b()
+    msp = b._doc.modelspace()
+    for x in (0, 40, 100, 119.6):
+        msp.add_line((x, 0), (x, 20))
+    msp.add_circle((200, 0), 10)
+    lie = await b.dimension_linear(0, 0, 40, 0, 20, -10, text_override="42")
+    double = await b.dimension_diameter(190, 0, 210, 0, text_override="%%c<>")
+    stale = await b.dimension_linear(100, 0, 119.6, 0, 110, -10)
+    override = DimStyleOverride(b._doc.entitydb[stale.handle])
+    override.dimstyle_attribs["dimdec"] = 0
+    override.commit()
+    issues = await run_critique(b, ["dimension_truth"])
+    got = sorted((str(i.detail.get("code")), i.handles[0]) for i in issues)
+    want = sorted(
+        [
+            ("dim_override_disagrees", lie.handle),
+            ("dim_double_prefix", double.handle),
+            ("dim_render_stale", stale.handle),
+        ]
+    )
+    if got != want:
+        return False
+    refined = await refine_drawing(b, focus=["dimension_truth"], min_score=100.0)
+    left = sorted((str(i["detail"].get("code")), i["handles"][0]) for i in refined.remaining_issues)
+    return left == [("dim_double_prefix", double.handle), ("dim_override_disagrees", lie.handle)]
+
+
+async def policy_read_only_batch():
+    """READ_ONLY refuses a write batch before step 1, revision unchanged (1.8-17).
+
+    ``config.settings.read_only`` is set on the settings object (1.7.0 has no
+    such setting and ignores it, so the batch draws its line there: the check
+    fails on 1.7.0 and passes from 1.8.0). Through the real server: a
+    ``cad_batch`` whose one step is ``entity_create_line`` must come back
+    ``policy_refused`` with policy ``read_only``, and the document's entity
+    count and content revision - read through the read tools the policy
+    still allows - must not move.
+    """
+    import config
+
+    saved = getattr(config.settings, "read_only", False)
+    try:
+        async with _served_headless() as client:
+            await client.call_tool("entity_create_line", {"x1": 0, "y1": 0, "x2": 10, "y2": 0})
+            config.settings.read_only = True
+            before = (await client.call_tool("system_status", {})).structured_content or {}
+            batch = await client.call_tool(
+                "cad_batch",
+                {
+                    "steps": [
+                        {
+                            "tool": "entity_create_line",
+                            "args": {"x1": 0, "y1": 0, "x2": 5, "y2": 5},
+                        }
+                    ]
+                },
+                raise_on_error=False,
+            )
+            after = (await client.call_tool("system_status", {})).structured_content or {}
+            info = (await client.call_tool("drawing_info", {})).structured_content or {}
+    finally:
+        config.settings.read_only = saved
+    payload = batch.structured_content or {}
+    return (
+        bool(batch.is_error)
+        and payload.get("kind") == "policy_refused"
+        and payload.get("policy") == "read_only"
+        and before.get("revision") is not None
+        and after.get("revision") == before.get("revision")
+        and info.get("entity_count") == 1
+    )
+
+
+async def write_path_autoload_refused():
+    """No tool writes a file AutoCAD autoloads (1.8-17).
+
+    ``data_extract`` to ``acaddoc.lsp`` and ``drawing_save_as`` to ``acad.lsp``
+    in a scratch folder must both be refused ``path_refused`` with nothing
+    written - 1.7.0 checked no extension on either.
+    """
+    from pathlib import Path
+
+    folder = Path(_scratch_dir("acadmcp_autoload_"))
+    targets = {
+        "data_extract": folder / "acaddoc.lsp",
+        "drawing_save_as": folder / "acad.lsp",
+    }
+    kinds = {}
+    async with _served_headless() as client:
+        await client.call_tool("entity_create_line", {"x1": 0, "y1": 0, "x2": 10, "y2": 0})
+        for tool, target in targets.items():
+            result = await client.call_tool(tool, {"path": str(target)}, raise_on_error=False)
+            kinds[tool] = (
+                (result.structured_content or {}).get("kind") if result.is_error else "written"
+            )
+    return all(kind == "path_refused" for kind in kinds.values()) and not any(
+        target.exists() for target in targets.values()
+    )
+
+
+async def dimension_auto_one_call_part():
+    """A plate dimensioned in one call, and not twice (1.8-13).
+
+    A closed 120 x 80 outline, six Ø11 holes, two R8 arcs and an ellipse, all
+    on GEOMETRY, in millimetres. One ``dimension_auto(selector={"layer":
+    "GEOMETRY"})`` must draw exactly four edge dimensions measuring 120, 80,
+    120, 80, six diameters of 11 and two radii of 8 - sizes fixed here, read
+    back off the DIMENSIONs themselves - and name the ellipse in ``omitted``. A
+    second identical call must draw nothing. 1.7.0 took LINE handles only and
+    refused the rest, so it cannot take a selector at all.
+    """
+    from pathlib import Path
+
+    import ezdxf
+
+    path = Path(_scratch_dir("acadmcp_dimauto_")) / "plate.dxf"
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 4
+    doc.layers.add("GEOMETRY")
+    msp = doc.modelspace()
+    geometry = {"layer": "GEOMETRY"}
+    msp.add_lwpolyline([(0, 0), (120, 0), (120, 80), (0, 80)], close=True, dxfattribs=geometry)
+    for x in (15.0, 60.0, 105.0):
+        for y in (15.0, 65.0):
+            msp.add_circle((x, y), 5.5, dxfattribs=geometry)
+    msp.add_arc((40, 40), 8.0, 0.0, 180.0, dxfattribs=geometry)
+    msp.add_arc((80, 40), 8.0, 180.0, 360.0, dxfattribs=geometry)
+    ellipse = msp.add_ellipse((60, 40), major_axis=(6, 0), ratio=0.5, dxfattribs=geometry)
+    doc.saveas(path)
+
+    b = await _b()
+    await b.drawing_open(str(path))
+    try:
+        first = await b.dimension_auto(selector={"layer": "GEOMETRY"})
+    except TypeError:  # 1.7.0: no selector
+        return False
+    report = first.to_dict()
+    dims = list(b._doc.modelspace().query("DIMENSION"))
+    kinds = sorted(d.dxf.dimtype & 0x0F for d in dims)
+    sizes = sorted(round(d.get_measurement(), 6) for d in dims)
+    omitted = [(row["handle"], row["type"]) for row in report["omitted"]]
+    again = await b.dimension_auto(selector={"layer": "GEOMETRY"})
+    after = len(list(b._doc.modelspace().query("DIMENSION")))
+    return (
+        len(report["created"]) == 12
+        and kinds == [0] * 4 + [3] * 6 + [4] * 2
+        and sizes == [8.0, 8.0] + [11.0] * 6 + [80.0, 80.0, 120.0, 120.0]
+        and omitted == [(ellipse.dxf.handle, "ELLIPSE")]
+        and len(again) == 0
+        and after == 12
+    )
+
+
+async def property_override_focus():
+    """An entity overriding its layer is named, and refine puts it back (1.8-01).
+
+    Through the real server, on the engineering layer GEOMETRY that
+    ``drawing_new`` bootstraps: a plain line must leave
+    ``drawing_critique(focus=["property_override"])`` empty; a second line
+    given colour 1 and lineweight 30 (0.30 mm, not ISO 128) must be named by
+    exactly two issues, each listing only its handle - ``lineweight_not_bylayer``
+    at ``error`` and ``color_not_bylayer`` at ``warning``.
+    ``drawing_refine(focus=["property_override"])`` must apply one repair per
+    issue, meet its threshold with nothing left, and leave the line on its
+    layer at colour 256 and lineweight ByLayer, the focus empty again. v1.7.0
+    has no such focus (the name is an unknown focus there), so nothing is named.
+    """
+
+    def _rows(result) -> list:
+        content = result.structured_content or {}
+        rows = content.get("result", content)
+        return rows if isinstance(rows, list) else []
+
+    focus = {"focus": ["property_override"]}
+    async with _served_headless() as client:
+        await client.call_tool("drawing_new", {})
+        await client.call_tool(
+            "entity_create_line", {"x1": 0, "y1": 0, "x2": 50, "y2": 0, "layer": "GEOMETRY"}
+        )
+        clean = _rows(await client.call_tool("drawing_critique", focus, raise_on_error=False))
+        line = await client.call_tool(
+            "entity_create_line", {"x1": 0, "y1": 10, "x2": 50, "y2": 10, "layer": "GEOMETRY"}
+        )
+        handle = (line.structured_content or {}).get("handle")
+        await client.call_tool(
+            "entity_set_properties", {"handle": handle, "color": 1, "lineweight": 30}
+        )
+        found = _rows(await client.call_tool("drawing_critique", focus, raise_on_error=False))
+        refined = await client.call_tool(
+            "drawing_refine", {**focus, "min_score": 100}, raise_on_error=False
+        )
+        after = _rows(await client.call_tool("drawing_critique", focus, raise_on_error=False))
+        entity = (await client.call_tool("entity_get", {"handle": handle})).structured_content
+    named = sorted(
+        (
+            row.get("focus"),
+            (row.get("detail") or {}).get("code"),
+            row.get("severity"),
+            tuple(row.get("handles") or ()),
+        )
+        for row in found
+    )
+    want = [
+        ("property_override", "color_not_bylayer", "warning", (handle,)),
+        ("property_override", "lineweight_not_bylayer", "error", (handle,)),
+    ]
+    report = refined.structured_content or {}
+    actions = [a for r in report.get("rounds") or [] for a in r.get("actions") or []]
+    repaired = sorted(
+        (a.get("focus"), (a.get("detail") or {}).get("code"), a.get("status")) for a in actions
+    )
+    entity = entity or {}
+    return (
+        clean == []
+        and named == want
+        and not refined.is_error
+        and report.get("status") == "threshold_met"
+        and report.get("remaining_issues") == []
+        and repaired
+        == [
+            ("property_override", "color_not_bylayer", "applied"),
+            ("property_override", "lineweight_not_bylayer", "applied"),
+        ]
+        and after == []
+        and entity.get("layer") == "GEOMETRY"
+        and entity.get("color") == 256
+        and entity.get("lineweight_name") == "ByLayer"
+    )
+
+
+async def search_default_lists_pins_and_batch_first():
+    """The idle surface a client meets by default (1.8-11).
+
+    With neither DISCOVERY_MODE nor DISCOVERY_PINNED set, a client must list
+    exactly search_tools, call_tool, describe_tool and the three pins
+    (cad_batch, drawing_info, entity_list); a tool it does not see must still
+    run on a direct call; ``describe_tool(names=[...])`` must answer two cards
+    in one call; and the server instructions must teach cad_batch and name no
+    tool the client cannot see (1.7.0 advertised the whole catalog, its
+    instructions taught one call per entity and named titleblock_apply_iso_a3).
+    """
+    import re
+
+    # the shipped defaults: nothing set, read when this fresh process first
+    # imports the server
+    for name in ("DISCOVERY_MODE", "DISCOVERY_PINNED"):
+        os.environ.pop(name, None)
+    import server
+
+    server._apply_discovery_mode()
+    expected = {"search_tools", "call_tool", "describe_tool"}
+    expected |= {"cad_batch", "drawing_info", "entity_list"}
+    async with _served_headless() as client:
+        listed = {tool.name for tool in await client.list_tools()}
+        text = client.initialize_result.instructions or ""
+        line = await client.call_tool(
+            "entity_create_line", {"x1": 0, "y1": 0, "x2": 10, "y2": 0}, raise_on_error=False
+        )
+        cards = await client.call_tool(
+            "describe_tool", {"names": ["entity_fillet", "layer_list"]}, raise_on_error=False
+        )
+    registered = {tool.name for tool in await server._registered_tools()}
+    named = set(re.findall(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+", text)) & (registered | expected)
+    tools = (cards.structured_content or {}).get("tools") if not cards.is_error else None
+    return (
+        listed == expected
+        and not line.is_error
+        and isinstance(tools, list)
+        and [card.get("name") for card in tools] == ["entity_fillet", "layer_list"]
+        and "cad_batch" in named
+        and named <= listed
+        and "titleblock_apply_iso_a3" not in text
+    )
+
+
+async def pid_project_links():
+    """Off-page links checked across two sheet files, each defect once (1.8-21).
+
+    Two P&ID sheets drawn by ``run_spec`` and saved: L-1 leaves sheet A under
+    100-P-1 and arrives on sheet B under 100-P-2 (a matched pair whose line
+    numbers disagree), L-2 leaves A and never arrives (orphan), L-3 leaves both
+    (direction mismatch), and pump P-101 is drawn on both. ``pid_project``
+    must report exactly those four, each with the sheet and the handle the
+    drawing gave the connector or pump, and must refuse 51 sheets by name.
+    v1.7.0 matches off-page connectors inside one document only: there is no
+    ``engineering.pid.project`` to import.
+    """
+    from pathlib import Path
+
+    from engineering.pid.spec import run_spec
+
+    try:
+        from engineering.pid.project import run_project
+    except ImportError:  # v1.7.0
+        return False
+
+    def pump(item_id, y):
+        return {"id": item_id, "symbol": "centrifugal_pump", "x": 100, "y": y, "tag": item_id}
+
+    def conn(item_id, direction, link, port, number, y):
+        end = {"from": port} if direction == "out" else {"to": port}
+        x = 200 if direction == "out" else 20
+        return {
+            "id": item_id,
+            "direction": direction,
+            "x": x,
+            "y": y + 40 * (direction == "out"),
+            "tag": "CONTINUATION",
+            "link": link,
+            "number": number,
+            **end,
+        }
+
+    sheet = {"layer_set": "pid", "sheet_size": "A3", "scale": 1.0}
+    specs = {
+        "A": {
+            "sheet": sheet,
+            "equipment": [pump("P-101", 100), pump("P-102", 200), pump("P-103", 300)],
+            "connectors": [
+                conn("A1", "out", "L-1", "P-101.discharge", "100-P-1", 100),
+                conn("A2", "out", "L-2", "P-102.discharge", "100-P-2", 200),
+                conn("A3", "out", "L-3", "P-103.discharge", "100-P-3", 300),
+            ],
+        },
+        "B": {
+            "sheet": sheet,
+            "equipment": [pump("P-101", 100), pump("P-201", 300)],
+            "connectors": [
+                conn("B1", "in", "L-1", "P-101.suction", "100-P-9", 100),
+                conn("B3", "out", "L-3", "P-201.discharge", "100-P-3", 300),
+            ],
+        },
+    }
+    folder = Path(_scratch_dir("acadmcp_pid_project_"))
+    handles, paths = {}, {}
+    for name, spec in specs.items():
+        b = await _b()
+        handles[name] = (await run_spec(b, spec))["handles"]
+        paths[name] = folder / f"{name}.dxf"
+        await b.drawing_save_as(str(paths[name]))
+    reader = await _b()
+    manifest = {"sheets": [{"path": str(p), "number": n} for n, p in paths.items()]}
+    result = await run_project(reader, "check", manifest=manifest, include_current=False)
+    links = {row["link"]: row for row in result["links"]}
+    found = {
+        k: (v["status"], [(c["sheet"], c["handle"]) for c in v["connectors"]])
+        for k, v in links.items()
+    }
+    lines = [
+        (r["link"], r["status"], r["out"]["handle"], r["in"]["handle"])
+        for r in result["line_continuity"]
+    ]
+    dups = [
+        (d["tag"], [(o["sheet"], o["handle"]) for o in d["occurrences"]])
+        for d in result["duplicate_tags"]
+    ]
+    try:
+        await run_project(reader, sheets=[str(folder / f"s{i}.dxf") for i in range(51)])
+        refused = False
+    except Exception as exc:  # noqa: BLE001 - the refusal's type and words are the check
+        refused = "at most 50 sheets" in str(exc)
+    return (
+        found
+        == {
+            "L-1": ("matched", [("A", handles["A"]["A1"]), ("B", handles["B"]["B1"])]),
+            "L-2": ("orphan", [("A", handles["A"]["A2"])]),
+            "L-3": (
+                "direction_mismatch",
+                [("A", handles["A"]["A3"]), ("B", handles["B"]["B3"])],
+            ),
+        }
+        and lines == [("L-1", "mismatch", handles["A"]["A1"], handles["B"]["B1"])]
+        and dups == [("P-101", [("A", handles["A"]["P-101"]), ("B", handles["B"]["P-101"])])]
+        and refused
+    )
+
+
+async def b40_between_rows_refused():
+    """A size between two transcribed rows is refused by name, never interpolated (1.8-22).
+
+    1.8.0 ships the B40 tables (DIN 471/472, DIN 509, DIN 332-1, ISO 3601-2)
+    with no row - the licensed copies were not at hand - so every table that
+    has none must refuse a lookup naming itself and "no rows transcribed". The
+    pipeline is then proved on a SYNTHETIC double entry written to a temporary
+    folder (round numbers, not DIN values): built through
+    ``transcription.build_tables``, registered under the real name DIN 471, a
+    listed size resolves to exactly its row and draws six lines, a size between
+    the two rows is refused with both neighbours named and nothing drawn, and an
+    entry B that differs from entry A by one value is refused naming its path.
+    v1.7.0 has no double entry (no transcription module), so nothing resolves.
+    """
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import engineering.mech.standards as standards_mod
+    from backends.ezdxf_backend import EzdxfBackend
+    from engineering.mech.standards import coverage_from_rows, lookup, register
+    from engineering.mech.standards import transcription as tr
+    from engineering.mech.standards.feature_tables import deferred_tables
+    from engineering.mech.standards.rings import ring_groove_dims
+    from engineering.mech.stdparts import draw_std_feature
+
+    for name in deferred_tables():
+        try:
+            lookup(name, 30.0)
+            return False
+        except ValueError as exc:
+            if name not in str(exc) or "no rows transcribed" not in str(exc):
+                return False
+
+    rows = {"10": {"m": 1.0, "d2": 9.0}, "20": {"m": 1.5, "d2": 18.5}}
+    saved = dict(standards_mod._REGISTRY)
+    with tempfile.TemporaryDirectory() as folder:
+        data = Path(folder)
+        for spec in tr.DATA_FILES:
+            for entry, who in (("a", "fixture-a"), ("b", "fixture-b")):
+                body = tr.skeleton(spec.stem, entry)
+                if spec.stem == "din471":
+                    body["entered_by"] = who
+                    body["tables"]["shaft"] = {
+                        "row_source": {"edition": "2011-04", "table": "SYNTHETIC", "page": "0"},
+                        "rows": rows,
+                    }
+                tr.entry_path(spec.stem, entry, data).write_text(json.dumps(body), "utf-8")
+        tables = tr.build_tables(data)
+        built = tables["DIN 471"]["rows"]
+        b_path = tr.entry_path("din471", "b", data)
+        broken = json.loads(b_path.read_text("utf-8"))
+        broken["tables"]["shaft"]["rows"]["10"]["m"] = 1.1
+        b_path.write_text(json.dumps(broken), "utf-8")
+        try:
+            tr.build_tables(data)
+            disagreement_named = False
+        except tr.TranscriptionError as exc:
+            disagreement_named = "din471: tables.shaft.rows.10.m: entry a 1.0 != entry b 1.1" in (
+                exc.problems
+            )
+    backend = EzdxfBackend()
+    await backend.connect()
+    try:
+        await backend.drawing_new()
+        standards_mod._REGISTRY.pop("DIN 471")
+        register("DIN 471", built, coverage_from_rows(built), "SYNTHETIC fixture, Table 0")
+        resolved = ring_groove_dims("DIN 471", 10.0) == {"m": 1.0, "d2": 9.0}
+        try:
+            ring_groove_dims("DIN 471", 15.0)
+            between = ""
+        except ValueError as exc:
+            between = str(exc)
+        before = len(await backend.entity_list())
+        drawn = await draw_std_feature(
+            backend, "ring_groove", (0.0, 0.0), {"d": 10.0, "kind": "shaft"}
+        )
+        try:
+            await draw_std_feature(
+                backend, "ring_groove", (0.0, 50.0), {"d": 15.0, "kind": "shaft"}
+            )
+            draw_refused = False
+        except ValueError as exc:
+            draw_refused = "DIN 471 has no row for 15" in str(exc)
+        after = len(await backend.entity_list())
+    finally:
+        standards_mod._REGISTRY.clear()
+        standards_mod._REGISTRY.update(saved)
+        await backend.disconnect()
+    return (
+        built == {10.0: {"m": 1.0, "d2": 9.0}, 20.0: {"m": 1.5, "d2": 18.5}}
+        and resolved
+        and between.startswith("DIN 471 has no row for 15")
+        and "nearest transcribed sizes: 10, 20" in between
+        and "Nothing is interpolated" in between
+        and len(drawn["handles"]) == 6
+        and draw_refused
+        and after == before + 6
+        and disagreement_named
+    )
+
+
+async def mech_revise_keeps_handles():
+    """A parameter change rebuilds a drawn part in place, and refuses over a hand edit (1.8-19).
+
+    A Ø60 x 30 bushing with a Ø20 bore, drawn in front and end views and
+    dimensioned. ``mech_part_revise`` takes the bore to Ø24 and the length to
+    40: every LINE / CIRCLE / ARC it reports as edited in place must still be
+    in the drawing under its handle, the end view's bore circle (found by its
+    feature tag) must be r = 12 - the size fixed here - and the drawing's
+    entity signatures must equal a fresh draw of the hand-written revised
+    part. On a second sheet a tagged line moved 1 mm by hand must refuse the
+    same revision ``hand_edited_tagged_entity`` with nothing changed. v1.7.0
+    has no ``mech_part_revise``.
+    """
+    from collections import Counter
+
+    try:
+        from engineering.mech.revise import revise_part
+    except ImportError:  # 1.7.0
+        return False
+    from engineering.changes.preview import entity_fingerprints
+    from engineering.errors import HandEditedTaggedEntityError
+    from engineering.mech.draw import draw_part
+    from engineering.mech.drift import tagged_entities
+    from engineering.mech.part import build_part
+    from engineering.understand.diff import signature
+    from engineering.understand.snapshot import take_snapshot
+
+    def bushing(length, bore):
+        return build_part(
+            {
+                "kind": "revolved",
+                "name": "bushing",
+                "material": "steel",
+                "segments": [{"length": length, "d_outer": 60.0}],
+                "features": [{"kind": "axial_bore", "id": "bore", "diameter": bore}],
+            }
+        )
+
+    changes = {"features.bore.diameter": 24.0, "segments[0].length": 40.0}
+    b = await _b()
+    pid = (await draw_part(b, bushing(30.0, 20.0), views=("front", "side")))["part_id"]
+    result = await revise_part(b, pid, changes)
+    snap = await take_snapshot(b)
+    alive = {rec.handle for rec in snap.records}
+    bore_circles = [
+        t.record.radius
+        for t in tagged_entities(snap.records, pid)
+        if t.type == "CIRCLE" and t.view == "side" and abs((t.record.radius or 0) - 12.0) < 1e-9
+    ]
+    fresh = await _b()
+    await draw_part(fresh, bushing(40.0, 24.0), views=("front", "side"))
+    same = Counter(signature(r) for r in snap.records) == Counter(
+        signature(r) for r in (await take_snapshot(fresh)).records
+    )
+
+    twin = await _b()
+    twin_pid = (await draw_part(twin, bushing(30.0, 20.0), views=("front", "side")))["part_id"]
+    line = next(
+        t
+        for t in tagged_entities((await take_snapshot(twin)).records, twin_pid)
+        if t.type == "LINE"
+    )
+    await twin.entity_move(line.handle, 1.0, 0.0)
+    handles = [rec.handle for rec in (await take_snapshot(twin)).records]
+    before = await entity_fingerprints(twin, handles)
+    refused = False
+    try:
+        await revise_part(twin, twin_pid, changes)
+    except HandEditedTaggedEntityError as exc:
+        refused = exc.fields().get("handles") == [line.handle]
+    after = await entity_fingerprints(twin, handles)
+    return (
+        len(result["in_place"]) > 0
+        and set(result["in_place"]) <= alive
+        and len(bore_circles) == 1
+        and same
+        and refused
+        and before == after
+    )
+
+
+async def pid_avoid_no_symbol_crossing():
+    """A P&ID line routes round a vessel that stands between its ports (1.8-20).
+
+    A pump discharges into the far vessel V-102's nozzle N3; vessel V-101
+    stands on the straight run between them, so the fixed ``auto`` route runs
+    through it. With ``sheet.routing: "avoid"`` the drawn polyline must enter
+    no symbol's box other than its two ends - measured here on the drawing
+    itself, each INSERT's own ezdxf bounding box against the LWPOLYLINE's
+    points, never through the server's own focus - and the graph read back
+    must hold no dangling end. v1.7.0 has no ``sheet.routing`` key (the spec is
+    refused by name), so the check fails there, as it should.
+    """
+    from ezdxf import bbox
+
+    from engineering.pid.graph import build_graph
+    from engineering.pid.spec import run_spec
+
+    spec = {
+        "sheet": {"routing": "avoid"},
+        "equipment": [
+            {"id": "P-1", "symbol": "centrifugal_pump", "x": 0, "y": -20, "tag": "P-101"},
+            {"id": "V-1", "symbol": "vertical_vessel", "x": 80, "y": 0, "tag": "V-101"},
+            {"id": "V-2", "symbol": "vertical_vessel", "x": 160, "y": 0, "tag": "V-102"},
+        ],
+        "lines": [{"from": "P-1.discharge", "to": "V-2.N3", "class": "process_major"}],
+    }
+    b = await _b()
+    try:
+        result = await run_spec(b, spec)
+    except Exception:
+        return False
+    msp = b._doc.modelspace()
+    poly = [e for e in msp.query("LWPOLYLINE") if e.dxf.layer == "PROCESS-PIPING-MAIN"]
+    if len(poly) != 1:
+        return False
+    points = [(float(p[0]), float(p[1])) for p in poly[0].get_points("xy")]
+    ends = {result["handles"]["P-1"], result["handles"]["V-2"]}
+    boxes = []
+    for insert in msp.query("INSERT"):
+        if insert.dxf.handle in ends or insert.dxf.name.startswith("PID_MARKER_"):
+            continue
+        box = bbox.extents(insert.virtual_entities())
+        boxes.append((box.extmin.x, box.extmin.y, box.extmax.x, box.extmax.y))
+
+    def enters(a, b_, box) -> bool:
+        # Orthogonal segments: inside the open box on the cross axis and
+        # overlapping it along the run.
+        x0, y0, x1, y1 = box
+        if abs(a[1] - b_[1]) < 1e-9:
+            lo, hi = sorted((a[0], b_[0]))
+            return y0 < a[1] < y1 and lo < x1 and hi > x0
+        lo, hi = sorted((a[1], b_[1]))
+        return x0 < a[0] < x1 and lo < y1 and hi > y0
+
+    graph = await build_graph(b)
+    return (
+        len(boxes) == 1
+        and not any(
+            enters(a, b_, box) for a, b_ in zip(points, points[1:], strict=False) for box in boxes
+        )
+        and graph["stats"]["dangling"] == 0
+        and len(graph["edges"]) == 1
+    )
+
+
+def _undo_after_restart() -> bool:
+    script = os.path.join(os.getcwd(), "server.py")
+    if not os.path.isfile(script):
+        return False
+    env = _server_env(_scratch_dir("acadmcp_state_"))
+    env.pop("EZDXF_UNDO_DEPTH", None)  # no undo setting: the default server
+    drawings = _scratch_dir()
+    log_path = os.path.join(drawings, "server.log")
+    path = os.path.join(drawings, "undo.dxf")
+
+    first = _StdioServer(script, env, drawings, log_path, timeout=40.0)
+    try:
+        first.call("drawing_new")
+        handle = first.call("entity_create_line", {"x1": 0, "y1": 0, "x2": 10, "y2": 0}).get(
+            "handle"
+        )
+        first.call("drawing_save_as", {"path": path})
+        moved = first.call("entity_move", {"handle": handle, "dx": 5, "dy": 5})
+        saved = first.call("drawing_save", {})
+    finally:
+        first.kill()
+    if not handle or moved["is_error"] or saved["is_error"]:
+        return False
+
+    second = _StdioServer(script, env, drawings, log_path, timeout=40.0)
+    try:
+        opened = second.call("drawing_open", {"path": path})
+        undone = second.call("drawing_undo")
+        line = second.call("entity_get", {"handle": handle})
+        # The unsaved variant: saved, one more move, killed.
+        second.call("drawing_save", {})
+        with open(path, "rb") as stream:
+            on_disk = stream.read()
+        second.call("entity_move", {"handle": handle, "dx": 1, "dy": 0})
+    finally:
+        second.kill()
+
+    third = _StdioServer(script, env, drawings, log_path, timeout=40.0)
+    try:
+        reopened = third.call("drawing_open", {"path": path})
+    finally:
+        third.kill()
+    with open(path, "rb") as stream:
+        unchanged = stream.read() == on_disk
+    props = line.get("properties") or {}
+    lost = reopened.get("lost_since_save") or {}
+    return (
+        opened["is_error"] is False
+        and undone.get("ok") is True
+        and undone.get("granularity") == "save"
+        and list(props.get("start") or [])[:2] == [0.0, 0.0]
+        and list(props.get("end") or [])[:2] == [10.0, 0.0]
+        and unchanged
+        and lost.get("count") == 1
+    )
+
+
+async def undo_after_restart():
+    """Undo works after the server is killed and restarted (1.8-08, §4.2).
+
+    Server A (``python server.py`` of the tree under test, stdio, headless, a
+    fresh ``ACADMCP_STATE_DIR``, no ``EZDXF_UNDO_DEPTH``) draws a line from
+    (0, 0) to (10, 0), saves, moves it by (5, 5), saves again and is killed.
+    Server B opens the file and calls ``drawing_undo``: the line must be back
+    at (0, 0)-(10, 0) and the step reported ``granularity: "save"``. B then
+    saves, moves the line once more and is killed unsaved; server C's
+    ``drawing_open`` must leave the file as B saved it and report
+    ``lost_since_save.count == 1``. 1.7.0 kept no history across a restart -
+    its headless ``drawing_undo`` was refused (``undo_history``) without
+    ``EZDXF_UNDO_DEPTH``, and the in-memory steps died with the process.
+    """
+    return await asyncio.to_thread(_undo_after_restart)
+
+
+async def atomic_batch_default():
+    """A batch with no on_error is all or nothing (1.8-09, §4.3).
+
+    The rival's probe through the real tool: line L, then ``cad_batch`` with
+    ``[entity_move(L), entity_delete("DEAD")]`` and no ``on_error``. The batch
+    must be refused ``unknown_handle`` with ``executed: 0`` and L's
+    ``entity_get`` summary must be what it was - 1.7.0 moved L, then failed
+    the delete and kept the move (default ``stop``). The run-time twin:
+    ``[entity_move(L), entity_edit_text(L)]`` (a LINE has no text, so the
+    second step fails while it runs) must come back ``ok: false``, rolled
+    back by the default with ``atomicity.verified`` true, L unchanged again.
+    """
+    async with _served_headless() as client:
+        created = await client.call_tool(
+            "entity_create_line", {"x1": 0, "y1": 0, "x2": 10, "y2": 0}
+        )
+        line = (created.structured_content or {}).get("handle")
+
+        async def summary():
+            got = await client.call_tool("entity_get", {"handle": line}, raise_on_error=False)
+            return None if got.is_error else got.structured_content
+
+        original = await summary()
+        move = {"tool": "entity_move", "args": {"handle": line, "dx": 5.0, "dy": 5.0}}
+        probe = await client.call_tool(
+            "cad_batch",
+            {"steps": [move, {"tool": "entity_delete", "args": {"handle": "DEAD"}}]},
+            raise_on_error=False,
+        )
+        refused = probe.structured_content or {}
+        after_probe = await summary()
+        runtime = await client.call_tool(
+            "cad_batch",
+            {
+                "steps": [
+                    move,
+                    {"tool": "entity_edit_text", "args": {"handle": line, "text": "X"}},
+                ]
+            },
+            raise_on_error=False,
+        )
+        undone = runtime.structured_content or {}
+        atomicity = undone.get("atomicity") or {}
+        after_runtime = await summary()
+    return (
+        original is not None
+        and probe.is_error is True
+        and refused.get("kind") == "unknown_handle"
+        and refused.get("executed") == 0
+        and after_probe == original
+        and runtime.is_error is False
+        and undone.get("ok") is False
+        and atomicity.get("rolled_back") is True
+        and atomicity.get("verified") is True
+        and after_runtime == original
+    )
+
+
+async def delete_many_all_or_nothing():
+    """``entity_delete_many`` deletes all of its handles or none (1.8-09).
+
+    Three lines A, B, C. ``[A, "DEAD"]`` must not answer ``ok: true`` and A
+    must still exist - 1.7.0 deleted A and answered ``ok: true`` with an
+    ``errors`` row. Then the delete of B is made to fail while the call runs
+    (a locked layer, staged on the engine class): ``[A, B, C]`` must answer
+    ``ok: false`` with all three still in the drawing - 1.7.0 kept A and C
+    deleted.
+    """
+    from backends.ezdxf_backend import EzdxfBackend
+
+    async with _served_headless() as client:
+        handles = []
+        for y in (0.0, 5.0, 10.0):
+            made = await client.call_tool(
+                "entity_create_line", {"x1": 0, "y1": y, "x2": 10, "y2": y}
+            )
+            handles.append((made.structured_content or {}).get("handle"))
+        a, b, c = handles
+
+        async def exists(handle):
+            got = await client.call_tool("entity_get", {"handle": handle}, raise_on_error=False)
+            return not got.is_error
+
+        missing = await client.call_tool(
+            "entity_delete_many", {"handles": [a, "DEAD"]}, raise_on_error=False
+        )
+        missing_ok = (missing.structured_content or {}).get("ok")
+        a_kept = await exists(a)
+
+        real = EzdxfBackend.entity_delete
+
+        async def locked(self, handle):
+            if str(handle).upper() == str(b).upper():
+                raise RuntimeError("the entity is on a locked layer")
+            return await real(self, handle)
+
+        EzdxfBackend.entity_delete = locked
+        try:
+            midway = await client.call_tool(
+                "entity_delete_many", {"handles": [a, b, c]}, raise_on_error=False
+            )
+        finally:
+            EzdxfBackend.entity_delete = real
+        midway_ok = (midway.structured_content or {}).get("ok")
+        all_kept = [await exists(h) for h in (a, b, c)]
+    return missing_ok is not True and a_kept and midway_ok is False and all(all_kept)
+
+
+#: 1.8-10 (H1): the plate of every round; only the hole's diameter changes.
+_HISTORY_PLATE = {
+    "kind": "prismatic",
+    "name": "plate",
+    "material": "aluminium",
+    "thickness": 8.0,
+    "outline": [[0.0, 0.0], [80.0, 0.0], [80.0, 50.0], [0.0, 50.0]],
+    "features": [{"kind": "hole", "id": "h1", "x": 40.0, "y": 25.0, "diameter": 10.0}],
+}
+
+
+def _history_rounds(script: str, env: dict, folder: str, log_path: str) -> dict:
+    """The H1 probe across a real restart (shared by the v9 ``history_value_lookup``).
+
+    Server A: rounds 1-3 of a plate drawn with ``mech_part_draw`` (hole 10, 12,
+    16; round 2's call labelled ``"round 2"`` through ``_meta.label``), saved
+    after each round; then the unlabelled twin - one circle edited 5 -> 6 -> 8
+    with ``entity_edit_geometry``, saved after each round. Killed. Server B
+    answers with ``drawing_open`` + ``drawing_history``: the labelled value, a
+    label nobody gave, and the unlabelled round from the checkpoint diff.
+    """
+    import copy
+
+    labelled = os.path.join(folder, "rounds.dxf")
+    plain = os.path.join(folder, "plain.dxf")
+
+    def spec(diameter: float) -> dict:
+        part = copy.deepcopy(_HISTORY_PLATE)
+        part["features"][0]["diameter"] = diameter
+        return part
+
+    first = _StdioServer(script, env, folder, log_path, timeout=60.0)
+    try:
+        first.call("drawing_new")
+        for index, diameter in enumerate((10.0, 12.0, 16.0), start=1):
+            params = {
+                "name": "mech_part_draw",
+                "arguments": {"spec": spec(diameter), "at_x": 200.0 * index, "dimension": False},
+            }
+            if index == 2:
+                params["_meta"] = {"label": "round 2"}
+            first.request("tools/call", params, 60.0)
+            if index == 1:
+                first.call("drawing_save_as", {"path": labelled})
+            else:
+                first.call("drawing_save", {})
+        first.call("drawing_new")
+        hole = first.call(
+            "entity_create_circle", {"cx": 50.0, "cy": 50.0, "radius": 5.0, "layer": "GEOMETRY"}
+        ).get("handle")
+        first.call("drawing_save_as", {"path": plain})
+        for radius in (6.0, 8.0):
+            first.call("entity_edit_geometry", {"handle": hole, "radius": radius})
+            first.call("drawing_save", {})
+    finally:
+        first.kill()
+
+    second = _StdioServer(script, env, folder, log_path, timeout=60.0)
+    try:
+        calls = 0
+        second.call("drawing_open", {"path": labelled})
+        calls += 1
+        found = second.call("drawing_history", {"label": "round 2", "detail": "args"})
+        calls += 1
+        wrong = second.call("drawing_history", {"label": "round 9"})
+        second.call("drawing_open", {"path": plain})
+        edits = second.call(
+            "drawing_history", {"tool": "entity_edit_geometry", "detail": "changes", "limit": 5}
+        )
+    finally:
+        second.kill()
+
+    labelled_value = None
+    rows = found.get("rows") or []
+    if rows:
+        features = ((rows[0].get("args") or {}).get("spec") or {}).get("features") or [{}]
+        labelled_value = features[0].get("diameter")
+    unlabelled_value = None
+    ordered = sorted(edits.get("rows") or [], key=lambda row: row.get("seq") or 0)
+    if ordered:
+        diff = ordered[0].get("diff") or {}
+        for row in diff.get("changed") or []:
+            radius = (row.get("changes") or {}).get("radius") or {}
+            if radius.get("to") is not None:
+                unlabelled_value = 2.0 * float(radius["to"])
+    return {
+        "calls": calls,
+        "labelled": {
+            "value": labelled_value,
+            "is_error": found.get("is_error"),
+            "label": rows[0].get("label") if rows else None,
+        },
+        "missing_label": {
+            "is_error": wrong.get("is_error"),
+            "kind": wrong.get("kind"),
+            "names_the_labels": "'round 2'" in str(wrong.get("message") or ""),
+        },
+        "unlabelled": {"value": unlabelled_value, "rows": len(ordered)},
+    }
+
+
+def _history_rounds_pass(seen: dict) -> bool:
+    return (
+        seen["calls"] <= 2
+        and seen["labelled"]["is_error"] is False
+        and seen["labelled"]["value"] == 12.0
+        and seen["labelled"]["label"] == "round 2"
+        and seen["missing_label"]["is_error"] is True
+        and seen["missing_label"]["kind"] == "invalid_args"
+        and seen["missing_label"]["names_the_labels"]
+        and seen["unlabelled"]["value"] == 12.0
+    )
+
+
+def _history_round2_value() -> bool:
+    script = os.path.join(os.getcwd(), "server.py")
+    if not os.path.isfile(script):
+        return False
+    env = _server_env(_scratch_dir("acadmcp_state_"))
+    drawings = _scratch_dir()
+    seen = _history_rounds(script, env, drawings, os.path.join(drawings, "server.log"))
+    return _history_rounds_pass(seen)
+
+
+async def history_round2_value():
+    """The value of round 2, read back after a restart in two calls (1.8-10, H1).
+
+    A real ``python server.py`` draws three rounds of a plate with
+    ``mech_part_draw`` - hole 10, 12, 16, round 2's call labelled ``round 2``
+    with ``_meta.label`` - saving after each, then is killed. A new process
+    answers with ``drawing_open`` + ``drawing_history(label="round 2",
+    detail="args")``: 12. A label nobody gave is refused ``invalid_args``
+    naming the labels there are (never guessed), and an unlabelled round (one
+    circle edited 5 -> 6 -> 8) is read from the checkpoint diff of
+    ``detail="changes"``: 12 again. 1.7.0 kept no history across a restart and
+    has no ``drawing_history`` - the rival measured us at 0/3.
+    """
+    return await asyncio.to_thread(_history_round2_value)
+
+
 CHECKS = {
     "core_line_length": (core_line_length, "Core"),
     "core_circle_radius": (core_circle_radius, "Core"),
@@ -1788,6 +3394,31 @@ CHECKS = {
         verify_t36_report_stale_after_file_change,
         "Verification",
     ),
+    "lineweight_truth": (lineweight_truth, "Entities"),
+    "error_envelope_routes_agree": (error_envelope_routes_agree, "Reliability"),
+    "journal_replay_after_kill": (journal_replay_after_kill, "Durability"),
+    "atomic_save_untouched_on_failure": (atomic_save_untouched_on_failure, "Durability"),
+    "lineage_revision_continues": (lineage_revision_continues, "Durability"),
+    "region_render_applied": (region_render_applied, "Render"),
+    "qa_coverage_not_checked": (qa_coverage_not_checked, "Quality gate"),
+    "dimension_display_truth": (dimension_display_truth, "Dimensions"),
+    "dimension_truth_focus": (dimension_truth_focus, "Quality gate"),
+    "policy_read_only_batch": (policy_read_only_batch, "Security"),
+    "write_path_autoload_refused": (write_path_autoload_refused, "Security"),
+    "dimension_auto_one_call_part": (dimension_auto_one_call_part, "Dimensions"),
+    "property_override_focus": (property_override_focus, "Quality gate"),
+    "search_default_lists_pins_and_batch_first": (
+        search_default_lists_pins_and_batch_first,
+        "Discovery",
+    ),
+    "pid_project_links": (pid_project_links, "P&ID"),
+    "b40_between_rows_refused": (b40_between_rows_refused, "Mechanical"),
+    "mech_revise_keeps_handles": (mech_revise_keeps_handles, "Mechanical"),
+    "pid_avoid_no_symbol_crossing": (pid_avoid_no_symbol_crossing, "P&ID"),
+    "undo_after_restart": (undo_after_restart, "Durability"),
+    "atomic_batch_default": (atomic_batch_default, "Durability"),
+    "delete_many_all_or_nothing": (delete_many_all_or_nothing, "Durability"),
+    "history_round2_value": (history_round2_value, "Durability"),
 }
 
 

@@ -44,6 +44,7 @@ __all__ = [
     "ToolAliases",
     "alias_text",
     "aliases_for",
+    "tools_for_command",
 ]
 
 
@@ -67,7 +68,12 @@ class ToolAliases:
 #       catalogue inserts), so each is a correct destination.
 #   QSELECT -- AutoCAD's Quick Select dialog is both "filter by properties"
 #       (selection_filter) and "find things like this one"
-#       (entity_select_smart); a drafter typing it could mean either.
+#       (entity_select_smart); a drafter typing it could mean either. Since
+#       1.8.0 it also selects-and-changes a whole set (entity_modify_where).
+#   CHPROP -- one entity's properties (entity_set_properties) or every entity
+#       a filter matches (entity_modify_where, 1.8.0).
+#   RENAME -- one dialog renames any named object: a layout (layout_rename)
+#       or a layer (layer_rename, 1.8.0).
 #   BLOCK -- one command makes a definition either from selected objects
 #       (block_create_from_entities) or from scratch with attribute
 #       definitions (block_define); a drafter typing it could mean either.
@@ -109,6 +115,7 @@ SHARED_ACAD_COMMANDS: frozenset[str] = frozenset(
     {
         "ARRAY",
         "BLOCK",
+        "CHPROP",
         "CLOSE",
         "DIMSTYLE",
         "DWGPROPS",
@@ -124,6 +131,7 @@ SHARED_ACAD_COMMANDS: frozenset[str] = frozenset(
         "PLINE",
         "PLOT",
         "QSELECT",
+        "RENAME",
         "REVCLOUD",
         "SAVEAS",
         "SECTIONPLANE",
@@ -870,6 +878,19 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
         acad=("MIRROR", "MI"),
         synonyms=("mirror", "flip", "reflect", "symmetry", "mirrored copy"),
     ),
+    "entity_modify_where": ToolAliases(
+        acad=("QSELECT", "CHPROP"),
+        synonyms=(
+            "change every entity on a layer",
+            "move all entities to another layer",
+            "set everything to bylayer",
+            "remove colour overrides",
+            "bulk change properties",
+            "modify where",
+            "restyle by filter",
+            "select by properties and change",
+        ),
+    ),
     "entity_move": ToolAliases(
         acad=("MOVE",),
         synonyms=("move", "shift", "translate", "relocate", "nudge"),
@@ -1197,6 +1218,16 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
         acad=("LAYLCK",),
         synonyms=("lock a layer", "protect a layer", "make a layer read only"),
     ),
+    "layer_merge": ToolAliases(
+        acad=("LAYMRG",),
+        synonyms=(
+            "merge layers",
+            "combine layers",
+            "move a layer's entities onto another layer",
+            "fold layers into one",
+            "layer cleanup",
+        ),
+    ),
     "layer_modify": ToolAliases(
         acad=("LAYER",),
         synonyms=(
@@ -1205,6 +1236,10 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
             "set the layer linetype",
             "set the layer lineweight",
         ),
+    ),
+    "layer_rename": ToolAliases(
+        acad=("RENAME",),
+        synonyms=("rename a layer", "change a layer name", "fix a misnamed layer"),
     ),
     "layer_set_current": ToolAliases(
         acad=("CLAYER", "LAYMCUR"),
@@ -1622,6 +1657,43 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
         ),
     ),
     # ── Transactions ────────────────────────────────────────────────────────
+    "checkpoint_create": ToolAliases(
+        synonyms=(
+            "create a checkpoint",
+            "restore point",
+            "snapshot the drawing",
+            "label this state",
+            "remember this version",
+        ),
+    ),
+    "checkpoint_list": ToolAliases(
+        synonyms=(
+            "list checkpoints",
+            "saved states",
+            "version history",
+            "what can i roll back to",
+        ),
+    ),
+    "checkpoint_restore": ToolAliases(
+        synonyms=(
+            "restore a checkpoint",
+            "roll back to a checkpoint",
+            "go back to an earlier version",
+            "undo after a restart",
+            "recover an earlier state",
+        ),
+    ),
+    "drawing_history": ToolAliases(
+        synonyms=(
+            "drawing history",
+            "what did i change earlier",
+            "value in an earlier round",
+            "operation log",
+            "audit trail",
+            "previous value of a parameter",
+            "what was the diameter before",
+        ),
+    ),
     "transaction_begin": ToolAliases(
         synonyms=(
             "start a transaction",
@@ -1758,6 +1830,16 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
             "instrument tag letters",
             "decode the tag",
             "loop number",
+        ),
+    ),
+    "pid_project": ToolAliases(
+        acad=(),
+        synonyms=(
+            "multi sheet p&id",
+            "off-page connector check",
+            "continuation sheets",
+            "cross sheet duplicate tag",
+            "project instrument index",
         ),
     ),
     # ── Styles (track E, group S) ───────────────────────────────────────────
@@ -2182,6 +2264,22 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
             "part features",
             "which views were drawn",
             "parca bilgisi",
+            "was the part edited by hand",
+            "model drift",
+            "revision history of a part",
+        ),
+    ),
+    "mech_part_revise": ToolAliases(
+        acad=(),
+        synonyms=(
+            "change a parameter of a drawn part",
+            "revise the part",
+            "make the bore bigger",
+            "change the length of the part",
+            "parametric edit",
+            "update the part and keep handles",
+            "rebuild the part in place",
+            "parcayi revize et",
         ),
     ),
     # ── Standard parts (SECTION 22, tracks B+G group S) ─────────────────────
@@ -2782,6 +2880,32 @@ def aliases_for(tool_name: str) -> ToolAliases | None:
     if record is None:
         record = SYNTHETIC_TOOL_ALIASES.get(tool_name)
     return record
+
+
+#: The decorators AutoCAD accepts in front of a command name (``security.py``).
+_COMMAND_DECORATORS = "_.-*'"
+
+_COMMAND_INDEX: dict[str, tuple[str, ...]] | None = None
+
+
+def tools_for_command(verb: str) -> tuple[str, ...]:
+    """The registered tools whose ``acad`` lists ``verb``, in catalogue order.
+
+    The reverse of :data:`TOOL_ALIASES` (plan 1.8-02): a refused raw command or
+    LISP ``(command "...")`` names the typed tools that do the same job.
+    ``verb`` may carry AutoCAD's decorators (``_.ERASE``, ``-LAYER``); case is
+    ignored. Visibility (profile, packs) is the caller's to apply - this module
+    knows no registry. Empty when no tool claims the command.
+    """
+    global _COMMAND_INDEX
+    if _COMMAND_INDEX is None:
+        index: dict[str, list[str]] = {}
+        for name, record in TOOL_ALIASES.items():
+            for command in record.acad:
+                index.setdefault(command.upper(), []).append(name)
+        _COMMAND_INDEX = {command: tuple(names) for command, names in index.items()}
+    key = str(verb or "").strip().lstrip(_COMMAND_DECORATORS).upper()
+    return _COMMAND_INDEX.get(key, ())
 
 
 def alias_text(tool_name: str) -> str:

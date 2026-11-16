@@ -15,6 +15,13 @@ if TYPE_CHECKING:
 
 
 class DimensionContract(ABC):
+    # ``xdata={app: values}`` (v1.8.0, plan item 1.8-06; the B17 pattern of
+    # ``EntityCreationContract``): linear, aligned, radius and diameter - the
+    # four the mechanical drawer calls - write XDATA onto the DIMENSION entity
+    # itself (never its anonymous ``*D`` block) inside the create call's own
+    # job, validated by ``backends/xdata_specs.py::prepare_xdata`` before the
+    # dimension exists, so a refused tag creates nothing.
+
     @abstractmethod
     async def dimension_linear(
         self,
@@ -30,6 +37,7 @@ class DimensionContract(ABC):
         tol_lower: float | None = None,
         tol_mode: str = "none",
         text_override: str | None = None,
+        xdata: dict[str, list] | None = None,
     ) -> EntityInfo: ...
 
     @abstractmethod
@@ -42,6 +50,7 @@ class DimensionContract(ABC):
         dim_x: float,
         dim_y: float,
         layer: str | None = None,
+        xdata: dict[str, list] | None = None,
     ) -> EntityInfo: ...
 
     @abstractmethod
@@ -71,7 +80,27 @@ class DimensionContract(ABC):
         tol_lower: float | None = None,
         tol_mode: str = "none",
         text_override: str | None = None,
+        xdata: dict[str, list] | None = None,
     ) -> EntityInfo: ...
+
+    @abstractmethod
+    async def dimension_rerender(
+        self, handles: list[str] | None = None, force: bool = False
+    ) -> dict:
+        """Redraw DIMENSIONs from their fields and style (1.8-15).
+
+        ``handles`` None means every DIMENSION of every layout. Returns ``{ok,
+        rerendered: [handles], text_kept: [handles], verified}``. Headlessly
+        the ``*D`` block is re-rendered (the old one deleted once nothing
+        references it) and group 42 rewritten; live, ``Update()`` runs on each
+        and ``rerendered`` holds only the handles whose ``*D`` text read back
+        changed or already matched (``verified``; S4: the live regen claim is
+        not measured yet). A text its author placed keeps its position unless
+        ``force``. A handle that is not a DIMENSION is refused by name. It is
+        the repair ``drawing_refine`` runs for ``dim_render_stale`` and
+        ``dim_group42_stale``; it is not a tool.
+        """
+        ...
 
     @abstractmethod
     async def dimension_diameter(
@@ -86,4 +115,5 @@ class DimensionContract(ABC):
         tol_lower: float | None = None,
         tol_mode: str = "none",
         text_override: str | None = None,
+        xdata: dict[str, list] | None = None,
     ) -> EntityInfo: ...

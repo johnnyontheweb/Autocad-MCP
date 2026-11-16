@@ -1,0 +1,217 @@
+{
+  "_comment": "The 1.8.0 token and call ceilings (plan section 4), fixed at the start of W2 before any 1.8.0 token work. Read by `python -m benchmarks.token_suite --budget benchmarks/token_budget.json` and `python -m benchmarks.call_budget`. Edit a ceiling only with the measurement that justifies it, in the item that owns the cell.",
+  "schema_version": "token-budget/1",
+  "release": "1.8.0",
+  "plan_item": "1.8-14",
+  "written": "2026-11-03",
+  "token_method": "ratio/v1: characters / the per-format divisor of benchmarks/token_suite.py (json_schema 4.19); estimates, not tokenizer counts. Characters are the measured unit.",
+  "growth_limit_pct": 5.0,
+  "published_report": "benchmarks/results/published/token-cost.json",
+  "gates": {
+    "ci": "Checked on every PR by --budget: a measurement over its ceiling exits 1.",
+    "release": "Over its ceiling on this tree, with a later owner named, or measured only by a lane the PR job does not run (the result cells: the result lane, since 1.8-25). --budget reports it under over_ceiling / pending (never as a pass) and exits 0; --budget --release exits 1 on it when it is over its ceiling or still unmeasured. The owner flips the cell to ci when its ceiling is met and the PR job measures it.",
+    "growth": "Every idle row on the headline basis, and the instructions row, may not grow more than growth_limit_pct over the published report: exit 1 on every PR."
+  },
+  "baseline": {
+    "v1.7.0_readme_wire": {
+      "_note": "Copied from the README token table (token_suite idle lane, wire basis, measured for 1.7.0).",
+      "default": 89226,
+      "search": 503,
+      "lean": 25066,
+      "packs_core": 61422
+    },
+    "v1.7.0_measured": {
+      "_note": "The cells the plan marked 'to measure', measured on the v1.7.0 tag (git archive v1.7.0, its own benchmarks/token_suite.py idle lane, run with this branch's frozen venv; TOOL_PACKS=core for packs_core). The wire values re-measure 0.1-0.3 % above the README's: same tree, newer lock.",
+      "measured_on": "2026-11-03",
+      "default": {"tools": 243, "prompt_tokens": 62471, "prompt_chars": 261755, "wire_tokens": 89350, "wire_chars": 374377},
+      "lean": {"tools": 66, "prompt_tokens": 17945, "prompt_chars": 75191, "wire_tokens": 25146, "wire_chars": 105363},
+      "packs_core": {"tools": 184, "prompt_tokens": 41902, "prompt_chars": 175571, "wire_tokens": 61546, "wire_chars": 257879},
+      "packs_core_mech": {"tools": 198, "prompt_tokens": 47955, "prompt_chars": 200932, "wire_tokens": 69391, "wire_chars": 290747},
+      "packs_core_arch": {"tools": 196, "prompt_tokens": 46679, "prompt_chars": 195586, "wire_tokens": 67974, "wire_chars": 284809},
+      "search": {"tools": 3, "prompt_tokens": 455, "prompt_chars": 1908, "wire_tokens": 503, "wire_chars": 2108},
+      "instructions": {"tokens": 461, "chars": 1933}
+    },
+    "w2_start_measured": {
+      "_note": "The same measurement on release/1.8.0 after the W1 integration (41588a8), before any 1.8-14 change: W1 added no tool but grew descriptions, so lean and packs_core already stand over their 1.7.0 + 5 % ceilings.",
+      "measured_on": "2026-11-03",
+      "default": {"tools": 243, "prompt_tokens": 64804, "prompt_chars": 271528, "wire_tokens": 91683, "wire_chars": 384150},
+      "lean": {"tools": 66, "prompt_tokens": 18961, "prompt_chars": 79445, "wire_tokens": 26162, "wire_chars": 109617},
+      "packs_core": {"tools": 184, "prompt_tokens": 44235, "prompt_chars": 185344, "wire_tokens": 63879, "wire_chars": 267652},
+      "packs_core_mech": {"tools": 198, "prompt_tokens": 50288, "prompt_chars": 210705, "wire_tokens": 71723, "wire_chars": 300520},
+      "packs_core_arch": {"tools": 196, "prompt_tokens": 49012, "prompt_chars": 205359, "wire_tokens": 70306, "wire_chars": 294582},
+      "search": {"tools": 3, "prompt_tokens": 455, "prompt_chars": 1908, "wire_tokens": 503, "wire_chars": 2108},
+      "instructions": {"tokens": 461, "chars": 1933}
+    },
+    "v1.8.0_release_measured": {
+      "_note": "1.8-25: the idle lane on the release tree (release/1.8.0 after 78b9b1e), python -m benchmarks.token_suite; the same run is benchmarks/results/published/token-cost.json, which --budget's growth check compares against from this release on. default is DISCOVERY_MODE=off (TOOL_PROFILE=full), search_pinned the 1.8.0 default surface.",
+      "measured_on": "2026-11-04",
+      "default": {"tools": 253, "prompt_tokens": 59138, "prompt_chars": 247787, "wire_tokens": 78391, "wire_chars": 328460},
+      "lean": {"tools": 68, "prompt_tokens": 16182, "prompt_chars": 67803, "wire_tokens": 21189, "wire_chars": 88780},
+      "packs_core": {"tools": 192, "prompt_tokens": 40722, "prompt_chars": 170625, "wire_tokens": 55169, "wire_chars": 231159},
+      "packs_core_mech": {"tools": 207, "prompt_tokens": 46767, "prompt_chars": 195953, "wire_tokens": 62425, "wire_chars": 261560},
+      "packs_core_arch": {"tools": 204, "prompt_tokens": 44901, "prompt_chars": 188137, "wire_tokens": 60289, "wire_chars": 252612},
+      "search": {"tools": 3, "prompt_tokens": 220, "prompt_chars": 922, "wire_tokens": 230, "wire_chars": 965},
+      "search_pinned": {"tools": 6, "prompt_tokens": 1026, "prompt_chars": 4299, "wire_tokens": 1300, "wire_chars": 5449},
+      "instructions": {"tokens": 199, "chars": 832}
+    }
+  },
+  "idle": {
+    "default": {
+      "metric": "tokens",
+      "basis": ["prompt_payload"],
+      "ceiling": 65594,
+      "gate": "ci",
+      "owner": "1.8-14",
+      "source": "plan section 4: full (prompt basis) = measured 1.7.0 prompt value 62,471 + 5 %, new tools included",
+      "lever": "W3: a Details: split of docstrings over 800 characters, only for the excess",
+      "measured": "W3, 2026-11-04: 59,138 tokens prompt payload (247,787 chars), 78,391 wire, 253 tools (252 + describe_tool, listed in off mode so the pointer leads somewhere) - 69,850 on release/1.8.0 (ab07c47) before the split; discovery/descriptions.py lists a description over 800 characters as its leading whole paragraphs + 'Details: describe_tool.' (47 of 257 tools), the full text served by describe_tool"
+    },
+    "lean": {
+      "metric": "tokens",
+      "basis": ["prompt_payload"],
+      "ceiling": 18842,
+      "gate": "ci",
+      "owner": "W3 (plan section 4 lever: a Details: split of docstrings over 800 characters, only for the excess)",
+      "source": "plan section 4: lean (prompt basis) = measured 1.7.0 prompt value 17,945 + 5 %",
+      "note": "18,961 at W2 start: W1's description growth is already over the ceiling.",
+      "measured": "W3, 2026-11-04: 16,182 tokens prompt payload (67,803 chars), 21,189 wire, 68 tools (describe_tool included) - 20,082 on release/1.8.0 (ab07c47) before the Details: split; flipped to ci"
+    },
+    "packs_core": {
+      "metric": "tokens",
+      "basis": ["prompt_payload"],
+      "ceiling": 43997,
+      "gate": "ci",
+      "owner": "W3 (plan section 4 lever: a Details: split of docstrings over 800 characters, only for the excess)",
+      "source": "plan section 4: core (prompt basis, TOOL_PACKS=core) = measured 1.7.0 prompt value 41,902 + 5 %",
+      "note": "44,235 at W2 start: W1's description growth is already over the ceiling.",
+      "measured": "W3, 2026-11-04: 40,722 tokens prompt payload (170,625 chars), 55,169 wire, 192 tools (describe_tool included) - 48,268 on release/1.8.0 (ab07c47) before the Details: split; flipped to ci"
+    },
+    "search": {
+      "metric": "tokens",
+      "basis": ["prompt_payload", "wire"],
+      "ceiling": 250,
+      "gate": "ci",
+      "owner": "1.8-11",
+      "source": "plan section 4: idle catalog of a plugin user and the search row, 503 (wire) -> <= 250",
+      "note": "Held on both bases: the 503 the rival compared was the wire payload.",
+      "measured": "1.8-11, 2026-11-03: 220 tokens prompt payload (922 chars), 230 wire - the three synthetic tools with one-line texts, no output schema, no _meta and no anyOf/additionalProperties noise (DISCOVERY_PINNED empty); flipped to ci"
+    },
+    "search_pinned": {
+      "metric": "tokens",
+      "basis": ["prompt_payload", "wire"],
+      "ceiling": 1500,
+      "gate": "ci",
+      "owner": "1.8-11",
+      "source": "plan section 4: search + the default pins <= 1,500",
+      "note": "Spike S1 measured search + the three proposed pins (cad_batch, drawing_info, entity_list) at 11,437 wire characters, ~2,730 tokens, cad_batch's docstring alone ~1,360. 1.8-11 lists a pin as a shortened card (discovery/serialize.py pinned_card): the same input schema - every property, type, enum, default, bound and the required list - with the description cut to its first paragraph plus 'Full description: describe_tool.' and each parameter description to whole sentences within 250 characters. The registered tool, its full-catalog listing and describe_tool keep the untouched text; nothing a call is validated against changed.",
+      "measured": "1.8-11, 2026-11-03: 1,003 tokens prompt payload (4,202 chars), 1,277 wire, 6 tools; the plan's 1,500 holds as measured, flipped to ci. 1.8-25 release tree: 1,026 prompt (4,299 chars), 1,300 wire, 23 tokens over 1.8-11's figure and still under the ceiling"
+    },
+    "instructions": {
+      "metric": "tokens",
+      "basis": ["text"],
+      "ceiling": 250,
+      "gate": "ci",
+      "owner": "1.8-11",
+      "source": "plan section 4: server instructions <= 250 (new idle row)",
+      "note": "461 tokens (1,933 characters) on 1.7.0 and at W2 start; 1.8-11 writes the instruction builder.",
+      "measured": "1.8-11, 2026-11-03: 199 tokens (832 chars) on the full-catalog surface, the longest text discovery/instructions.py writes; flipped to ci"
+    }
+  },
+  "result": {
+    "system_status_1000_rows": {
+      "metric": "bytes",
+      "ceiling_rule": "the output at 0 journal rows + <= 300 bytes",
+      "ceiling": 300,
+      "gate": "release",
+      "owner": "1.8-10",
+      "v1_7_0": "20 full operation records",
+      "measured": "1.8-25, 2026-11-04, release/1.8.0: +18 bytes (1,280 at 0 rows, 1,298 at 1,002 journal rows), token_suite result lane (result.budget_cells), measured as tests/test_drawing_history.py does"
+    },
+    "critique_500_summary": {
+      "metric": "chars",
+      "ceiling": 2500,
+      "gate": "release",
+      "owner": "1.8-16",
+      "v1_7_0": "an unbounded list",
+      "measured": "1.8-25, 2026-11-04, release/1.8.0: 735 characters for 500 duplicate_entities issues (total 500), token_suite result lane, measured as tests/test_qa_coverage.py does"
+    },
+    "finalize_qa_coverage": {
+      "metric": "tokens",
+      "ceiling": 300,
+      "gate": "release",
+      "owner": "1.8-16",
+      "measured": "1.8-25, 2026-11-04, release/1.8.0: 226 tokens (947 chars) with three layouts not_checked, token_suite result lane, measured as tests/test_qa_coverage.py does"
+    },
+    "error_envelope": {
+      "metric": "tokens_per_error",
+      "ceiling": 60,
+      "gate": "release",
+      "owner": "1.8-02 (shipped in W1; the result-lane row that measures it is written by the W2 integration)",
+      "measured": "1.8-25, 2026-11-04, release/1.8.0: 58 tokens, the largest of three provoked errors (entity_get and entity_move of a missing handle: not_found, 55 each; a negative circle radius: invalid_args, 58), over the envelope fields only (ok, kind, category, retryable, hint, tool, backend, operation_id - not the message the client read before 1.8.0, nor the kind's own fields)"
+    },
+    "history_row": {
+      "metric": "tokens",
+      "ceiling": 400,
+      "gate": "release",
+      "owner": "1.8-10",
+      "note": "drawing_history(limit=10)",
+      "measured": "1.8-25, 2026-11-04, release/1.8.0: 344 tokens (1,441 chars) for ten rows after twelve writes, token_suite result lane, measured as tests/test_drawing_history.py does"
+    }
+  },
+  "task": {
+    "sketch_20_entities": {
+      "metric": "batched_calls",
+      "ceiling": 1,
+      "gate": "ci",
+      "owner": "1.8-14",
+      "source": "plan section 4: a 20-entity sketch <= 1 call"
+    },
+    "inspect_foreign": {
+      "metric": "batched_calls",
+      "ceiling": 1,
+      "gate": "ci",
+      "owner": "1.8-14",
+      "source": "1.8-14 task lane: drawing_understand against paging entity_list - one call by the scenario's definition"
+    },
+    "layer_cleanup_300": {
+      "metric": "batched_calls",
+      "ceiling": 3,
+      "gate": "ci",
+      "owner": "1.8-12 (entity_modify_where, layer_merge) and 1.8-13 (the call_budget oracle)",
+      "source": "plan section 4: H4 layer cleanup <= 3 calls",
+      "measured": "1.8-13, 2026-11-03: 2 calls (one cad_batch of six layer_merge + one entity_modify_where, then drawing_critique == []); flipped to ci",
+      "v1_7_0": "124 calls",
+      "rival": {"calls": 11, "input_tokens": 315000}
+    },
+    "dimension_plate": {
+      "metric": "batched_calls",
+      "ceiling": 2,
+      "gate": "ci",
+      "owner": "1.8-13 (dimension_auto v2)",
+      "source": "plan section 4: H5 part dimensioning <= 2 calls",
+      "measured": "1.8-13, 2026-11-03: 2 calls (dimension_auto(selector={'layer': 'GEOMETRY'}) + drawing_critique); flipped to ci",
+      "v1_7_0": "89 calls",
+      "rival": {"calls": 10, "input_tokens": 350000}
+    },
+    "history_value_lookup": {
+      "metric": "batched_calls",
+      "ceiling": 2,
+      "gate": "ci",
+      "owner": "1.8-10 (drawing_history)",
+      "source": "plan section 4: H1 the value in round 2 <= 2 calls",
+      "v1_7_0": "unsolved (0/3)",
+      "measured": "1.8-10: 2 calls (drawing_open + drawing_history(handle=..., detail='args')), the oracle in benchmarks/call_budget.py; flipped to ci by its owner"
+    }
+  },
+  "real_model": {
+    "plugin_eval": {
+      "metric": "calls_per_case",
+      "ceiling": 6,
+      "gate": "release",
+      "owner": "1.8-11",
+      "cases": ["layer-cleanup-budget", "dimension-budget", "history-round2"],
+      "measured_by": "claude plugin eval --no-publish --max-cost-usd (maintainer's machine, never CI); cached/uncached input and time beside the rival's H4 (11 calls, 315k) and H5 (10 calls, 350k)",
+      "measured": "1.8-11, 2026-11-03, one run per case (CLI 2.1.317, --model sonnet, --ablation none, search mode, --max-cost-usd 3, $0.33 + $0.36): layer-cleanup-budget 3 then 6 server calls after the setup (call-budget PASS both runs; one cad_batch of layer_merge + entity_modify_where, then reads); dimension-budget 9 then 12 calls (call-budget FAIL both runs: one dimension_auto(selector) did the job, the excess is the model re-reading the result handle by handle). history-round2 does not exist yet (1.8-10). Stays release: the dimension case is over 6."
+    }
+  }
+}

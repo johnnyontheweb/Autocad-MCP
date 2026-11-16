@@ -143,22 +143,43 @@ def _make_mock_doc(
 
     doc.GetVariable.side_effect = _get_variable
     doc.SetVariable.return_value = None
-    doc.SendCommand.return_value = None
 
-    # Modelspace iteration for handle snapshotting
-    pre = modelspace_handles_pre or set()
-    post = modelspace_handles_post or set()
-    call_count: list[int] = [0]
+    # No layout members: the fallback reads the target space's own block.
+    doc.Layouts.Item.side_effect = RuntimeError("no Layouts on this seat")
 
-    def _iter_modelspace():
-        call_count[0] += 1
-        handles = pre if call_count[0] == 1 else post
-        for h in handles:
-            entity = MagicMock()
-            entity.Handle = h
-            yield entity
+    # 1.8-23: model space as Count / Item - the fallback reads its Count and
+    # last handle before the command and only its new tail after, never the
+    # whole space (iterating it fails the test).
+    pre = sorted(modelspace_handles_pre or set(), key=lambda h: int(h, 16))
+    post = sorted(modelspace_handles_post or set(), key=lambda h: int(h, 16))
+    items: list = []
 
-    doc.ModelSpace.__iter__ = lambda _: _iter_modelspace()
+    def _entity(handle):
+        entity = MagicMock()
+        entity.Handle = handle
+        entity.ObjectName = "AcDbLine"
+        return entity
+
+    items.extend(_entity(h) for h in pre)
+
+    def _send(_text):
+        for handle in post:
+            if handle not in pre:
+                items.append(_entity(handle))
+
+    class _Space:
+        @property
+        def Count(self):
+            return len(items)
+
+        def Item(self, index):
+            return items[index]
+
+        def __iter__(self):
+            raise AssertionError("model space was walked whole")
+
+    doc.SendCommand.side_effect = _send
+    doc.ModelSpace = _Space()
     return doc
 
 
@@ -166,7 +187,7 @@ def test_safe_send_command_immediate_return():
     """CMDACTIVE=0 immediately → no polling loop, returns empty new-handles list."""
     doc = _make_mock_doc(cmdactive_sequence=[0])
     result = ComBackend._safe_send_command(doc, "ZOOM E\n")
-    assert result == []
+    assert result.handles == [] and result.created_count == 0
     doc.SendCommand.assert_called_once()
 
 
@@ -175,7 +196,7 @@ def test_safe_send_command_waits_for_active_to_clear():
     doc = _make_mock_doc(cmdactive_sequence=[1, 1, 0])
     with patch("time.sleep"):  # don't actually sleep
         result = ComBackend._safe_send_command(doc, "REGEN\n")
-    assert result == []
+    assert result.handles == []
 
 
 def test_safe_send_command_restores_variables_on_success():
@@ -256,7 +277,7 @@ def test_safe_send_command_new_handle_detection():
         modelspace_handles_post=post_handles,
     )
     result = ComBackend._safe_send_command(doc, "LINE\n")
-    assert set(result) == {"1C", "1D"}
+    assert set(result.handles) == {"1C", "1D"}
 
 
 # ---------------------------------------------------------------------------

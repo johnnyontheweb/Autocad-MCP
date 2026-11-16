@@ -12,6 +12,59 @@ DEFAULT_CAD_PROGID = "AutoCAD.Application"
 #: Default ``MAX_DXF_BYTES``: 512 MB.
 DEFAULT_MAX_DXF_BYTES = 512 * 1024 * 1024
 
+#: Default ``MAX_HTTP_BODY_BYTES``: 8 MiB (1.8-17).
+DEFAULT_MAX_HTTP_BODY_BYTES = 8 * 1024 * 1024
+
+#: Default ``ACCORECONSOLE_TIMEOUT_S`` (K1): a conversion measured 1-2 s here.
+DEFAULT_ACCORECONSOLE_TIMEOUT_S = 60.0
+
+#: ``LISP_POLICY`` values (1.8-18, ``security_lisp.py``); the first is the default.
+LISP_POLICIES: tuple[str, ...] = ("read", "denylist", "off")
+
+#: ``COM_REFRESH_MODE`` values (1.8-23); the first is the default.
+COM_REFRESH_MODES: tuple[str, ...] = ("auto", "regen")
+
+#: ``CAD_LAUNCH`` values (#19); the first is the default. ``auto`` attaches to a
+#: running CAD application and starts one when none runs (1.7 behaviour);
+#: ``never`` only attaches.
+CAD_LAUNCH_MODES: tuple[str, ...] = ("auto", "never")
+
+
+def parse_cad_launch(raw: str | None) -> str:
+    """A ``CAD_LAUNCH`` value; an unknown one is refused by name.
+
+    Refused, not fallen back with a warning like ``COM_REFRESH_MODE``: the
+    fallback would be ``auto``, so a misspelt ``never`` would start the very
+    application the operator set it to keep closed.
+    """
+    value = str(raw or "").strip().lower()
+    if not value:
+        return CAD_LAUNCH_MODES[0]
+    if value not in CAD_LAUNCH_MODES:
+        raise ValueError(
+            f"CAD_LAUNCH={raw!r} is not a launch mode. Valid values: "
+            f"{', '.join(CAD_LAUNCH_MODES)} (default {CAD_LAUNCH_MODES[0]!r})."
+        )
+    return value
+
+
+def parse_lisp_policy(raw: str | None) -> str:
+    """A ``LISP_POLICY`` value; an unknown one falls back to ``read`` with a warning."""
+    value = str(raw or "").strip().lower()
+    if not value:
+        return LISP_POLICIES[0]
+    if value not in LISP_POLICIES:
+        import logging
+
+        logging.getLogger("autocad_mcp.config").warning(
+            "Unknown LISP_POLICY %r - falling back to %r. Valid values: %s.",
+            raw,
+            LISP_POLICIES[0],
+            ", ".join(LISP_POLICIES),
+        )
+        return LISP_POLICIES[0]
+    return value
+
 
 class Settings:
     """Server configuration loaded from environment variables."""
@@ -49,8 +102,49 @@ class Settings:
         """
         return os.environ.get("CAD_PROGID", "").strip() or DEFAULT_CAD_PROGID
 
+    @property
+    def cad_launch(self) -> str:
+        """``CAD_LAUNCH`` (#19): ``auto`` (default) or ``never``.
+
+        Whether the live backend may start the CAD application when
+        ``GetActiveObject`` finds none running: ``never`` attaches only, and
+        both the first call and ``system_launch`` answer ``cad_not_running``
+        instead. Read live and read-only, like ``cad_progid``; an unknown value
+        is refused by name (at startup by ``__init__``, and on every read).
+        """
+        return parse_cad_launch(os.environ.get("CAD_LAUNCH"))
+
+    @property
+    def accoreconsole_path(self) -> str:
+        """``ACCORECONSOLE_PATH`` as set, stripped ("" when unset; K1, 1.8.0).
+
+        The headless engine's second DWG reader (``backends/dwg_read.py``):
+        unset means AutoCAD 2026's installed ``accoreconsole.exe`` when it
+        exists, ``off`` disables the route. Read live, like ``backend``.
+        """
+        return os.environ.get("ACCORECONSOLE_PATH", "").strip()
+
+    @property
+    def accoreconsole_timeout_s(self) -> float:
+        """``ACCORECONSOLE_TIMEOUT_S`` (default 60): one DWG -> DXF conversion's
+        deadline; an overrun kills the process tree. Read live."""
+        raw = os.environ.get("ACCORECONSOLE_TIMEOUT_S", "").strip()
+        try:
+            value = float(raw) if raw else DEFAULT_ACCORECONSOLE_TIMEOUT_S
+        except ValueError:
+            raise ValueError(
+                f"ACCORECONSOLE_TIMEOUT_S={raw!r}: expected a number of seconds "
+                f"(default {DEFAULT_ACCORECONSOLE_TIMEOUT_S:g})"
+            ) from None
+        if value <= 0:
+            raise ValueError(f"ACCORECONSOLE_TIMEOUT_S={raw!r}: must be more than 0 seconds")
+        return value
+
     def __init__(self):
         self.log_level: str = os.environ.get("LOG_LEVEL", "INFO").upper().strip()
+
+        # #19: a misspelt CAD_LAUNCH stops the server at startup, by name.
+        parse_cad_launch(os.environ.get("CAD_LAUNCH"))
 
         raw_paths = os.environ.get("ALLOWED_PATHS", "").strip()
         self.allowed_paths: list[Path] = []
@@ -92,6 +186,45 @@ class Settings:
         # otherwise block the single-thread STA executor forever.
         self.com_call_timeout: float = float(os.environ.get("COM_CALL_TIMEOUT", "60"))
 
+        # Issue #20: a live entity_get on a DIMENSION or HATCH reads its fields
+        # from a Document.Export of the whole drawing. That export is reused for
+        # this many seconds while the bound document, its revision and the
+        # operator-edit count stand still; the age bounds what the revision does
+        # not count (view changes, SetVariable, an edit during a server call,
+        # everything without Visual LISP). 0 = one export per read, as 1.8.0
+        # did; a negative value reads as 0.
+        self.com_snapshot_ttl: float = max(0.0, float(os.environ.get("COM_SNAPSHOT_TTL", "5")))
+
+        # 1.8-05: how long a command sent to AutoCAD's command line (a raw
+        # system_run_command, drawing_undo / drawing_redo, a corner op, the
+        # transaction mark) may stay active before it is cancelled with ESC x3
+        # and reported as command_incomplete with AutoCAD's LASTPROMPT. Well
+        # inside COM_CALL_TIMEOUT, so the STA job always comes back.
+        self.command_deadline_s: float = max(0.1, float(os.environ.get("COMMAND_DEADLINE_S", "8")))
+
+        # 1.8-23: the live engine refreshes the display once per COM job, not
+        # once per entity. A job that asked for at most COM_REFRESH_UPDATE_MAX
+        # refreshes, each naming its entity, calls Update() on the last one;
+        # a larger job (or one whose refresh names no entity) does one
+        # Regen(acActiveViewport). The default 1 is the safe reading while
+        # spike S4 (does Update() of the last entity paint the earlier ones?)
+        # is unmeasured: a single create is one Update(), anything more is one
+        # Regen. COM_REFRESH_MODE=regen is the plan's fallback for a graphics
+        # configuration where Update() does not paint: one Regen per job.
+        self.com_refresh_update_max: int = max(
+            0, int(os.environ.get("COM_REFRESH_UPDATE_MAX", "1"))
+        )
+        self.com_refresh_mode: str = os.environ.get("COM_REFRESH_MODE", "auto").strip().lower()
+        if self.com_refresh_mode not in COM_REFRESH_MODES:
+            import logging
+
+            logging.getLogger("autocad_mcp.config").warning(
+                "Unknown COM_REFRESH_MODE %r - falling back to 'auto'. Valid values: %s.",
+                self.com_refresh_mode,
+                ", ".join(COM_REFRESH_MODES),
+            )
+            self.com_refresh_mode = "auto"
+
         # Per-call timeout for the headless ezdxf backend. Every ezdxf method
         # runs under one document lock, so a single hung call (pathological DXF,
         # a render that never returns) would otherwise hold that lock forever
@@ -132,8 +265,49 @@ class Settings:
         )
         self.mcp_auth_token: str = os.environ.get("MCP_AUTH_TOKEN", "").strip()
 
+        # 1.8-17 (policy.py): which tools a client may reach. The defaults are
+        # 1.7's behaviour - every tool, every cost. READ_ONLY runs only `read`
+        # tools and writes no file; TOOL_ALLOWLIST / TOOL_DENYLIST take comma-
+        # separated names or globs (`entity_*`), an entry naming no tool is
+        # warned about at startup; MAX_TOOL_COST is the highest @cad_tool cost
+        # a call may carry (read|safe|mutate|destructive|escape).
+        from policy import parse_cost, parse_patterns
+
+        self.read_only: bool = os.environ.get("READ_ONLY", "false").lower().strip() == "true"
+        self.tool_allowlist: tuple[str, ...] = parse_patterns(os.environ.get("TOOL_ALLOWLIST"))
+        self.tool_denylist: tuple[str, ...] = parse_patterns(os.environ.get("TOOL_DENYLIST"))
+        self.max_tool_cost: str = parse_cost(os.environ.get("MAX_TOOL_COST"))
+
+        # 1.8-18 (security_lisp.py): how system_run_lisp checks an expression.
+        # "read" (default) runs what passes the AutoLISP read tier and sends the
+        # rest to the 1.7 denylist unchanged; "denylist" is 1.7's behaviour;
+        # "off" checks nothing. An unknown value falls back to "read".
+        self.lisp_policy: str = parse_lisp_policy(os.environ.get("LISP_POLICY"))
+
+        # 1.8-17 (http_guard.py): the HTTP transport's request guard. A request
+        # carrying an Origin header must name one of HTTP_ALLOWED_ORIGINS
+        # (default none: every browser origin is refused 403); its Host must be
+        # the bound host:port or one of HTTP_ALLOWED_HOSTS (421); a body over
+        # MAX_HTTP_BODY_BYTES (8 MiB; 0 disables) is refused 413. A request
+        # authenticated with MCP_AUTH_TOKEN_READONLY gets only the mcp:read
+        # scope and runs under the `read` ceiling. stdio is unaffected.
+        self.http_allowed_origins: tuple[str, ...] = tuple(
+            origin.strip().rstrip("/").lower()
+            for origin in os.environ.get("HTTP_ALLOWED_ORIGINS", "").split(",")
+            if origin.strip()
+        )
+        self.http_allowed_hosts: tuple[str, ...] = tuple(
+            host.strip().lower()
+            for host in os.environ.get("HTTP_ALLOWED_HOSTS", "").split(",")
+            if host.strip()
+        )
+        self.max_http_body_bytes: int = max(
+            0, int(os.environ.get("MAX_HTTP_BODY_BYTES", str(DEFAULT_MAX_HTTP_BODY_BYTES)))
+        )
+        self.mcp_auth_token_readonly: str = os.environ.get("MCP_AUTH_TOKEN_READONLY", "").strip()
+
         # Exposed tool profile: "full" (default, everything) or "lean" (a
-        # curated 66-tool drafting/inspection core for clients with tight tool
+        # curated 67-tool drafting/inspection core for clients with tight tool
         # caps). Invalid values fall back to "full" with a warning at startup;
         # so does the "core" profile removed in v1.5.0 (see
         # server.REMOVED_TOOL_PROFILES).
@@ -143,16 +317,33 @@ class Settings:
         # list ("core,pid,settings") advertises only those. core cannot be disabled.
         self.tool_packs: str = os.environ.get("TOOL_PACKS", "all").lower().strip()
 
-        # Tool discovery: "off" (default) advertises the full catalog; "search"
-        # replaces it with a search tool plus a call_tool proxy (see
-        # discovery/transform.py and server._apply_discovery_mode).
+        # Tool discovery: "search" (default since 1.8.0) advertises search_tools
+        # + call_tool + describe_tool and the DISCOVERY_PINNED tools; "off"
+        # advertises the full catalog (see discovery/transform.py and
+        # server._apply_discovery_mode).
         #
-        # Default "off" deliberately. "search" is the intended v1.x default,
-        # but flipping it changes what every connected client sees on
-        # list_tools — a breaking wire-level change that needs its own
-        # migration note and README pass, neither of which ships in v1.5.0.
-        # Invalid values fall back to "off" with a warning at startup.
-        self.discovery_mode: str = os.environ.get("DISCOVERY_MODE", "off").lower().strip()
+        # Flipped in 1.8-11 on the plan's condition (section 7-2): spike S1
+        # measured that a hidden tool stays directly callable (no per-write
+        # call_tool wrapper is forced), and the v8 matrix passed 31/31 with its
+        # MCP-client tasks going through call_tool. A breaking wire-level
+        # change: DISCOVERY_MODE=off restores the 1.7.0 catalog. Invalid values
+        # fall back to "off" with a warning at startup.
+        self.discovery_mode: str = os.environ.get("DISCOVERY_MODE", "search").lower().strip()
+
+        # 1.8-11: tools search mode keeps listed beside search_tools / call_tool
+        # / describe_tool (comma list; empty pins nothing). A pin the active
+        # profile or packs hide is simply not listed; an unregistered name is
+        # warned about at startup. Static on purpose: a pin set that moved
+        # between sessions would break every client's prompt-cache prefix.
+        self.discovery_pinned: tuple[str, ...] = tuple(
+            dict.fromkeys(
+                name.strip()
+                for name in os.environ.get(
+                    "DISCOVERY_PINNED", "cad_batch,drawing_info,entity_list"
+                ).split(",")
+                if name.strip()
+            )
+        )
 
         # Opt-in 3D solids (COM backend only). Disabled by default because the
         # headless backend cannot produce ACIS solids and live 3D modifies real

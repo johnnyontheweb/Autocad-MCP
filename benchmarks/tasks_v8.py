@@ -36,8 +36,11 @@ the claim:
   is measured against requirements, repaired under a fingerprint precondition
   and accepted on the saved file, every other entity unchanged;
 * ``damaged_dxf_refusal``: a truncated DXF and a file that is not a DXF at
-  all are refused by name and the open document is kept. 1.7.0 refuses;
-  ``recover`` arrives in 1.7.1, and this task is named for what 1.7.0 does;
+  all are refused by name and the open document is kept. Since 1.8.0 the
+  default open still refuses by name - the refusal now names
+  ``recover=True`` - and ``drawing_open(recover=True)`` recovers the
+  truncated file (1.8-04, B09; held by ``tests/test_identity_lineage.py``).
+  The gate here is unchanged: the default open, refused, nothing lost;
 * ``dimension_binding`` (best-cad-mcp's claim): a DIMENSION bound to the
   features it measures, its displayed text and DIMLFAC judged against the
   geometry - best-cad is COM-only with no adapter, so its lane is ``not_run``.
@@ -119,7 +122,8 @@ NEW_TASKS_V8: tuple[TaskSpec, ...] = (
         "damaged_dxf_refusal",
         "reliability",
         "Open a truncated DXF and a non-DXF: refused by name, the open document kept "
-        "(recover arrives in 1.7.1)",
+        "(the default open; since 1.8.0 the refusal names recover=True and "
+        "drawing_open(recover=True) recovers the truncated file)",
         1.0,
     ),
     TaskSpec(
@@ -143,6 +147,9 @@ RIVAL_GROUND: dict[str, str] = {
 
 #: Bumped whenever a task's gate or its fixture changes, so two reports with the
 #: same evaluator version measured the same thing (the run manifest carries it).
+#: "v8.1" is the evaluator the published v8 report names; since 1.8-25 the
+#: runner reads ``tasks_v9.EVALUATOR_VERSION`` ("v9.0"), so a report from the
+#: 1.8.0 tree says it was measured by the 1.8.0 evaluator.
 EVALUATOR_VERSION = "v8.1"
 
 #: Repository files that generate the fixtures the matrix runs on; the run
@@ -166,6 +173,8 @@ MATRICES: dict[str, tuple[TaskSpec, ...]] = {
     "v8": TASKS_V8,
 }
 
+#: This module's own default, kept for its callers (as every tasks_vN keeps its
+#: own); the runner's default is ``tasks_v9.DEFAULT_MATRIX`` ("v9") since 1.8-25.
 DEFAULT_MATRIX = "v8"
 
 
@@ -174,3 +183,8 @@ def task_by_id(task_id: str, matrix: str = DEFAULT_MATRIX) -> TaskSpec:
         if task.task_id == task_id:
             return task
     raise KeyError(f"{task_id} is not in matrix {matrix}")
+
+
+# 1.8.0: the v9 matrix registers itself in MATRICES ("v9"); this module's
+# DEFAULT_MATRIX stays "v8", the runner's (tasks_v9) is "v9".
+import benchmarks.tasks_v9  # noqa: E402, F401

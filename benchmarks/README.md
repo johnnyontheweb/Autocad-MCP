@@ -44,14 +44,17 @@ and `environment_blocked` say the task was never attempted and stay out of
 every denominator (matrix v8 below).
 
 ```bash
-python -m benchmarks.run_competitors --list --matrix v8
-python -m benchmarks.run_competitors --server autocad-mcp-pro --backend ezdxf --matrix v8 --timeout 180 --json
+python -m benchmarks.run_competitors --list --matrix v9
+python -m benchmarks.run_competitors --server autocad-mcp-pro --backend ezdxf --matrix v9 --timeout 180 --json
 python -m benchmarks.run_competitors --task table_mleader --task hatch_islands --json
 ```
 
-The release-machine ezdxf self-check is **31/31 (100.0)** on the v8 matrix
-(`--matrix v7` … `--matrix v2` reproduce the earlier sets); the published
-report is [`results/published/autocad-mcp-pro.json`](results/published/autocad-mcp-pro.json).
+The 1.8.0 release-machine ezdxf self-check is **47/47 attempted (100.0)** on the
+v9 matrix of 49 tasks, `lisp_read_tier` `environment_blocked` and
+`std_tables_b40` `not_run` ([`results/published/lanes-v9/autocad-mcp-pro.json`](results/published/lanes-v9/autocad-mcp-pro.json));
+1.7.0's v8 run, 31/31 (100.0), stays published as
+[`results/published/autocad-mcp-pro.json`](results/published/autocad-mcp-pro.json)
+(`--matrix v8` … `--matrix v2` reproduce the earlier sets).
 Repository stars and raw tool counts do not contribute to the score. Adapter
 registration lives in `competitors.yaml`.
 
@@ -165,6 +168,75 @@ The v8 tasks stage their inputs inside the headless engine; on the live engine t
 
 **Run manifest.** Every report carries `manifest`: the server's commit and whether tracked files were modified (`dirty`), the sha256 of the files that generate the fixtures (`FIXTURE_SOURCES`), `EVALUATOR_VERSION` and the installed versions of ezdxf, fastmcp, mcp, numpy, openpyxl, matplotlib and pywin32.
 
+### Matrix v9 (v1.8.0) — call economy, dimension truth, security, durability, the named promises
+
+`tasks_v9.py` keeps the v8 thirty-one unchanged and appends the 1.8.0 tasks per
+plan item, into the same `MATRICES` registry `run_competitors` imports. Since
+1.8-25 v9 is the runner's `DEFAULT_MATRIX` (`--matrix v8` reproduces 1.7.0's
+set) and the manifest names `EVALUATOR_VERSION` `v9.0`. v9 holds 49 tasks, v8's
+31 plus these 18 - every row of the plan's section 8:
+
+| Task | Category | Verified against |
+|---|---|---|
+| `dimension_lie_detect` | qa | `tests/fixtures/lying_dims.py`: seven dimensions that each lie one way give exactly one `dimension_truth` finding each; DIMDEC 0 over 19.6 shows "20"; a redraw left stale by `rerender=False` is named and `drawing_refine` clears it |
+| `policy_read_only` | security | under `READ_ONLY`, a batch with one create step is refused before step 1 with the revision unchanged, and the same write sent through the search proxy's `call_tool` is `policy_refused` |
+| `lisp_read_tier` | security | three AutoLISP reads (`vla-get-Area`, `getvar`, a `mapcar` over a `lambda`) answer on the first try and `(command "_ERASE" ...)` is refused with its symbol, line and typed alternatives; live engine only (headless: `environment_blocked`) |
+| `layer_cleanup_budget` | ergonomics | six misnamed layers and 300 overridden entities reach ISO names, ByLayer and no empty layer in at most 3 calls, with the `iso128` / `layer_color` / `property_override` critique empty; a stale `expect_count` is refused `stale_revision` with nothing changed |
+| `call_count_dimension_part` | ergonomics | a plate (outline, six holes, two arcs) dimensioned in at most 2 calls, every dimension bound with no `dimension_mismatch` and no duplicate, a second run drawing nothing; an ELLIPSE and a SPLINE in the selection are `omitted` with their reasons |
+| `undo_across_restart` | durability | draw, save, move, save, kill the server; a new process opens the file and one `drawing_undo` puts the line back before the move. Unsaved twin: the file is untouched and `lost_since_save.count` is 1 |
+| `atomic_batch_default` | durability | a line moved and a handle that does not exist deleted in one batch with no `on_error`: refused `unknown_handle`, nothing executed, the line unchanged. Run-time twin: the default rolls the move back, verified |
+| `history_value_lookup` | durability | three rounds of a plate (hole 10, 12 labelled `round 2`, 16), saved, the server killed; a new process finds the round-2 diameter 12 in at most two calls (`drawing_open` + `drawing_history`). Twins: a label nobody gave is refused by name; an unlabelled round is read from the checkpoint diff |
+| `parametric_revise_keeps_handles` | parametric | a dimensioned three-view flange revised in one `mech_part_revise` (bore 20 → 24, length 60 → 70, + chamfer, - radius): in-place handles kept, signatures equal to a fresh draw, the dimensions read 24 and 70, the bore requirement passes. Twin `revise_hand_edit_refused`: a hand-moved tagged line is refused `hand_edited_tagged_entity` with the fingerprints unchanged |
+| `pid_routing_obstacles` | pid | a sheet whose `auto` lines cross two vessels, routed with `sheet.routing: "avoid"`: zero `pid_line_through_symbol`, zero dangling ends, crossings within the dry run's; a walled-in pump refused `no_route` naming the four vessels' tags |
+| `pid_project_offpage` | pid | three P&ID sheet files checked by `pid_project`: one orphan link, one direction mismatch, one cross-sheet duplicate tag and one line-number mismatch, each once with sheet and handle; a missing sheet file and 51 sheets refused by name |
+| `std_tables_b40` | standards | one size from every filled DIN 471/472, DIN 509, DIN 332-1 and ISO 3601-2 table drawn with the double entry's own dimensions, a size between two rows refused by name with nothing drawn. With no table filled - the 1.8.0 state, every table deferred to 1.8.1 - it is `not_run` naming the deferred tables, never a pass |
+| `dwg_headless_roundtrip` | reliability | a DWG opened on the headless engine through a converter (ODA, then `accoreconsole`) and saved as DXF with the layers, blocks and entity counts of its DXF twin; with no converter on the machine the open is refused `dwg_read` and the task is `environment_blocked` |
+| `replay_across_restart` | durability | through `fault_inject.py`: a real server runs `cad_batch(operation_id=...)`, saves and is killed; the next process answers the same id and steps `replayed: true` with nothing drawn, other steps `operation_conflict`. In-call twin: a server parked at the `journal.after_begin` barrier inside a `cad_batch` is killed there, and the next process answers that id `requires_reconcile` |
+| `interrupted_save_recover` | durability | a writer that dies half way through `atomic_write_dxf` (`os._exit` in a child, no `finally`) leaves the file byte for byte as it was and the next server reports `rolled_back`. In-call twin: a server parked at `save.before_replace` (tmp written, fsynced, verified) is killed; the next start reports `finished` and the file's sha is the one the marker named |
+| `damaged_dxf_recover` | reliability | a 50-line DXF cut before its last ENDSEC, three handles repeating an earlier entity's and four not hex: `drawing_open(recover=True)` reports the three conflicts as `fixes`, 47 entities read, every handle unique, the source's sha unchanged by the open and by the refused save onto it; the plain open is refused `damaged_drawing` naming `recover=True` |
+| `bylayer_truth` | qa | 22 lines at lineweight `"Default"` and three at `"ByLayer"` through the real server; the oracle is the saved DXF read with ezdxf (22 at -3, the rest -1). `property_override` reports one grouped `lineweight_not_bylayer` issue with those 22 handles; after `drawing_refine` the saved DXF holds -1 on every line |
+| `space_context` | reliability | a drawing saved with Layout1 active (two entities on it) is opened and a circle created: it lands in model space and the sheet still holds its two entities in the saved file. Twin: a trim under a UCS rotated 30° about a moved origin keeps the WCS endpoints a world-UCS trim keeps. The live half is `scripts/smoke_space_com.py`, which passed 13 / 13 on AutoCAD 2026 for 1.8.0 ([`results/live/1.8.0/space.json`](results/live/1.8.0/space.json)) |
+
+`dimension_lie_detect`, `layer_cleanup_budget`, `call_count_dimension_part`,
+`undo_across_restart`, `atomic_batch_default`, `history_value_lookup`,
+`parametric_revise_keeps_handles`, `pid_routing_obstacles`,
+`pid_project_offpage`, `dwg_headless_roundtrip`, `replay_across_restart`,
+`interrupted_save_recover`, `damaged_dxf_recover`, `bylayer_truth` and
+`space_context` stage their inputs in the headless engine and are `not_run` on
+the live lane (`HEADLESS_ONLY_V9`). `KILL_POINTS` names, for
+`undo_across_restart`, `history_value_lookup`, `replay_across_restart` and
+`interrupted_save_recover`, where a real `python server.py` is killed with
+`Popen.kill()`; the run manifest records them with the state-folder policy.
+`pid_roundtrip` (v4) is pinned to `sheet.routing: "auto"`, so v9 does not
+change what v4 measured.
+
+**Search mode is not vacuous.** Under the 1.8.0 default (`DISCOVERY_MODE=search`)
+the reference adapter's in-process MCP-client tasks reach every non-synthetic
+tool through `call_tool`, and the adapter reports `discovery_mode` and
+`proxied_calls` in its metadata. On the 1.8-11 branch, v8 passed 31 / 31
+(`proxied_calls` 9) and v9 33 / 33 (`proxied_calls` 41) under the new default.
+
+### Result — matrix v9 on the release tree
+
+```bash
+python -m benchmarks.run_competitors --server autocad-mcp-pro --backend ezdxf --matrix v9 --no-fetch --timeout 180 --artifact-dir <outside the repo> --publish <out>/autocad-mcp-pro.json
+python -m benchmarks.run_competitors --server lizaixi01-agentcad --matrix v9 --no-fetch --artifact-dir <outside the repo> --publish <out>/lizaixi01-agentcad.json
+```
+
+Run on `78b9b1e` with a clean tree (`manifest.dirty: false`, evaluator `v9.0`):
+**47 / 47 attempted tasks pass**, score 100.0, coverage 100 %. Two of the 49 are
+not attempted and enter no score: `lisp_read_tier` is `environment_blocked`
+(AutoLISP runs only in AutoCAD; the headless lane records the policy's verdicts
+in its metrics) and `std_tables_b40` is `not_run`, naming the eight B40 tables
+deferred to 1.8.1. `dwg_headless_roundtrip` passed through AutoCAD 2026's
+`accoreconsole` on the run machine (route `accoreconsole`, about 2.9 s); a machine
+with neither ODA nor `accoreconsole` makes it `environment_blocked`. AgentCAD's
+lane is `not_run` on all 49 (no adapter; `RIVAL_GROUND` names the nine tasks on
+its ground). The reports live in
+[`results/published/lanes-v9/`](results/published/lanes-v9/); the v8 reference
+report (`results/published/autocad-mcp-pro.json`, 31 / 31) and the v8 rival lanes
+are kept as they were, and the task-matrix chart still renders v8.
+
 ## Live competitor lane (v1.4)
 
 Two competitor adapters now execute the exact same task matrix, black-box over
@@ -232,6 +304,47 @@ python -m benchmarks.perf_suite --out benchmarks/results/published/perf-ezdxf.js
 python -m benchmarks.render_perf_chart
 ```
 
+### v1.7.0 against v1.8.0 (the spec §8.3 gate)
+
+The same gate for 1.8.0, run on 2026-11-05 at `f3523db` against a v1.7.0
+worktree (CPython 3.12.16, ezdxf 1.4.4; 20 rounds after 5 warm-ups):
+[`results/published/perf-v1.7.0-vs-v1.8.0.json`](results/published/perf-v1.7.0-vs-v1.8.0.json),
+`ok: true`.
+
+| Workload | v1.7.0 | 1.8.0 | ratio |
+|---|---:|---:|---:|
+| 2,000 lines, one call each | 272.1 ms | 286.2 ms | 1.02 |
+| 10,000 lines: build, DXF export, reopen | 1,682.8 ms | 1,721.3 ms | 1.03 |
+| Region query over 10,000 entities | 249.3 ms | 224.5 ms | 0.97 |
+| Premium quality pass | 46.9 ms | 41.2 ms | 0.96 |
+| 2,000 `entity_create_line` calls through the MCP server | 3,496.3 ms | 3,636.0 ms | 1.06 |
+
+The A/A spread was 7.1 % on that run (the machine was in use), so the bound
+was 1.14. Two things the numbers say. The server row's 1.06 is the durable
+journal's one commit per mutating call - the `running` row a restart turns
+into `unknown_commit` - measured at about 50 µs of a 1.7 ms call through the
+in-memory client, plus about 50 µs for the change summary, the session
+metrics and the tool policy together; with `JOURNAL_DURABLE=off` the row is
+1.03. On a quiet machine (A/A spread 1.4 % earlier that day) the bound is the
+1.05 floor and that row misses it by about 1 %: recorded, not re-run until it
+passed. The 1.8.1 fix is an append-only running log (one write per call, the
+rows written in batches, reconciled at open), which keeps what a restart
+reports. The first run of the gate that day measured 1.15 on that row and
+1.09 on the roundtrip: its workers had used this machine's default state
+folder, holding a 213 MB journal of 446,254 rows and 656 checkpoint lineages
+left by earlier gate runs - the journal's size cost 0.1 ms per call, and
+`CheckpointStore._evict_budget`'s scan of the whole store 41 ms per open of a
+changed file - so since `f3523db` every measurement runs in a fresh temp
+`ACADMCP_STATE_DIR` of its own, never under `--scratch` (which may lie inside
+the checkout, where a state folder is refused and the journal would silently
+run in memory). The roundtrip's 1.03 is the atomic save (fsync and verify
+before the replace) and the S0 checkpoint of a reopened file (gzip level 1:
+2.4 ms for 1.3 MB).
+
+```bash
+python -m benchmarks.perf_compare --base v1.7.0 --aa --rounds 20 --out out/perf/compare.json
+```
+
 ### v1.6.0 against v1.7.0 (the spec §8.3 gate)
 
 1.7.0 must not be slower than 1.6.0. `perf_compare.py` builds a v1.6.0 worktree
@@ -260,7 +373,13 @@ v1.4.0's creation throughput; that is B10, 1.7.1.
 
 ```bash
 python -m benchmarks.perf_compare --base v1.6.0 --aa --out out/perf/compare.json
+python -m benchmarks.perf_compare --aa --out out/perf/compare.json   # --base auto (default since 1.8.0)
 ```
+
+Since 1.8.0 `--base` defaults to `auto`: the previous release tag, found with
+`git describe --tags --abbrev=0` from HEAD (from `HEAD^` when a tag points at
+HEAD itself). With no reachable tag it refuses by name - fetch the tags or pass
+`--base <tag>`. It is not yet wired into a nightly or release workflow.
 
 ### v1.4.0 against v1.6.0, and what the call-timeout guard costs
 
@@ -335,6 +454,113 @@ pr.disable()
 print(pstats.Stats(pr).total_calls)
 ```
 
+## Live COM performance lane (1.8-23)
+
+`perf_com.py` measures the live engine against a v1.7.0 checkout on a running
+AutoCAD, never in CI. Each side runs in its own child process with its own
+backends and server first on `sys.path`, through an in-process fastmcp client,
+on a document seeded with 5,000 lines; every repeated workload gets one untimed
+warm-up, and what a workload created is removed untimed so each runs at about
+5,000 entities. The workloads: `create_circle_singles`, `batch_create_200`,
+`delete_singles_200`, `delete_many_200`, `cad_batch_50`, `fillet_50_n5000` and
+`fillet_50_n10000`. Its targets were fixed before any run: the bulk tools at
+least 5× faster than v1.7.0's 200 single calls, the single
+`entity_create_circle` median at least 30 % lower, and `entity_fillet` at
+10,000 lines at most 1.2× its time at 5,000. The bulk-delete target is measured
+on the tool as 1.8.0 ships it, pre-check and transaction included.
+
+```bash
+python -m benchmarks.perf_com --base <a v1.7.0 checkout>   # writes results/live/perf_com.json
+python -m benchmarks.perf_com --pending   # the skeleton; no AutoCAD
+```
+
+[`results/live/perf_com.json`](results/live/perf_com.json) is the 1.8.0 run on
+AutoCAD 2026 (2026-11-05, current side `cc82532`, a v1.7.0 worktree as base),
+`status: "failed"`: three of the four targets are missed. `entity_batch_create`
+is 2.90× and `entity_delete_many` 3.78× faster than v1.7.0's 200 single calls
+(target 5×), and the single `entity_create_circle` median is 8.9 % lower
+(target 30 %). The fillet ratio is 55× (target at most 1.2×): its median at
+5,000 lines was 81 ms here and 6.0 s in a run an hour earlier, so that row is
+not stable on this seat (that earlier run's ratio was 1.19×; it was not kept
+because it named its v1.7.0 side "1.8.0", the bug `cc82532` fixes). v1.7.0
+overran `COM_CALL_TIMEOUT` once at 10,000 lines and failed 30 of its 50
+fillets there. ADR 0001 (`docs/adr/0001-native-worker.md`) names a recorded
+live `perf_com.json` as what would trigger its one-day worker spike.
+
+## Token and call budgets (1.8.0)
+
+`token_suite.py` measures what the server costs a model in tokens, offline (a
+characters-per-token ratio, labelled `ratio/v1`; `--tokenizer anthropic` counts
+for real). Four lanes: `idle` (the advertised catalog and the server
+instructions, per profile and pack set; the headline is the **prompt payload**
+a client forwards to the model, the tools/list wire payload is the `wire`
+column; report schema `token/2.0`), `discovery`, `result`, and since 1.8.0
+`task`. The task lane runs five scripted jobs - `sketch_20_entities`,
+`layer_cleanup_300`, `dimension_plate`, `inspect_foreign`,
+`history_value_lookup` - each two ways: **naive**, one tool per entity, labelled
+as the shape a rival was observed using and not as the least this server needs,
+and **batched**, the least-call oracle of `call_budget.py`. Each arm reports its
+calls, request and result characters, and a modelled 30-turn session input
+cached and uncached (turn *k* re-sends the prefix and every earlier request and
+result). An arm that does not finish its job fails; an oracle whose tool is not
+on the tree yet reports `pending_tool`, never a pass.
+
+`call_budget.py` owns the fixtures (plain ezdxf files), the scenarios and their
+verifiers; setup and verification calls are not counted. The plan's ceilings
+live in `token_budget.json`, written at the start of W2 before any token work,
+each cell with a gate and an owner: `ci` cells fail every PR, `release` cells
+(over their ceiling on the tree, or owned by a later item) are reported under
+`over_ceiling` / `pending` and fail only `--release`. Every idle row, and the
+instructions row, also fails when it grows more than 5 % over the published
+`results/published/token-cost.json`.
+
+```bash
+python -m benchmarks.token_suite --lanes idle,task --budget benchmarks/token_budget.json --out out/token-budget.json
+python -m benchmarks.token_suite --budget benchmarks/token_budget.json --release   # the release gate
+python -m benchmarks.call_budget --out out/call-budget.json
+```
+
+The CI job `token-budget` runs the first and the third on every PR. The call
+oracles measured so far: `sketch_20_entities` 1 call (naive 20),
+`layer_cleanup_300` 2 (one `cad_batch` of `layer_merge` + `entity_modify_where`,
+then `drawing_critique`; naive 311; 1.7.0 took 124, the rival 11),
+`dimension_plate` 2 (`dimension_auto(selector=...)` + `drawing_critique`; naive
+23; 1.7.0 89, the rival 10), `inspect_foreign` 1 (`drawing_understand`; naive
+5), and since 1.8-10 `history_value_lookup` 2 (`drawing_open` +
+`drawing_history(handle=..., detail="args")`; 1.7.0 could not answer it). The
+history oracle counts its two calls in one in-process client; the restart half
+is proven by the v9 task and the `history_round2_value` check, which kill real
+server processes.
+
+The cells as `token_budget.json` holds them, measured on the release tree by
+`python -m benchmarks.token_suite --budget benchmarks/token_budget.json --release`
+(exit 0; the same run without `--budget` is the published
+[`results/published/token-cost.json`](results/published/token-cost.json), the
+report the growth check compares against from 1.8.0 on):
+
+| Lane | Cell | Ceiling | Gate | Release tree |
+|---|---|---:|---|---|
+| idle | `default` (`DISCOVERY_MODE=off`, 253 tools) | 65,594 tokens | `ci` | 59,138 prompt / 78,391 wire (1.7.0: 62,471 / 89,350) |
+| idle | `lean` (68 tools) | 18,842 | `ci` | 16,182 / 21,189 - over its ceiling at W2 start (18,961) and flipped to `ci` by the W3 `Details:` split |
+| idle | `packs_core` (192 tools) | 43,997 | `ci` | 40,722 / 55,169 - over at W2 start (44,235), flipped the same way |
+| idle | `search` (3 tools) | 250 | `ci` | 220 / 230 (1.7.0: 455 / 503) |
+| idle | `search_pinned` (6 tools, the 1.8.0 default) | 1,500 | `ci` | 1,026 / 1,300 (1.8-11 measured 1,003 / 1,277) |
+| idle | `instructions` | 250 | `ci` | 199 tokens (1.7.0: 461) |
+| result | `system_status_1000_rows` | +300 bytes | `release` | +18 bytes at 1,002 journal rows |
+| result | `critique_500_summary` | 2,500 chars | `release` | 735 chars for 500 issues |
+| result | `finalize_qa_coverage` | 300 tokens | `release` | 226 tokens, three layouts `not_checked` |
+| result | `error_envelope` | 60 tokens per error | `release` | 58, the largest of three provoked errors (the envelope fields, not the message) |
+| result | `history_row` | 400 tokens | `release` | 344 for `drawing_history(limit=10)` |
+| task | `sketch_20_entities`, `inspect_foreign`, `layer_cleanup_300`, `dimension_plate`, `history_value_lookup` | 1, 1, 3, 2, 2 calls | `ci` | 1, 1, 2, 2, 2 |
+| real model | `plugin_eval` | 6 calls per case | `release` | not checked by `--budget`; 1.8-11's runs: `layer-cleanup-budget` 3 and 6 (pass), `dimension-budget` 9 and 12 (over); `history-round2` written, not yet run |
+
+Since 1.8-25 the result lane measures the five result cells itself
+(`result.budget_cells`, each the way its owner's test measures it, on a private
+state folder); they stay `release` because the PR job runs only `idle,task`, so
+on a PR they are `pending`, never a pass. The growth rows are all negative
+against the 1.8-14 publication (default -8.89 %, lean -15.12 %, packs_core
+-8.16 %, search -51.65 %, instructions -56.83 %).
+
 ## Correctness A/B suite
 
 `correctness_suite.py` is a set of deterministic, headless (ezdxf-backend) checks
@@ -352,15 +578,77 @@ python benchmarks/compare_versions.py --json results.json
 python benchmarks/compare_versions.py v1.6.0 --fail-on-regression   # exit 1 on any regression
 ```
 
-### Result — v1.7.0 vs v1.6.0 (release gate)
+The suite file under test is always the current one: the old tree runs it with
+its own code on `PYTHONPATH`, so a check imports anything newer than the
+baseline inside its function, and a check the baseline cannot pass records
+`fail` or `miss` there - an improvement, never a regression. A check is a
+function placed just before `CHECKS` (the file ends in `main()`) and an entry at
+the end of `CHECKS`.
 
-61 checks, ezdxf backend, one subprocess per check. Machine-readable report:
+1.8.0 added 22 checks: six in W1 (described under the result below) and these
+sixteen, twelve W2 and four W3:
+
+| Check | Category | Item | Verified against |
+|---|---|---|---|
+| `qa_coverage_not_checked` | Quality gate | 1.8-16 | a paper layout with content and no model viewport is named `not_checked` (`no_viewport_scale`) by the critique report and by finalize's `qa_coverage`, and `strict_critique=True` fails on it |
+| `dimension_display_truth` | Dimensions | 1.8-15 | 19.6 mm after DIMDEC 2 → 0 shows "20" in the `*D` block and in `bind_dimension`, `display_rounding` 0.4, no mismatch |
+| `dimension_truth_focus` | Quality gate | 1.8-15 | an override lie, a doubled Ø and a stale render are exactly their three codes; `drawing_refine` redraws only the stale one |
+| `policy_read_only_batch` | Security | 1.8-17 | `READ_ONLY` refuses a one-create-step `cad_batch` (`policy_refused`, `read_only`) with the revision and the entity count unchanged |
+| `write_path_autoload_refused` | Security | 1.8-17 | `data_extract` → `acaddoc.lsp` and `drawing_save_as` → `acad.lsp` are `path_refused`, nothing written |
+| `dimension_auto_one_call_part` | Dimensions | 1.8-13 | one `dimension_auto(selector=...)` dimensions a plate (4 edges, six Ø11, two R8, sizes read off the DIMENSIONs), omits the ellipse, and a rerun draws nothing |
+| `property_override_focus` | Quality gate | 1.8-01 (the plan's section-8 check W1 did not add) | through the server: a clean GEOMETRY line yields nothing; one given colour 1 and lineweight 30 is named by exactly `lineweight_not_bylayer` (error) and `color_not_bylayer` (warning) with only its handle; `drawing_refine` applies both repairs and leaves it at colour 256 and ByLayer |
+| `search_default_lists_pins_and_batch_first` | Discovery | 1.8-11 | with nothing set, a client lists exactly `search_tools`, `call_tool`, `describe_tool`, `cad_batch`, `drawing_info` and `entity_list`; an unlisted `entity_create_line` still runs on a direct call; `describe_tool(names=[...])` answers two cards in one call; the instructions name `cad_batch`, nothing unlisted and no `titleblock_apply_iso_a3` |
+| `undo_after_restart` | Durability | 1.8-08 | a real `python server.py` draws, saves, moves, saves and is killed; a new process opens the file and one `drawing_undo` puts the line back with `granularity: "save"`; a killed unsaved session leaves the file as saved and the next open reports `lost_since_save.count == 1` |
+| `atomic_batch_default` | Durability | 1.8-09 | `[entity_move(L), entity_delete("DEAD")]` with no `on_error` is refused `unknown_handle` with L unchanged; the run-time twin is rolled back by the default with `atomicity.verified` true |
+| `delete_many_all_or_nothing` | Durability | 1.8-09 | `entity_delete_many([A, "DEAD"])` keeps A and does not answer `ok: true`; a delete made to fail mid-call answers `ok: false` with A, B and C all still in the drawing |
+| `history_round2_value` | Durability | 1.8-10 | the round-2 hole diameter (12) of a three-round plate is read back after a killed server in two calls (`drawing_open` + `drawing_history(label="round 2", detail="args")`); an unknown label is refused `invalid_args` naming the labels; an unlabelled round is read from the checkpoint diff |
+| `pid_project_links` | P&ID | 1.8-21 | two sheet files: a matched link whose line numbers disagree, an orphan, a direction mismatch and a pump on both sheets, each reported once with sheet and handle; 51 sheets refused by name |
+| `pid_avoid_no_symbol_crossing` | P&ID | 1.8-20 | a pump discharging into a far vessel with another between them: with `sheet.routing: "avoid"` the polyline enters no symbol's box but its two ends (each INSERT's own ezdxf bounding box, not the server's focus) and the graph read back holds no dangling end |
+| `b40_between_rows_refused` | Mechanical | 1.8-22 | every empty B40 table refuses a lookup naming itself; on a synthetic double entry (round numbers, not DIN values) a listed size draws its row, a size between two rows is refused with both neighbours named and nothing drawn, and an entry B one value off entry A is refused by path |
+| `mech_revise_keeps_handles` | Mechanical | 1.8-19 | a Ø60 × 30 bushing revised to a Ø24 bore and length 40: every LINE / CIRCLE / ARC edited in place keeps its handle, the end view's bore circle is r = 12, the signatures equal a fresh draw of the revised part; a tagged line moved 1 mm by hand refuses the revision `hand_edited_tagged_entity` with nothing changed |
+
+### Result — v1.8.0 vs v1.7.0 (release gate)
+
+83 checks, ezdxf backend, one subprocess per check. Machine-readable report:
+[`results/published/ab-v1.7.0-vs-v1.8.0.json`](results/published/ab-v1.7.0-vs-v1.8.0.json)
+(`python benchmarks/compare_versions.py v1.7.0 --json ...`, taken at `ab07c47`,
+whose `correctness_suite.py` is the release tree's byte for byte; the current
+side alone, re-run one subprocess per check on `78b9b1e`, is again 83 / 83).
+
+| Version | Checks passing | Pass rate | Fixed | Regressed |
+|---------|----------------|-----------|-------|-----------|
+| **v1.7.0** (baseline)     | 61 / 83 | 73.5 % | — | — |
+| **v1.8.0** (this release) | 83 / 83 | 100 % | 22 | **0** |
+
+Twenty-two are fixed and nothing regressed. The sixteen W2 and W3 checks of the
+table above: fourteen answer `fail` on v1.7.0, and `dimension_truth_focus` and
+`b40_between_rows_refused` are `miss → pass` (the focus and the B40 lookup do
+not exist on 1.7.0). The six W1 checks, one per W1 item of 1.8.0: four are `fail → pass`: v1.7.0 has every
+method they call and gets the answer wrong. `journal_replay_after_kill` kills a
+server after a `cad_batch(operation_id=…)` and sends the same id to a fresh
+process: 1.7.0's in-memory journal had forgotten it and drew the batch again;
+now it answers `replayed: true` (B13, 1.8-03). `atomic_save_untouched_on_failure`
+holds the target open while a save runs: 1.7.0 wrote straight into it; now the
+save is refused `save_locked` with the target's bytes untouched and no `.tmp`
+left (1.8-04). `lineage_revision_continues` reopens an unchanged file in a fresh
+backend: 1.7.0 started a new document at revision 0; now the same `document_id`
+and revision continue (1.8-04). `region_render_applied` asks for a window:
+1.7.0 answered `applied: false` and rendered the extents; now the region is
+drawn at the requested pixel size with one `px_per_unit` (1.8-07). The other two
+are `miss → pass`: `lineweight_truth` reads `lineweight_name` and the named
+`"ByLayer"` parser, and `error_envelope_routes_agree` compares the typed
+envelope on the direct and the `cad_batch` route - neither exists on 1.7.0
+(1.8-01, 1.8-02). The 61 checks v1.7.0 was released on all still pass.
+
+### Result — v1.7.0 vs v1.6.0
+
+61 checks at the time, ezdxf backend, one subprocess per check. Machine-readable report:
 [`results/published/ab-v1.6.0-vs-v1.7.0.json`](results/published/ab-v1.6.0-vs-v1.7.0.json).
 
 | Version | Checks passing | Pass rate | Fixed | Regressed |
 |---------|----------------|-----------|-------|-----------|
 | **v1.6.0** (baseline)     | 48 / 61 | 78.7 % | — | — |
-| **v1.7.0** (this release) | 61 / 61 | 100 % | 13 | **0** |
+| **v1.7.0** (that release) | 61 / 61 | 100 % | 13 | **0** |
 
 Thirteen are fixed. Four are `fail → pass`: v1.6.0 has every method they call and gets the
 answer wrong. They are the three reproducers of the 1.7.0 W1 review focus and

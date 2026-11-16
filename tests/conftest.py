@@ -25,6 +25,91 @@ def pin_headless_backend(request, monkeypatch):
     monkeypatch.setenv("AUTOCAD_MCP_BACKEND", "ezdxf")
 
 
+@pytest.fixture(scope="session")
+def state_root():
+    """A session folder for journal state, outside every repository checkout.
+
+    ``--basetemp`` often points inside this repository (``out/pytest/...``), and
+    the journal refuses a state folder anywhere inside a checkout (B13), so the
+    state folders live under the system temp folder instead.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    root = Path(tempfile.mkdtemp(prefix="acadmcp-test-state-"))
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
+def outside_repo_dir(state_root):
+    """A fresh, empty folder outside every repository checkout."""
+    import uuid
+
+    folder = state_root / uuid.uuid4().hex[:12]
+    folder.mkdir()
+    return folder
+
+
+@pytest.fixture(autouse=True)
+def private_state_dir(state_root, monkeypatch):
+    """Every test gets its own durable journal folder (B13, 1.8.0).
+
+    The server's lifespan opens ``<ACADMCP_STATE_DIR>/journal.sqlite3``; left
+    at its default that is the developer's real ``%LOCALAPPDATA%`` store, and a
+    client id one test used ("op-1") would replay into the next test. The
+    folder is only named here - the journal creates it when a lifespan opens.
+    """
+    import uuid
+
+    folder = state_root / "auto" / uuid.uuid4().hex[:12]
+    monkeypatch.setenv("ACADMCP_STATE_DIR", str(folder))
+
+
+@pytest.fixture
+def full_catalog(request):
+    """``DISCOVERY_MODE=off`` for a test that reads the whole catalog off ``list_tools``.
+
+    Since 1.8.0 the server's default is ``search`` (plan 1.8-11): a client lists
+    the synthetic tools and the pins, every tool stays callable. A test about a
+    tool's advertised schema or annotations asks for the full catalog by
+    name; the configured mode is put back afterwards.
+
+    Applied to the ``server`` module the test module imported AND the one
+    ``sys.modules`` holds now: ``tests/test_http_auth.py`` re-imports server.py
+    and drops it from ``sys.modules``, so the two can be different objects (and
+    a bare ``import server`` here would build a third).
+    """
+    import sys
+
+    modules = []
+    for candidate in (getattr(request.module, "server", None), sys.modules.get("server")):
+        if hasattr(candidate, "_apply_discovery_mode") and candidate not in modules:
+            modules.append(candidate)
+    if not modules:
+        import server
+
+        modules.append(server)
+    for module in modules:
+        module._apply_discovery_mode("off")
+    yield
+    for module in modules:
+        module._apply_discovery_mode()
+
+
+@pytest.fixture(autouse=True)
+def no_dwg_converter(monkeypatch):
+    """No test spawns AutoCAD's accoreconsole unless it says so (K1, 1.8.0).
+
+    Unset, ``ACCORECONSOLE_PATH`` means AutoCAD 2026's installed console when it
+    exists, so on a developer machine with AutoCAD every ``drawing_open`` of a
+    ``.dwg`` would start a real AutoCAD engine. ``tests/test_dwg_read.py`` sets
+    the variable itself, to a fake or to the real executable.
+    """
+    monkeypatch.setenv("ACCORECONSOLE_PATH", "off")
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",

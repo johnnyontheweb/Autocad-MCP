@@ -25,10 +25,28 @@ parameters only (``discovery/serialize.py`` says why), so a search-mode client
 had no way to read a tool's optional arguments short of a failed call.
 ``describe_tool(name)`` returns one tool's full input schema, description,
 annotations, risk, cost, pack, AutoCAD commands, synonyms and its docstring's
-own examples. It resolves names against the same filtered catalog
+own examples; ``describe_tool(names=[...])`` returns several in one turn
+(1.8-11). It resolves names against the same filtered catalog
 ``call_tool`` reaches, refuses a hidden or unknown name with the same
 ``Unknown tool`` refusal, and is itself refused by ``call_tool`` (and, being
 card-less, by ``cad_batch``) like the other synthetic tools.
+
+**``describe_tool`` in ``off`` mode too.** A description over 800 characters
+is listed as its leading paragraphs and ``Details: describe_tool.``
+(``discovery/descriptions.py``) on every surface, so :class:`DetailsTransform`
+lists the whole catalog unchanged plus the same ``describe_tool`` - the
+pointer leads somewhere in both modes.
+
+**Built once.** The base class builds its synthetic tools on every listing
+(``Tool.from_function``: a pydantic schema each). A listing is not rare: the
+low-level MCP server lists again whenever a call names a tool its definition
+cache has not seen, and under the search default that is every tool but the
+pinned ones (``server._install_tool_definition_cache`` says what it does
+about that). MEASURED 2026-11-05 (``benchmarks/perf_compare.py``, release
+tree 19ada05): 2,000 direct ``entity_create_line`` calls took 8.5 x their
+v1.7.0 time, six listings a call, three ``Tool.from_function`` per listing.
+So the three synthetic tools and each pinned card are built once per
+transform and handed out again (``tests/test_discovery_perf.py``).
 """
 
 from __future__ import annotations
@@ -42,25 +60,36 @@ from typing import Annotated, Any, Literal
 from fastmcp.exceptions import NotFoundError
 from fastmcp.server.context import Context
 from fastmcp.server.transforms import GetToolNext
+from fastmcp.server.transforms.catalog import CatalogTransform
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.server.transforms.search.base import SearchResultSerializer
 from fastmcp.server.transforms.search.base import (
     _extract_searchable_text as _stock_searchable_text,
 )
 from fastmcp.tools.base import Tool, ToolResult
+from fastmcp.tools.function_tool import FunctionTool
 from fastmcp.utilities.versions import VersionSpec
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from discovery.aliases import alias_text, aliases_for
-from discovery.serialize import describe_payload, serialize_search_results
+from discovery.descriptions import DETAILS_POINTER, full_description
+from discovery.serialize import (
+    describe_payload,
+    lean_schema,
+    pinned_card,
+    serialize_search_results,
+)
 
 __all__ = [
     "ACAD_MATCH_BOOST",
+    "DEFAULT_PINNED",
+    "MAX_DESCRIBE_NAMES",
     "MAX_SEARCH_LIMIT",
     "RISK_CEILINGS",
     "SYNONYM_MATCH_BOOST",
     "CadSearchTransform",
+    "DetailsTransform",
     "SearchOutcome",
     "tool_risk",
 ]
@@ -164,6 +193,15 @@ RISK_CEILINGS = ("any", "write", "read")
 
 MAX_SEARCH_LIMIT = 25
 
+#: The most tools one ``describe_tool(names=[...])`` call answers: the same
+#: ceiling as one search, so "describe every hit" is always one call.
+MAX_DESCRIBE_NAMES = MAX_SEARCH_LIMIT
+
+#: DISCOVERY_PINNED's default (1.8-11): the batch executor and the two reads
+#: nearly every session starts with stay listed beside the synthetic tools, so
+#: they never cost a search turn. Pinned tools are left out of search results.
+DEFAULT_PINNED: tuple[str, ...] = ("cad_batch", "drawing_info", "entity_list")
+
 
 def tool_risk(tool: Tool) -> str:
     """``"read"`` | ``"write"`` | ``"destructive"`` for one tool.
@@ -249,6 +287,10 @@ class CadSearchTransform(BM25SearchTransform):
         pack_of: Callable[[str], str | None] | None = None,
         search_result_serializer: SearchResultSerializer | None = None,
     ) -> None:
+        #: The synthetic tools by name, and each pinned card with what it was
+        #: made from - both built once (module docstring, "Built once").
+        self._synthetic_cache: dict[str, Tool] = {}
+        self._pinned_cards: dict[str, tuple[Any, str | None, Tool]] = {}
         super().__init__(
             max_results=max_results,
             always_visible=always_visible,
@@ -270,9 +312,22 @@ class CadSearchTransform(BM25SearchTransform):
         """Every name this transform answers itself rather than the catalog."""
         return frozenset({self._search_tool_name, self._call_tool_name, self._describe_tool_name})
 
+    @property
+    def pinned(self) -> frozenset[str]:
+        """The ``always_visible`` names (listed only when the catalog has them)."""
+        return frozenset(self._always_visible)
+
     async def transform_tools(self, tools: Sequence[Tool]) -> Sequence[Tool]:
-        """The stock pinned + search + call surface, plus ``describe_tool``."""
-        return [*await super().transform_tools(tools), self._make_describe_tool()]
+        """Pinned tools (as :func:`pinned_card`), search, call, then ``describe_tool``.
+
+        The order is fixed - pins in catalog order, then the three synthetic
+        tools - so a client's prompt-cache prefix never moves between sessions.
+        """
+        listed = [
+            self._pinned_card(tool) if tool.name in self._always_visible else tool
+            for tool in await super().transform_tools(tools)
+        ]
+        return [*listed, self._make_describe_tool()]
 
     async def get_tool(
         self, name: str, call_next: GetToolNext, *, version: VersionSpec | None = None
@@ -281,6 +336,30 @@ class CadSearchTransform(BM25SearchTransform):
         if name == self._describe_tool_name:
             return self._make_describe_tool()
         return await super().get_tool(name, call_next, version=version)
+
+    # ------------------------------------------------------------------
+    # Built once
+    # ------------------------------------------------------------------
+
+    def _synthetic(self, name: str, build: Callable[[], Tool]) -> Tool:
+        """``build()`` on the first listing; the same object on every later one."""
+        tool = self._synthetic_cache.get(name)
+        if tool is None:
+            tool = build()
+            self._synthetic_cache[name] = tool
+        return tool
+
+    def _pinned_card(self, tool: Tool) -> Tool:
+        """:func:`pinned_card` of ``tool``, kept while the tool is what it was made
+        from. A listing hands over the registered ``Tool`` or a shallow copy of
+        it, so its schema dict is the same object either way; a tool registered
+        again with another schema or text gets a new card."""
+        hit = self._pinned_cards.get(tool.name)
+        if hit is not None and hit[0] is tool.parameters and hit[1] == tool.description:
+            return hit[2]
+        card = pinned_card(tool)
+        self._pinned_cards[tool.name] = (tool.parameters, tool.description, card)
+        return card
 
     # ------------------------------------------------------------------
     # Indexed document
@@ -294,8 +373,14 @@ class CadSearchTransform(BM25SearchTransform):
         place — it is called and extended instead. Tools with no alias record
         (anything registered outside this server) keep the stock text
         unchanged.
+
+        A tool listed with a split description (``discovery.descriptions``)
+        is indexed on its full text, so the W3 split moves no search result.
         """
         extra = alias_text(tool.name)
+        full = full_description(tool)
+        if full != (tool.description or ""):
+            tool = tool.model_copy(update={"description": full})
         stock = _stock_searchable_text(tool)
         return f"{stock} {extra}" if extra else stock
 
@@ -402,54 +487,44 @@ class CadSearchTransform(BM25SearchTransform):
         return {"results": rendered, "notice": notice}
 
     def _make_search_tool(self) -> Tool:
+        return self._synthetic(self._search_tool_name, self._build_search_tool)
+
+    def _build_search_tool(self) -> Tool:
         transform = self
         default_limit = self._max_results
 
+        # 1.8-11: the synthetic texts are the whole idle cost of search mode, so
+        # each is one line (all of them together under 1,000 characters,
+        # tests/test_discovery_transform.py) and the schema carries no wire noise.
         async def search_tools(
-            query: Annotated[
-                str,
-                Field(
-                    description=(
-                        "What you want to do, in plain English or as an AutoCAD "
-                        "command name (FILLET, BPOLY, QSELECT, DLI)."
-                    )
-                ),
-            ],
-            limit: Annotated[
-                int,
-                Field(description=(f"How many tools to return. Clamped to 1..{MAX_SEARCH_LIMIT}.")),
-            ] = default_limit,
+            query: str,
+            limit: int = default_limit,
             risk: Annotated[
                 Literal["any", "write", "read"],
-                Field(
-                    description=(
-                        "Highest risk level to return. 'any' (default) is everything; "
-                        "'write' hides tools that delete or overwrite; 'read' returns "
-                        "only read-only query tools — use it for questions like 'how "
-                        "many ...?'. Anything filtered out is reported in the result."
-                    )
-                ),
+                Field(description="any|write|read; filtered hits are reported"),
             ] = "any",
             ctx: Context = None,  # type: ignore[assignment]
         ) -> Any:
-            """Find the AutoCAD tools that do a job.
-
-            Accepts AutoCAD command names as well as English. Returns one
-            compact line per tool: name, risk level, what it does, its required
-            arguments and the AutoCAD command it corresponds to. Call a result
-            with call_tool.
-            """
+            """Find tools for a job, in English or as an AutoCAD command (FILLET, QSELECT)."""
             visible = await transform._get_visible_tools(ctx)
             outcome = transform.rank(visible, query, limit=limit, risk=risk)
             return await transform.render(outcome)
 
-        return Tool.from_function(fn=search_tools, name=self._search_tool_name)
+        tool = _lean(Tool.from_function(fn=search_tools, name=self._search_tool_name))
+        # Written here, not in the annotation: the default is this instance's.
+        tool.parameters["properties"]["limit"]["description"] = (
+            f"default {default_limit}, max {MAX_SEARCH_LIMIT}"
+        )
+        return tool
 
     # ------------------------------------------------------------------
     # The call proxy, guarded against every synthetic name
     # ------------------------------------------------------------------
 
     def _make_call_tool(self) -> Tool:
+        return self._synthetic(self._call_tool_name, self._build_call_tool)
+
+    def _build_call_tool(self) -> Tool:
         """The stock ``call_tool`` proxy, refusing ``describe_tool`` as well.
 
         Upstream's proxy refuses only the two names it knows about. The body is
@@ -459,14 +534,11 @@ class CadSearchTransform(BM25SearchTransform):
         transform = self
 
         async def call_tool(
-            name: Annotated[str, "The name of the tool to call"],
-            arguments: Annotated[dict[str, Any] | None, "Arguments to pass to the tool"] = None,
+            name: str,
+            arguments: dict[str, Any] | None = None,
             ctx: Context = None,  # type: ignore[assignment]
         ) -> ToolResult:
-            """Call a tool by name with the given arguments.
-
-            Use this to execute tools discovered via search_tools.
-            """
+            """Call a tool found by search_tools with its arguments."""
             if name in transform.synthetic_names:
                 raise ValueError(
                     f"'{name}' is a synthetic search tool and cannot be called via the "
@@ -474,46 +546,148 @@ class CadSearchTransform(BM25SearchTransform):
                 )
             return await ctx.fastmcp.call_tool(name, arguments)
 
-        return Tool.from_function(fn=call_tool, name=self._call_tool_name)
+        return _lean(Tool.from_function(fn=call_tool, name=self._call_tool_name))
 
     # ------------------------------------------------------------------
     # The synthetic describe tool
     # ------------------------------------------------------------------
 
     def _make_describe_tool(self) -> Tool:
-        transform = self
+        return self._synthetic(self._describe_tool_name, lambda: _describe_tool_for(self))
 
-        async def describe_tool(
-            name: Annotated[
-                str,
-                Field(description="Exact tool name, as search_tools returned it."),
-            ],
-            ctx: Context = None,  # type: ignore[assignment]
-        ) -> dict[str, Any]:
-            """Return one tool's full input schema, optional parameters included.
 
-            Also its description, annotations, risk, cost, pack, AutoCAD
-            commands, synonyms and its docstring's examples. Use it before
-            call_tool when a search card's required arguments are not enough.
-            """
-            if name in transform.synthetic_names:
-                raise ValueError(
-                    f"'{name}' is a synthetic search tool and cannot be described via "
-                    "describe_tool; list_tools already carries its full schema"
-                )
-            # The catalog call_tool reaches: every visibility gate (TOOL_PROFILE,
-            # TOOL_PACKS, ENABLE_3D) and auth filter already applied. Pinned
-            # tools are included, because call_tool accepts them too.
-            catalog = await transform.get_tool_catalog(ctx)
-            tool = next((t for t in catalog if t.name == name), None)
-            if tool is None:
-                # The exact refusal FastMCP raises when call_tool resolves the name.
-                raise NotFoundError(f"Unknown tool: {name!r}")
-            pack = transform._pack_of(name) if transform._pack_of is not None else None
-            return describe_payload(tool, pack=pack)
+def _describe_tool_for(transform: Any) -> Tool:
+    """The ``describe_tool`` a transform lists: its catalog, its pack table.
 
-        return Tool.from_function(
+    ``transform`` is a :class:`CatalogTransform` carrying ``synthetic_names``,
+    ``_describe_tool_name`` and ``_pack_of`` - :class:`CadSearchTransform` in
+    search mode, :class:`DetailsTransform` in ``off`` mode. One body for both,
+    so the card a client reads never depends on the mode.
+    """
+
+    async def describe_tool(
+        name: str | None = None,
+        names: Annotated[list[str] | None, Field(max_length=MAX_DESCRIBE_NAMES)] = None,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        """Full schema, risk and examples of a tool (name) or several (names)."""
+        if (name is None) == (names is None):
+            raise ValueError(
+                "describe_tool: pass exactly one of `name` (one tool) or `names` "
+                "(several, one card each)"
+            )
+        wanted = [name] if names is None else list(dict.fromkeys(names))
+        if not wanted:
+            raise ValueError("describe_tool: `names` is empty")
+        synthetic = [n for n in wanted if n in transform.synthetic_names]
+        if synthetic:
+            raise ValueError(
+                f"'{synthetic[0]}' is a synthetic search tool and cannot be described "
+                "via describe_tool; list_tools already carries its full schema"
+            )
+        # The catalog call_tool reaches: every visibility gate (TOOL_PROFILE,
+        # TOOL_PACKS, ENABLE_3D) and auth filter already applied. Pinned
+        # tools are included - with their full description and schema, not
+        # the shortened card search mode lists - because call_tool accepts
+        # them too.
+        catalog = {t.name: t for t in await transform.get_tool_catalog(ctx)}
+        unknown = [n for n in wanted if n not in catalog]
+        if unknown:
+            # The exact refusal FastMCP raises when call_tool resolves the name;
+            # several unknown names are all named, nothing is described.
+            raise NotFoundError(f"Unknown tool: {', '.join(repr(n) for n in unknown)}")
+        cards = [
+            describe_payload(
+                catalog[n],
+                pack=transform._pack_of(n) if transform._pack_of is not None else None,
+            )
+            for n in wanted
+        ]
+        return cards[0] if names is None else {"tools": cards}
+
+    return _lean(
+        Tool.from_function(
             fn=describe_tool,
-            name=self._describe_tool_name,
+            name=transform._describe_tool_name,
             annotations=ToolAnnotations(readOnlyHint=True),
         )
+    )
+
+
+class DetailsTransform(CatalogTransform):
+    """``DISCOVERY_MODE=off``: the whole catalog, plus ``describe_tool``.
+
+    A description over 800 characters is listed as its leading paragraphs and
+    ``Details: describe_tool.`` (``discovery/descriptions.py``) on *every*
+    surface, the full catalog, ``TOOL_PROFILE=lean`` and each ``TOOL_PACKS``
+    one included. Search mode lists ``describe_tool`` already; this transform
+    is what makes the pointer lead somewhere in ``off`` mode too. It changes
+    nothing else: every catalog tool is listed as it comes, in order, and
+    ``describe_tool`` is appended last (a stable prompt-cache prefix) - only
+    when a listed description actually points to it. Like the search-mode one
+    it is synthetic: never in the registry, card-less (so ``cad_batch``
+    refuses it as a step) and never counted by ``system_about``.
+    """
+
+    def __init__(
+        self,
+        *,
+        describe_tool_name: str = "describe_tool",
+        pack_of: Callable[[str], str | None] | None = None,
+    ) -> None:
+        super().__init__()
+        self._describe_tool_name = describe_tool_name
+        self._pack_of = pack_of
+        self._describe_cache: Tool | None = None
+
+    @property
+    def synthetic_names(self) -> frozenset[str]:
+        """Every name this transform answers itself rather than the catalog."""
+        return frozenset({self._describe_tool_name})
+
+    async def transform_tools(self, tools: Sequence[Tool]) -> Sequence[Tool]:
+        """The catalog unchanged, then ``describe_tool`` when a listing points to it."""
+        if not any(_points_to_details(tool) for tool in tools):
+            return tools
+        return [*tools, self._make_describe_tool()]
+
+    async def get_tool(
+        self, name: str, call_next: GetToolNext, *, version: VersionSpec | None = None
+    ) -> Tool | None:
+        """Resolve ``describe_tool`` here; every other name passes through."""
+        if name == self._describe_tool_name:
+            return self._make_describe_tool()
+        return await call_next(name, version=version)
+
+    def _make_describe_tool(self) -> Tool:
+        """Built once (module docstring); the same object on every listing."""
+        if self._describe_cache is None:
+            self._describe_cache = _describe_tool_for(self)
+        return self._describe_cache
+
+
+def _points_to_details(tool: Tool) -> bool:
+    """True when ``tool`` lists a shortened description whose rest is elsewhere."""
+    listed = tool.description or ""
+    return listed.endswith(DETAILS_POINTER) and full_description(tool) != listed
+
+
+class _SyntheticTool(FunctionTool):
+    """A synthetic tool listed without fastmcp's ``_meta`` block.
+
+    ``{"fastmcp": {"tags": []}}`` says nothing about a synthetic tool (it has
+    no tags, no version) and costs ~30 wire characters each - about a tenth of
+    search mode's whole idle budget (plan section 4: 250 tokens).
+    """
+
+    def get_meta(self) -> dict[str, Any] | None:  # type: ignore[override]
+        return None
+
+
+def _lean(tool: Tool) -> Tool:
+    """A synthetic tool as listed: :func:`lean_schema` as its input schema, no
+    output schema (structured content is still returned) and no ``_meta``."""
+    fields = {name: getattr(tool, name) for name in type(tool).model_fields}
+    fields["parameters"] = lean_schema(tool.parameters or {})
+    fields["output_schema"] = None
+    return _SyntheticTool(**fields)

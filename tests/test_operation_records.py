@@ -40,7 +40,9 @@ async def _status(client) -> dict:
 
 
 async def _operations(client) -> list[dict]:
-    return (await _status(client))["operations"]
+    return (await client.call_tool("system_status", {"detail": "operations"})).structured_content[
+        "operations"
+    ]
 
 
 async def _entities(client) -> int:
@@ -144,18 +146,24 @@ async def test_a_failed_step_names_its_operation_and_the_batch_is_partial(client
             "cad_batch",
             {
                 "steps": [
-                    {"tool": "entity_get", "args": {"handle": "NOSUCH"}},
-                    {"tool": "entity_create_line", "args": _LINE},
+                    {"tool": "entity_create_line", "args": _LINE, "bind": "l"},
+                    {"tool": "entity_edit_text", "args": {"handle": "$l", "text": "X"}},
                 ],
                 "on_error": "continue",
             },
         )
     ).structured_content
-    error = result["results"][0]["error"]
+    # 1.8-02: a missing handle is now not_found (a refusal), so the failing
+    # step is an operation that really broke.
+    error = result["results"][1]["error"]
     assert error["kind"] == "failed"
     operations = await _operations(client)
     (step,) = [r for r in operations if r["operation_id"] == error["operation_id"]]
-    assert (step["tool"], step["state"], step["error_kind"]) == ("entity_get", "failed", "failed")
+    assert (step["tool"], step["state"], step["error_kind"]) == (
+        "entity_edit_text",
+        "failed",
+        "failed",
+    )
     (batch,) = [r for r in operations if r["tool"] == "cad_batch"]
     assert batch["operation_id"] == result["operation_id"]
     assert (batch["state"], batch["error_kind"]) == ("partial", "failed")
@@ -240,10 +248,12 @@ async def test_the_search_proxy_reuses_the_operation_it_runs_under(monkeypatch):
             await client.call_tool("call_tool", {"name": "drawing_new", "arguments": {}})
             await client.call_tool("call_tool", {"name": "entity_create_line", "arguments": _LINE})
             status = (
-                await client.call_tool("call_tool", {"name": "system_status", "arguments": {}})
+                await client.call_tool(
+                    "call_tool", {"name": "system_status", "arguments": {"detail": "operations"}}
+                )
             ).structured_content
     finally:
-        server._apply_discovery_mode("off")
+        server._apply_discovery_mode()
     (operation_id,) = seen
     rows = [r for r in status["operations"] if r["operation_id"] == operation_id]
     assert len(rows) == 1 and (rows[0]["tool"], rows[0]["state"]) == ("call_tool", "committed")
@@ -253,7 +263,9 @@ async def test_the_search_proxy_reuses_the_operation_it_runs_under(monkeypatch):
 
 
 def test_the_batch_taxonomy_declares_every_kind_1_7_emits():
-    assert server.BATCH_ERROR_KINDS == (
+    # 1.8-02 extends the closed set (engineering/errors.py); the 1.7 kinds stay
+    # first, in their order.
+    assert server.BATCH_ERROR_KINDS[:17] == (
         "denied",
         "malformed_step",
         "unknown_tool",

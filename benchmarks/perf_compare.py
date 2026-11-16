@@ -20,6 +20,38 @@ head/base is at most ``1 + max(0.05, 2 × aa_spread)``. Without ``--aa`` the
 spread is taken as 0 and the bound is 1.05; the phase gate runs with ``--aa``.
 
     python -m benchmarks.perf_compare --base v1.6.0 --aa --out out/perf/compare.json
+    python -m benchmarks.perf_compare --aa      # --base auto: the previous release tag
+
+``--base auto`` (the default since 1.8-14; it was a hard-coded ``v1.6.0``)
+resolves to the newest tag reachable from HEAD, or from HEAD's parent when HEAD
+is itself the tag being released.
+
+**The same catalog on both sides.** Every measurement runs with
+``DISCOVERY_MODE=off``, the 1.7.0 catalog. The in-memory client is ``mcp``'s
+own session, and that session lists the catalog again on every call of a tool
+it was not shown (``ClientSession._validate_tool_result``); under the search
+default (1.8-11) every tool but the pinned ones is such a tool, so the server
+workload would measure the client's listings, not the server's call path.
+MEASURED 2026-11-05 (release tree 19ada05, 20 rounds): 8.5 x v1.7.0 under
+the search default - six listings a call, three of them the server's own
+definition-cache refreshes - against 0.96 x with ``DISCOVERY_MODE=off``.
+The server's share is fixed (``server._install_tool_definition_cache``,
+``discovery/transform.py`` "Built once"); the client's listings are the
+client's, and the gate compares the call path under one catalog shape.
+
+**A fresh state folder per measurement.** Every worker runs with an
+``ACADMCP_STATE_DIR`` of its own - a temp folder made for it and removed after
+it - so the journal, the lineage records and the checkpoints it writes are the
+code's own cost, never the residue of earlier runs or of the machine's default
+state folder. MEASURED 2026-11-05 (release tree a4a0aba): that default folder
+held a 213 MB journal of 446,254 rows left by earlier gate runs, written under
+an earlier schema draft with three indexes the released schema does not
+create, and 656 checkpoint lineages; against it ``server_create_lines_2k``
+measured 1.15 x v1.7.0 (1.06-1.09 x with a fresh folder), and every open of a
+changed file paid 41 ms in ``CheckpointStore._evict_budget``'s scan of the
+whole store (0.2 ms in a fresh one). The folder is never put under
+``--scratch``: that may lie inside the checkout (its default does), where a
+state folder is refused and the journal would silently run in memory.
 """
 
 from __future__ import annotations
@@ -28,6 +60,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -156,25 +189,39 @@ async def measure(workloads: list[str], scratch: Path) -> dict[str, float]:
 
 
 def run_in_tree(tree: Path, workloads: list[str], scratch: Path) -> dict[str, float]:
-    """One measurement of ``workloads`` with ``tree``'s packages, in a subprocess."""
-    env = {**os.environ, "PYTHONPATH": str(tree), "AUTOCAD_MCP_BACKEND": "ezdxf"}
-    done = subprocess.run(
-        [
-            sys.executable,
-            "-P",
-            str(Path(__file__).resolve()),
-            "--worker",
-            "--workloads",
-            ",".join(workloads),
-            "--scratch",
-            str(scratch),
-        ],
-        cwd=str(tree),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
+    """One measurement of ``workloads`` with ``tree``'s packages, in a subprocess.
+
+    The worker gets ``DISCOVERY_MODE=off`` and a fresh state folder of its own,
+    removed afterwards: the module docstring says why for both.
+    """
+    state = Path(tempfile.mkdtemp(prefix="acadmcp_perf_state_"))
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(tree),
+        "AUTOCAD_MCP_BACKEND": "ezdxf",
+        "DISCOVERY_MODE": "off",
+        "ACADMCP_STATE_DIR": str(state),
+    }
+    try:
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-P",
+                str(Path(__file__).resolve()),
+                "--worker",
+                "--workloads",
+                ",".join(workloads),
+                "--scratch",
+                str(scratch),
+            ],
+            cwd=str(tree),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    finally:
+        shutil.rmtree(state, ignore_errors=True)
     if done.returncode != 0:
         raise RuntimeError(f"measurement in {tree} failed:\n{done.stderr[-4000:]}")
     return json.loads(done.stdout.strip().splitlines()[-1])
@@ -187,6 +234,30 @@ def _git(*args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(REPO), *args], check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+#: ``--base`` value that resolves to the previous release tag (1.8-14).
+AUTO_BASE = "auto"
+
+
+def resolve_base(base: str, git=_git) -> str:
+    """``auto`` -> the previous release tag; anything else is used as given.
+
+    The previous tag is the newest tag reachable from HEAD, or - when HEAD is
+    itself tagged (a release run) - the newest one reachable from its parent,
+    so a tag is never compared with itself. No tag at all is refused by name.
+    """
+    if base != AUTO_BASE:
+        return base
+    try:
+        exact = git("tag", "--points-at", "HEAD")
+        start = "HEAD^" if exact.strip() else "HEAD"
+        return git("describe", "--tags", "--abbrev=0", start)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(
+            "--base auto: no release tag is reachable from HEAD (git describe --tags failed); "
+            "fetch the tags (actions/checkout fetch-depth: 0) or pass --base <tag>"
+        ) from exc
 
 
 def compare(
@@ -227,7 +298,11 @@ def compare(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--base", default="v1.6.0", help="git ref to compare against")
+    parser.add_argument(
+        "--base",
+        default=AUTO_BASE,
+        help="git ref to compare against; 'auto' (default) = the previous release tag",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--aa", action="store_true", help="measure base twice per round")
@@ -248,8 +323,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.worker:
         print(json.dumps(asyncio.run(measure(workloads, args.scratch.resolve()))))
         return 0
+    base = resolve_base(args.base)
+    print(f"base: {base}", file=sys.stderr, flush=True)
     report = compare(
-        args.base,
+        base,
         warmup=args.warmup,
         rounds=args.rounds,
         aa=args.aa,

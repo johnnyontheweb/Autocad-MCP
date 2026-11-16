@@ -69,7 +69,13 @@ from ezdxf import bbox as ezbbox
 
 import config
 from backends.capability import UnsupportedCapabilityError
-from backends.entity_fields import acadmcp_xdata, dimension_fields, hatch_loops
+from backends.entity_fields import (
+    acadmcp_xdata,
+    dimension_fields,
+    dimension_rendered,
+    dimension_style_vars,
+    hatch_loops,
+)
 from backends.ocs import is_flat_frame, to_wcs_2d, wcs_arc_angles, wcs_bulge
 from engineering.measure import polygon_area_perimeter
 from engineering.understand.labels import plain
@@ -141,8 +147,33 @@ class EntityRecord:
     #: stays the MINSERT's own placement - cell (0, 0) - so a 1.6 reader sees
     #: what it always saw; empty for a plain INSERT.
     cells: tuple = ()
+    #: VIEWPORT (1.8-16): True for a paper layout's own paper viewport - the one
+    #: ezdxf's ``main_viewport()`` returns (status 1, else id 1) - which shows
+    #: the sheet, not the model. False for every other record.
+    paper_viewport: bool = False
     #: Every ``ACADMCP_*`` application on the entity, as ``(app id, json)``.
     xdata: tuple[tuple[str, str], ...] = ()
+    #: v1.8.0: the entity's own display properties as DXF stores them, so the
+    #: ``property_override`` focus reads one snapshot on both engines.
+    #: Lineweight is group 370: -1 ByLayer (also when absent), -2 ByBlock,
+    #: -3 Default (LWDEFAULT - not ByLayer), else hundredths of a mm.
+    lineweight: int = -1
+    #: ACI, group 62: 256 ByLayer (also when absent), 0 ByBlock.
+    color: int = 256
+    #: Group 6, as stored; "BYLAYER" when absent.
+    linetype: str = "BYLAYER"
+    #: Group 440 raw (flags + alpha), None when absent (ByLayer).
+    transparency: int | None = None
+    #: DIMENSION (1.8-15): the plain text its ``*D`` geometry block shows -
+    #: what the sheet displays, which may be stale against its fields
+    #: (``backends/entity_fields.py::dimension_rendered``); None without one.
+    rendered_text: str | None = None
+    #: DIMENSION (1.8-15): DXF group 42, the measurement stored at the last
+    #: render (an angle in radians); None when absent.
+    group42: float | None = None
+    #: DIMENSION (1.8-15): the effective style variables the text is formatted
+    #: with, ``((name, value), ...)`` (``dimension_style_vars``); None unread.
+    dim_vars: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -236,6 +267,21 @@ def _polyline(entity) -> tuple[tuple[Pt, ...], tuple[float, ...], bool]:
     return points, bulges, bool(entity.is_closed)
 
 
+def _display_properties(dxf) -> dict:
+    """Lineweight, colour, linetype and transparency as stored (see EntityRecord)."""
+    out: dict = {}
+    for key, default, cast in (
+        ("lineweight", -1, int),
+        ("color", 256, int),
+        ("linetype", "BYLAYER", str),
+    ):
+        if dxf.is_supported(key):
+            out[key] = cast(dxf.get(key, default))
+    if dxf.is_supported("transparency") and dxf.hasattr("transparency"):
+        out["transparency"] = int(dxf.get("transparency"))
+    return out
+
+
 def _record(entity, space: str, *, insert_boxes: bool = True) -> EntityRecord | None:
     kind = entity.dxftype()
     dxf = entity.dxf
@@ -247,6 +293,7 @@ def _record(entity, space: str, *, insert_boxes: bool = True) -> EntityRecord | 
         "bbox": None if kind == "INSERT" and not insert_boxes else _box(entity),
         "visible": not bool(dxf.get("invisible", 0)),
         "xdata": acadmcp_xdata(entity),
+        **_display_properties(dxf),
     }
     extrusion = _extrusion(entity)
     if kind in _PLANAR_TYPES and not is_flat_frame(extrusion):
@@ -315,7 +362,16 @@ def _record(entity, space: str, *, insert_boxes: bool = True) -> EntityRecord | 
         text = plain(override) if override not in ("", "<>") else None
         middle = dxf.get("text_midpoint", dxf.defpoint)
         points = (_xy(dxf.defpoint), tuple(to_wcs_2d(extrusion, middle.x, middle.y, middle.z)))
-        return EntityRecord(**base, points=points, text=text, dimension=dimension_fields(entity))
+        rendered, group42 = dimension_rendered(entity)
+        return EntityRecord(
+            **base,
+            points=points,
+            text=text,
+            dimension=dimension_fields(entity),
+            rendered_text=rendered,
+            group42=group42,
+            dim_vars=dimension_style_vars(entity),
+        )
     if kind == "LEADER":
         return EntityRecord(**base, points=tuple(_xy(v) for v in entity.vertices))
     if kind == "POINT":
@@ -341,7 +397,20 @@ def _record(entity, space: str, *, insert_boxes: bool = True) -> EntityRecord | 
             hatch_loops=loops,
             hatch_style=int(dxf.get("hatch_style", 0) or 0),
         )
+    if kind == "VIEWPORT":
+        return EntityRecord(**base, paper_viewport=_is_paper_viewport(entity))
     return EntityRecord(**base)
+
+
+def _is_paper_viewport(viewport) -> bool:
+    """The layout's own viewport, asked of the layout the way
+    ``EzdxfBackend._is_main_viewport`` asks it (status 1 first, then id 1)."""
+    try:
+        layout = viewport.get_layout()
+        main = layout.main_viewport() if layout is not None else None
+    except Exception:  # noqa: BLE001 - a viewport without a layout shows no sheet
+        return False
+    return main is not None and main.dxf.handle == viewport.dxf.handle
 
 
 def _insert_transform(entity) -> tuple[float, float, float, float, float, float]:
@@ -429,6 +498,13 @@ def records_from_doc(
     own blocks, not the ``*D`` blocks holding a DIMENSION's rendering, no
     ATTDEF - into ``Snapshot.blocks``, in the block's own coordinates, for the
     observed-geometry reader. ``records`` is the same either way.
+
+    The ``*D`` blocks stay out of ``Snapshot.blocks`` on purpose: their lines
+    and arrows are a dimension's picture, and exploding them would turn every
+    extension line into a feature a requirement could bind to. What the
+    picture *says* reaches the DIMENSION's own record instead
+    (``rendered_text``, ``group42``; 1.8-15) - every other reader ignores
+    those fields, so its input is unchanged.
     """
     records: list[EntityRecord] = []
     layouts = tuple(doc.layouts.names_in_taborder())
@@ -441,6 +517,12 @@ def records_from_doc(
         str(layer.dxf.name): {
             "color": int(layer.dxf.get("color", 7)),
             "linetype": str(layer.dxf.get("linetype", "Continuous")),
+            # v1.8.0: group 370 (-3 Default when absent), group 290 (plot),
+            # and the on / frozen state ezdxf reads off the colour sign and flags.
+            "lineweight": int(layer.dxf.get("lineweight", -3)),
+            "plot": bool(layer.dxf.get("plot", 1)),
+            "on": bool(layer.is_on()),
+            "frozen": bool(layer.is_frozen()),
         }
         for layer in doc.layers
     }
